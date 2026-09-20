@@ -1,0 +1,10 @@
+*.pyc
+*.obj
+*.d
+build*/
+bsh/
+dist/
+bindings/python/dist/
+*.egg-info/
+.pytest_cache
+*.whl

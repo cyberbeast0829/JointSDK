@@ -1,0 +1,10 @@
+@PACKAGE_INIT@
+
+# `find_package(jsdk_can REQUIRED)` → 目标 `jsdk::can`（静态库；静态/共享同符号，互斥链接）
+include("${CMAKE_CURRENT_LIST_DIR}/jsdk_canTargets.cmake")
+
+# 两个 include 目录都已经由 import 目标带出来（`INTERFACE_INCLUDE_DIRECTORIES`），
+# 客户不需要自己 include_directories —— 直接
+#   target_link_libraries(myapp PRIVATE jsdk::can)
+# 即可同时拿到头文件路径与依赖（UNIX 下含 -lm / -ldl）。
+check_required_components(jsdk_can)

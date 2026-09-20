@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cyberbeast-joint-sdk"
+version = "0.1.0"
+description = "CyberBeast 关节 SDK 的 Python 绑定（ctypes，加载 libjsdk_can）"
+readme = "README.md"
+# 3.8 是**实测**下限（WSL/Ubuntu 20.04 的 python3 就是 3.8；
+# 包内只用到注解层面的新语法，见各模块的 __future__ import）。
+# 开发机是 3.12，两套都在跑测试。
+requires-python = ">=3.8"
+license = { text = "Proprietary" }
+authors = [{ name = "JointSDK team" }]
+keywords = ["can", "canfd", "robotics", "joint", "mit", "odrive", "cyberbeast"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: C",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Hardware :: Hardware Drivers",
+]
+# 不硬依赖 numpy：绑定只做配置/采集，数值处理交给用户
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.urls]
+Documentation = "https://example.invalid/joint-sdk"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+# py.typed 必须随包分发，否则类型检查器不认这些注解
+zip-safe = false
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+jsdk_can = ["py.typed", "lib/*.dll", "lib/*.so", "lib/*.so.*", "lib/*.dylib"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error::DeprecationWarning"]

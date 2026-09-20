@@ -1,0 +1,1317 @@
+/**
+ * @file    test_ops.c
+ * @brief   WP4（健壮性）+ WP5（运维）测试
+ *
+ * @par 关于时钟
+ *  与前几步不同，这里的被测 API（标定/回零/发现/批量读）**必须让时间流逝**：
+ *  设备的瞬时状态靠 `sim_tick` 推进，而 `sim_tick` 只由
+ *  `jsdk_hal_virtual_advance_ms()` 驱动。所以本文件把虚拟后端包一层：
+ *  自己的 `now_ms` 每被调用一次就推进 1 ms 仿真时间——这正是**真实 HAL**
+ *  的行为（自由运行的硬件计数器），于是 SDK 的阻塞等待自然能完成。
+ *  `tests/test_joint.c` 则保留“手工推进时钟”的写法，用来验证**冻结时钟**下
+ *  的非阻塞路径。
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#include "jsdk_hal_builtin.h"
+#include "hal_virtual_internal.h"
+#include "jsdk_core_internal.h"
+
+#ifndef JSDK_TEST_DATA_DIR
+#  define JSDK_TEST_DATA_DIR "."
+#endif
+
+static unsigned g_checks;
+static unsigned g_fail;
+
+#define CHECK(cond)                                                            \
+    do {                                                                       \
+        g_checks++;                                                            \
+        if (!(cond)) {                                                         \
+            printf("  FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond);           \
+            g_fail++;                                                          \
+        }                                                                      \
+    } while (0)
+
+#define CHECK_EQ(a, b)                                                         \
+    do {                                                                       \
+        long long _a = (long long)(a), _b = (long long)(b);                    \
+        g_checks++;                                                            \
+        if (_a != _b) {                                                        \
+            printf("  FAIL %s:%d  %s = %lld, expected %s = %lld\n",            \
+                   __FILE__, __LINE__, #a, _a, #b, _b);                        \
+            g_fail++;                                                          \
+        }                                                                      \
+    } while (0)
+
+#define CHECK_NEAR(a, b, tol)                                                  \
+    do {                                                                       \
+        double _a = (double)(a), _b = (double)(b);                             \
+        g_checks++;                                                            \
+        if (!(fabs(_a - _b) <= (double)(tol))) {                               \
+            printf("  FAIL %s:%d  |%.6f - %.6f| > %g\n", __FILE__, __LINE__,   \
+                   _a, _b, (double)(tol));                                     \
+            g_fail++;                                                          \
+        }                                                                      \
+    } while (0)
+
+#define CHECK_STR(a, b)                                                        \
+    do {                                                                       \
+        const char *_a = (a), *_b = (b);                                       \
+        g_checks++;                                                            \
+        if ((_a == NULL) != (_b == NULL) || (_a && strcmp(_a, _b) != 0)) {     \
+            printf("  FAIL %s:%d  \"%s\" != expected \"%s\"\n", __FILE__,      \
+                   __LINE__, _a ? _a : "(null)", _b ? _b : "(null)");          \
+            g_fail++;                                                          \
+        }                                                                      \
+    } while (0)
+
+/* ==========================================================================
+ * 夹具：自动推进时钟的虚拟总线
+ * ======================================================================== */
+
+static char  *g_json;
+static size_t g_json_len;
+
+static int load_fixture(void)
+{
+    FILE *fh = fopen(JSDK_TEST_DATA_DIR "/endpoints_v8.json", "rb");
+    long  sz;
+
+    if (!fh) return -1;
+    if (fseek(fh, 0L, SEEK_END) != 0) { fclose(fh); return -1; }
+    sz = ftell(fh);
+    if (sz <= 0) { fclose(fh); return -1; }
+    rewind(fh);
+    g_json = (char *)malloc((size_t)sz);
+    if (!g_json) { fclose(fh); return -1; }
+    if (fread(g_json, 1u, (size_t)sz, fh) != (size_t)sz) {
+        free(g_json); g_json = NULL; fclose(fh); return -1;
+    }
+    fclose(fh);
+    g_json_len = (size_t)sz;
+    return 0;
+}
+
+typedef struct {
+    /* 内层：虚拟后端原生回调（user = jsdk_hal_handle_t*） */
+    jsdk_can_hal_t     inner;
+    jsdk_hal_handle_t *h;
+    sim_bus_t         *sim;
+
+    /* 外层：给 SDK 用的 HAL（user = 本结构体） */
+    jsdk_can_hal_t     hal;
+
+    jsdk_context_storage_t   store;
+    jsdk_context_t          *ctx;
+    jsdk_joint_config_t      jc[JSDK_MAX_JOINTS];
+    jsdk_joint_t            *j;
+    jsdk_context_config_t    cfg;
+} fix_t;
+
+static int w_send(void *u, const jsdk_can_frame_t *f)
+{
+    fix_t *fx = (fix_t *)u;
+    return fx->inner.send(fx->inner.user, f);
+}
+
+static int w_recv(void *u, jsdk_can_frame_t *f)
+{
+    fix_t *fx = (fix_t *)u;
+    return fx->inner.recv(fx->inner.user, f);
+}
+
+/**
+ * 每次被调用推进 1 ms 仿真时间再返回。
+ * 真实 HAL 的 `now_ms` 是自由运行计数器，语义一致。
+ */
+static uint32_t w_now(void *u)
+{
+    fix_t *fx = (fix_t *)u;
+    jsdk_hal_virtual_advance_ms(fx->h, 1u);
+    return fx->inner.now_ms(fx->inner.user);
+}
+
+/** 建总线 + 上下文 + n 个关节（不下载描述符）。`is_fd` = 0 时走 Classic。 */
+static int fx_open_flags(fix_t *fx, const char *spec, unsigned n_joints, int is_fd)
+{
+    static uint8_t arena[32768];
+    unsigned i;
+
+    memset(fx, 0, sizeof *fx);
+
+    if (jsdk_hal_virtual_open(&fx->inner, &fx->h, spec) != JSDK_OK) return -1;
+    fx->sim = jsdk_hal_virtual_sim(fx->h);
+    if (!fx->sim) return -1;
+    if (sim_set_desc(fx->sim, g_json, (uint32_t)g_json_len, 0x1234u) != 0) return -1;
+
+    fx->hal = fx->inner;          /* 复制回调，再换掉 user / now_ms */
+    fx->hal.user   = fx;
+    fx->hal.send   = w_send;
+    fx->hal.recv   = w_recv;
+    fx->hal.now_ms = w_now;
+
+    jsdk_context_config_default(&fx->cfg);
+    fx->cfg.hal = fx->hal;
+    fx->cfg.master_id = 1u;
+    fx->cfg.is_fd = (uint8_t)(is_fd ? 1u : 0u);
+    fx->cfg.period_ns = 1000000u;
+    fx->cfg.auto_keepalive = 1u;
+    fx->cfg.desc.retain = JSDK_DESC_RETAIN_ALL;
+    fx->cfg.desc.arena = arena;
+    fx->cfg.desc.arena_size = sizeof arena;
+    fx->cfg.desc.timeout_ms = 5000u;
+
+    if (jsdk_context_init((jsdk_context_t *)&fx->store, &fx->cfg) != JSDK_OK) return -1;
+    fx->ctx = (jsdk_context_t *)&fx->store;
+
+    for (i = 0u; i < n_joints; ++i) {
+        memset(&fx->jc[i], 0, sizeof fx->jc[i]);
+        fx->jc[i].node_id = (uint8_t)(i + 1u);
+        fx->jc[i].initial_mode = JSDK_MODE_MIT;
+        if (jsdk_context_add_joint(fx->ctx, &fx->jc[i], &fx->j) != JSDK_OK) return -1;
+    }
+    fx->j = &fx->ctx->joints[0];
+    return 0;
+}
+
+/** 便捷包装：默认 FD（本文件绝大多数用例都是 FD）。 */
+static int fx_open(fix_t *fx, const char *spec, unsigned n_joints)
+{
+    return fx_open_flags(fx, spec, n_joints, 1);
+}
+
+/** 下好描述符并 configure（本文件的 HAL 会推进时钟，阻塞路径可用）。 */
+static int fx_configure(fix_t *fx)
+{
+    jsdk_status_t st;
+
+    st = jsdk_context_desc_fetch(fx->ctx);
+    if (st != JSDK_OK) {
+        printf("      desc_fetch -> %s\n", jsdk_context_last_error(fx->ctx));
+        return -1;
+    }
+    st = jsdk_context_configure(fx->ctx);
+    if (st != JSDK_OK) {
+        printf("      configure -> %s\n", jsdk_context_last_error(fx->ctx));
+        return -1;
+    }
+    return 0;
+}
+
+static void fx_close(fix_t *fx)
+{
+    if (fx->ctx) jsdk_context_destroy(fx->ctx);
+    if (fx->h) jsdk_hal_close(fx->h);
+}
+
+static void fx_cycle(fix_t *fx)
+{
+    jsdk_context_cycle_begin(fx->ctx, 0u);
+    jsdk_context_cycle_end(fx->ctx);
+}
+
+/** 统计主站发出的某类帧（从捕获队列里数，会清空队列）。 */
+static unsigned count_tx(fix_t *fx, uint8_t msgtype, int batch_only)
+{
+    jsdk_can_frame_t f;
+    unsigned n = 0u;
+
+    while (jsdk_hal_virtual_capture(fx->h, &f)) {
+        if (cb_id_msgtype(f.id) != msgtype) continue;
+        if (batch_only && !(f.len > 0u && (f.data[0] & CB_PARAM_FLAG_BATCH))) continue;
+        n++;
+    }
+    return n;
+}
+
+static void drain_tx(fix_t *fx) { (void)count_tx(fx, 0u, 0); }
+
+/**
+ * 取出捕获队列里所有 `PARAM_READ` **请求**帧，并记下决定分块行为的三个量：
+ * 载荷长度（4 = 旧式无 offset / 8 = 带 offset）、`ReqLen` 字节、`offset` 字段。
+ *
+ * 为什么值得单独断言：第一块用哪种形式（旧式 4 B vs 带 offset 的 8 B）
+ * **仿真设备两种都接受**，所以只看“读回来的值对不对”是发现不了写错的；
+ * 而真机/旧固件上旧式形式兼容性更好，这个选择必须被测试钉住。
+ */
+static unsigned take_read_requests(fix_t *fx, uint8_t *lens_out,
+                                  uint8_t *reqlen_out, uint32_t *offset_out,
+                                  unsigned max_n)
+{
+    jsdk_can_frame_t f;
+    unsigned n = 0u;
+
+    while (jsdk_hal_virtual_capture(fx->h, &f)) {
+        if (cb_id_msgtype(f.id) != CB_MSG_PARAM_READ) continue;
+        if (n < max_n) {
+            lens_out[n]   = f.len;
+            reqlen_out[n] = (f.len > 3u) ? f.data[3] : 0u;
+            offset_out[n] = (f.len >= CB_PARAM_READ_REQ_FULL)
+                            ? cb_be_get_u32(f.data + 4) : 0u;
+        }
+        n++;
+    }
+    return n;
+}
+
+/* ==========================================================================
+ * 1. 故障码文本（WP4）
+ * ======================================================================== */
+
+static void test_fault_text(void)
+{
+    unsigned i;
+    /* 取自固件 `can_cyberbeast.hpp` 的 `ErrorCode` —— **不是** ODrive 的
+       `ErrorCode` 枚举（两者顺序完全不同，凭记忆写必错）。 */
+    static const char *const k_mit[9] = {
+        "NONE", "MOTOR", "ENCODER", "CONTROLLER", "UNDER_VOLTAGE",
+        "OVER_TEMP", "OVER_CURRENT", "STALL", "CAN_TIMEOUT"
+    };
+
+    printf("[1] fault code text\n");
+
+    for (i = 0u; i < 9u; ++i) {
+        CHECK_STR(jsdk_joint_error_string((uint8_t)i), k_mit[i]);
+    }
+    CHECK_STR(jsdk_joint_error_string(0xFu), "MULTIPLE");   /* 线宽 4 bit 的最高值 */
+    CHECK(jsdk_joint_error_string(9u) != NULL);             /* 未定义值有兜底 */
+    CHECK(strcmp(jsdk_joint_error_string(9u), "NONE") != 0);
+
+    /* 心跳 5-bit 位名 */
+    CHECK_STR(jsdk_hb_error_bit_name(0u), "axis");
+    CHECK_STR(jsdk_hb_error_bit_name(4u), "board");
+    CHECK(jsdk_hb_error_bit_name(5u) == NULL);
+    CHECK(jsdk_hb_error_bit_name(99u) == NULL);
+
+    /* 32-bit 位图：只认固件定义过的那 13 个位 */
+    CHECK_STR(jsdk_axis_error_bit_name(0u),  "INVALID_STATE");
+    CHECK_STR(jsdk_axis_error_bit_name(20u), "CAN_BUS_FAILED");
+    CHECK_STR(jsdk_axis_error_bit_name(14u), "ESTOP_REQUESTED");
+    CHECK(jsdk_axis_error_bit_name(1u) == NULL);        /* 固件未定义 → 不编名字 */
+    CHECK(jsdk_axis_error_bit_name(21u) == NULL);
+
+    {
+        unsigned bit = 99u;
+        const char *nm;
+
+        CHECK(jsdk_axis_error_first(0u, &bit) == NULL);          /* 无错误 */
+        CHECK_EQ(bit, 0u);
+
+        nm = jsdk_axis_error_first(1u << 20, &bit);
+        CHECK_STR(nm, "CAN_BUS_FAILED");
+        CHECK_EQ(bit, 20u);
+
+        /* 多个位同时置位 → 取**位号最小**的那个（结果稳定、可复现） */
+        nm = jsdk_axis_error_first((1u << 14) | (1u << 20), &bit);
+        CHECK_STR(nm, "ESTOP_REQUESTED");
+        CHECK_EQ(bit, 14u);
+
+        /* 只置了固件未定义的位 → 不猜，返回 NULL */
+        CHECK(jsdk_axis_error_first(0x00000002u, &bit) == NULL);
+    }
+
+    CHECK_STR(jsdk_can_axis_state_name(0u),  "UNDEFINED");
+    CHECK_STR(jsdk_can_axis_state_name(3u),  "FULL_CALIBRATION_SEQUENCE");
+    CHECK_STR(jsdk_can_axis_state_name(11u), "HOMING");
+    CHECK_STR(jsdk_can_axis_state_name(16u), "MOTOR_DEADTIME_CALIBRATION");
+    CHECK_STR(jsdk_can_axis_state_name(17u), "unknown");
+
+    /* 组合描述 */
+    {
+        fix_t fx;
+        char   buf[256];
+        int    n;
+
+        if (fx_open(&fx, "0:id=1,hb=10,timeout=30000,fd", 1u) != 0) {
+            printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+        }
+        if (fx_configure(&fx) != 0) { g_fail++; g_checks++; fx_close(&fx); return; }
+
+        /* 注入一个 32-bit 轴错误 + 心跳子系统位，再看描述串 */
+        fx.j->fb.err_code   = 8u;                       /* CAN_TIMEOUT */
+        fx.j->fb.hb_error   = (uint8_t)(CB_HB_ERR_AXIS | CB_HB_ERR_MOTOR);
+        fx.j->fb.axis_error = 1u << 20;                 /* CAN_BUS_FAILED */
+        fx.j->current_state_raw = 8u;                   /* CLOSED_LOOP_CONTROL */
+        fx.j->state_known = 1u;
+
+        n = jsdk_joint_describe_fault(fx.j, buf, sizeof buf);
+        CHECK(n > 0);
+        CHECK(strstr(buf, "CAN_BUS_FAILED") != NULL);
+        CHECK(strstr(buf, "CAN_TIMEOUT") != NULL);
+        CHECK(strstr(buf, "axis|motor") != NULL);
+        CHECK(strstr(buf, "CLOSED_LOOP_CONTROL") != NULL);
+        printf("      %s\n", buf);
+
+        /* 无故障时也要给得出可读串 */
+        fx.j->fb.err_code = 0u; fx.j->fb.hb_error = 0u; fx.j->fb.axis_error = 0u;
+        n = jsdk_joint_describe_fault(fx.j, buf, sizeof buf);
+        CHECK(n > 0);
+        CHECK(strstr(buf, "hb=none") != NULL);
+        printf("      %s\n", buf);
+
+        CHECK_EQ(jsdk_joint_describe_fault(NULL, buf, sizeof buf), 0);
+        fx_close(&fx);
+    }
+}
+
+/* ==========================================================================
+ * 2. 参数访问（WP5）
+ * ======================================================================== */
+
+static void test_params(void)
+{
+    fix_t fx;
+    jsdk_value_t v;
+
+    printf("[2] parameter access\n");
+
+    if (fx_open(&fx, "0:id=1,gear=16.0,tconst=0.0385,pmax=12.5,vmax=65,tmax=50,"
+                     "kpmax=500,kdmax=5,hb=10,timeout=30000,fd", 1u) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+    if (fx_configure(&fx) != 0) { g_fail++; g_checks++; fx_close(&fx); return; }
+
+    /* --- 类型化读 --- */
+    CHECK_EQ(jsdk_joint_param_get(fx.j, "axis0.motor.config.gear_ratio", &v), JSDK_OK);
+    CHECK_EQ(v.type, JSDK_EP_F32);
+    CHECK_NEAR(v.v.f32, 16.0f, 1e-6);
+
+    CHECK_EQ(jsdk_joint_param_get(fx.j, "axis0.config.can.node_id", &v), JSDK_OK);
+    CHECK_EQ(v.type, JSDK_EP_U32);
+    CHECK_EQ(v.v.u32, 1u);
+
+    CHECK_EQ(jsdk_joint_param_get(fx.j, "axis0.config.enable_watchdog", &v), JSDK_OK);
+    CHECK_EQ(v.type, JSDK_EP_BOOL);
+    CHECK_EQ(v.v.boolean, 1);
+
+    {
+        uint32_t u = 0u;
+        int      b = -1;
+        float    f = 0.0f;
+
+        CHECK_EQ(jsdk_joint_param_get_u32(fx.j, "axis0.config.can.node_id", &u), JSDK_OK);
+        CHECK_EQ(u, 1u);
+        CHECK_EQ(jsdk_joint_param_get_bool(fx.j, "axis0.config.enable_watchdog", &b),
+                 JSDK_OK);
+        CHECK_EQ(b, 1);
+        CHECK_EQ(jsdk_joint_param_get_f32(fx.j, "axis0.controller.config.mit_max_pos",
+                                          &f), JSDK_OK);
+        CHECK_NEAR(f, 12.5f, 1e-6);
+        /* 整型端点用 f32 读也应成功（宽化），但比值端点用 u32 读要报错 */
+        CHECK_EQ(jsdk_joint_param_get_u32(fx.j, "axis0.motor.config.gear_ratio", &u),
+                 JSDK_ERR_PROTOCOL);
+    }
+
+    /* --- 未命中：不猜、不近似 --- */
+    CHECK_EQ(jsdk_joint_param_get(fx.j, "axis0.motor.config.nope", &v),
+             JSDK_ERR_NOT_FOUND);
+    CHECK(strstr(jsdk_context_last_error(fx.ctx), "not found") != NULL);
+
+    /* --- 只读端点写入必须被拒 --- */
+    CHECK_EQ(jsdk_joint_param_set_f32(fx.j, "vbus_voltage", 1.0f), JSDK_ERR_UNSUPPORTED);
+
+    /* --- 类型不匹配必须报错（猜宽度会静默写坏邻字段） --- */
+    CHECK_EQ(jsdk_joint_param_set_f32(fx.j, "axis0.config.can.node_id", 1.0f),
+             JSDK_ERR_PROTOCOL);      /* 端点存在（非 NOT_FOUND），但 f32 ≠ u32 */
+    {
+        jsdk_value_t bad;
+        memset(&bad, 0, sizeof bad);
+        bad.type = JSDK_EP_F32;
+        bad.v.f32 = 1.0f;
+        CHECK_EQ(jsdk_joint_param_set(fx.j, "axis0.config.can.node_id", &bad),
+                 JSDK_ERR_PROTOCOL);
+        CHECK(strstr(jsdk_context_last_error(fx.ctx), "type mismatch") != NULL);
+    }
+
+    /* --- 真正的写入 + 读回 --- */
+    {
+        uint32_t before = 0u, after = 0u;
+        float    flim = 0.0f;
+
+        CHECK_EQ(jsdk_joint_param_get_u32(fx.j, "axis0.config.can.node_id", &before),
+                 JSDK_OK);
+        CHECK_EQ(before, 1u);
+
+        /* 写 u32 端点：node_id 改成 1（幂等），确认写路径通 */
+        CHECK_EQ(jsdk_joint_param_set_u32(fx.j, "axis0.config.can.node_id", 1u), JSDK_OK);
+        CHECK_EQ(jsdk_joint_param_get_u32(fx.j, "axis0.config.can.node_id", &after),
+                 JSDK_OK);
+        CHECK_EQ(after, 1u);
+
+        /* u32 便利函数写 u16 端点应自动按宽度降级（不截断成 0） */
+        CHECK_EQ(jsdk_joint_param_set_u32(fx.j, "can.config.break_timeout", 1234u),
+                 JSDK_OK);
+        {
+            uint32_t bt = 0u;
+            CHECK_EQ(jsdk_joint_param_get_u32(fx.j, "can.config.break_timeout", &bt),
+                     JSDK_OK);
+            CHECK_EQ(bt, 1234u);
+        }
+
+        CHECK_EQ(jsdk_joint_param_set_f32(fx.j,
+                                          "axis0.controller.config.vel_limit", 42.5f),
+                 JSDK_OK);
+        CHECK_EQ(jsdk_joint_param_get_f32(fx.j,
+                                          "axis0.controller.config.vel_limit", &flim),
+                 JSDK_OK);
+        CHECK_NEAR(flim, 42.5f, 1e-6);
+        printf("      typed get/set ok (f32/u32/bool, width auto-degrade, "
+               "type mismatch rejected)\n");
+    }
+
+    /* --- 批量读（FD：必须在**一帧**里完成） --- */
+    {
+        jsdk_param_req_t reqs[6];
+        static const char *const paths[6] = {
+            "axis0.motor.config.gear_ratio",            /* f32 */
+            "axis0.config.can.node_id",                 /* u32 */
+            "can.config.break_timeout",                 /* u16 */
+            "axis0.controller.config.control_mode",     /* u8  */
+            "axis0.config.enable_watchdog",             /* bool */
+            "axis0.motor.config.torque_constant"        /* f32 */
+        };
+        unsigned i;
+
+        drain_tx(&fx);
+        for (i = 0u; i < 6u; ++i) {
+            reqs[i].path = paths[i];
+            memset(&reqs[i].value, 0, sizeof reqs[i].value);
+            reqs[i].status = JSDK_OK;
+        }
+
+        CHECK_EQ(jsdk_joint_param_get_batch(fx.j, reqs, 6u), JSDK_OK);
+        for (i = 0u; i < 6u; ++i) {
+            CHECK_EQ(reqs[i].status, JSDK_OK);
+        }
+
+        /* 逐条单读对照 */
+        for (i = 0u; i < 6u; ++i) {
+            jsdk_value_t solo;
+            CHECK_EQ(jsdk_joint_param_get(fx.j, paths[i], &solo), JSDK_OK);
+            CHECK_EQ(solo.type, reqs[i].value.type);
+            switch (solo.type) {
+            case JSDK_EP_F32:   CHECK_NEAR(solo.v.f32, reqs[i].value.v.f32, 1e-6); break;
+            case JSDK_EP_U32:   CHECK_EQ(solo.v.u32, reqs[i].value.v.u32); break;
+            case JSDK_EP_U16:   CHECK_EQ(solo.v.u16, reqs[i].value.v.u16); break;
+            case JSDK_EP_U8:    CHECK_EQ(solo.v.u8,  reqs[i].value.v.u8);  break;
+            case JSDK_EP_BOOL:  CHECK_EQ(solo.v.boolean, reqs[i].value.v.boolean); break;
+            default: break;
+            }
+        }
+
+        /* 批量请求帧数：应为 1 帧（62 B 预算装 6 条 18 B 绰绰有余） */
+        {
+            unsigned nb = count_tx(&fx, CB_MSG_PARAM_READ, 1);
+            CHECK_EQ(nb, 1u);
+            printf("      6 mixed-type endpoints in %u batch frame "
+                   "(values match individual reads)\n", nb);
+        }
+    }
+
+    /* --- 批量读里的坏路径：只影响那一条，其余照常 --- */
+    {
+        jsdk_param_req_t reqs[3];
+        reqs[0].path = "axis0.motor.config.gear_ratio";
+        reqs[1].path = "no.such.endpoint";
+        reqs[2].path = "axis0.config.can.node_id";
+        memset(reqs[0].value.v.u64 ? &reqs[0].value : &reqs[0].value, 0, 0);
+        CHECK_EQ(jsdk_joint_param_get_batch(fx.j, reqs, 3u), JSDK_OK);
+        CHECK_EQ(reqs[0].status, JSDK_OK);
+        CHECK_EQ(reqs[1].status, JSDK_ERR_NOT_FOUND);
+        CHECK_EQ(reqs[2].status, JSDK_OK);
+        printf("      bad path in a batch only fails that entry\n");
+    }
+
+    /* --- Classic：自动退化为逐条，且**不发**批量请求 --- */
+    {
+        jsdk_param_req_t reqs[3];
+        fix_t cx;
+
+        if (fx_open(&cx, "0:id=1,gear=16.0,tconst=0.0385,pmax=12.5,vmax=65,tmax=50,"
+                         "kpmax=500,kdmax=5,hb=10,timeout=30000,classic", 1u) == 0) {
+            cx.cfg.is_fd = 0u;
+            /* is_fd 影响帧编码，必须重新 init */
+            jsdk_context_destroy(cx.ctx);
+            cx.cfg.hal = cx.hal;
+            if (jsdk_context_init((jsdk_context_t *)&cx.store, &cx.cfg) == JSDK_OK) {
+                cx.ctx = (jsdk_context_t *)&cx.store;
+                if (jsdk_context_add_joint(cx.ctx, &cx.jc[0], &cx.j) == JSDK_OK) {
+                    if (fx_configure(&cx) == 0) {
+                        reqs[0].path = "axis0.motor.config.gear_ratio";
+                        reqs[1].path = "axis0.config.enable_watchdog";
+                        reqs[2].path = "axis0.motor.config.current_lim";
+                        drain_tx(&cx);
+                        CHECK_EQ(jsdk_joint_param_get_batch(cx.j, reqs, 3u), JSDK_OK);
+                        CHECK_EQ(reqs[0].status, JSDK_OK);
+                        CHECK_EQ(reqs[1].status, JSDK_OK);
+                        CHECK_EQ(reqs[2].status, JSDK_OK);
+                        CHECK_NEAR(reqs[0].value.v.f32, 16.0f, 1e-6);
+                        CHECK_EQ(count_tx(&cx, CB_MSG_PARAM_READ, 1), 0u); /* 无批量帧 */
+                        printf("      Classic: batch auto-degraded to single reads "
+                               "(0 batch frames)\n");
+                    }
+                }
+            }
+            fx_close(&cx);
+        }
+    }
+
+    fx_close(&fx);
+}
+
+/* ==========================================================================
+ * 3. SDO 槽位（WP5）
+ * ======================================================================== */
+
+static void test_sdo(void)
+{
+    fix_t fx;
+    jsdk_sdo_handle_t h;
+
+    printf("[3] SDO-style slots\n");
+
+    if (fx_open(&fx, "0:id=1,gear=16.0,tconst=0.0385,pmax=12.5,vmax=65,tmax=50,"
+                     "kpmax=500,kdmax=5,hb=10,timeout=30000,fd", 1u) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+    if (fx_configure(&fx) != 0) { g_fail++; g_checks++; fx_close(&fx); return; }
+
+    h = jsdk_joint_sdo_create_by_name(fx.j, "axis0.motor.config.gear_ratio");
+    CHECK(h > 0);
+    CHECK_EQ(jsdk_joint_sdo_data_size(fx.j, h), 4u);
+    CHECK_EQ(jsdk_joint_sdo_state(fx.j, h), JSDK_SDO_IDLE);
+    CHECK(jsdk_joint_sdo_data(fx.j, h) != NULL);
+
+    CHECK_EQ(jsdk_joint_sdo_read(fx.j, h), JSDK_OK);
+    CHECK_EQ(jsdk_joint_sdo_state(fx.j, h), JSDK_SDO_SUCCESS);
+    CHECK_EQ(cb_be_get_f32(jsdk_joint_sdo_data(fx.j, h)), 16.0f);
+
+    /* 写回同一个值（幂等），再读回 */
+    {
+        uint8_t *d = jsdk_joint_sdo_data(fx.j, h);
+        cb_be_put_f32(d, 20.0f);
+        CHECK_EQ(jsdk_joint_sdo_write(fx.j, h), JSDK_OK);
+        CHECK_EQ(jsdk_joint_sdo_state(fx.j, h), JSDK_SDO_SUCCESS);
+        CHECK_EQ(jsdk_joint_sdo_read(fx.j, h), JSDK_OK);
+        CHECK_NEAR(cb_be_get_f32(jsdk_joint_sdo_data(fx.j, h)), 20.0f, 1e-5);
+    }
+
+    /* 只读端点写：必须报 UNSUPPORTED */
+    {
+        jsdk_sdo_handle_t ro = jsdk_joint_sdo_create_by_name(fx.j, "axis0.encoder.pos_estimate");
+        CHECK(ro > 0);
+        CHECK_EQ(jsdk_joint_sdo_write(fx.j, ro), JSDK_ERR_UNSUPPORTED);
+    }
+
+    /* subindex 必须为 0（本协议端点 ID 是平铺的） */
+    CHECK_EQ(jsdk_joint_sdo_create(fx.j, 242u, 1u, 4u), -1);
+    CHECK_EQ(jsdk_joint_sdo_create(fx.j, 242u, 0u, 9u), -1);       /* 宽度上限 8 */
+
+    /* 非法句柄 */
+    CHECK_EQ(jsdk_joint_sdo_state(fx.j, 0), JSDK_SDO_ERROR);
+    CHECK_EQ(jsdk_joint_sdo_state(fx.j, 99), JSDK_SDO_ERROR);
+    CHECK(jsdk_joint_sdo_data(fx.j, 99) == NULL);
+
+    printf("      create/read/write/state ok; read-only and bad handles rejected\n");
+    fx_close(&fx);
+}
+
+/* ==========================================================================
+ * 4. 节点发现（WP5）
+ * ======================================================================== */
+
+static void test_discover(void)
+{
+    fix_t fx;
+    uint8_t ids[16];
+    unsigned found = 0u;
+
+    printf("[4] node discovery\n");
+
+    /* 4 节点总线（SIM_MAX_NODES = 4），心跳 10 ms → 被动发现能全部看到 */
+    if (fx_open(&fx, "0:id=1,hb=10,fd;1:id=2,hb=10,fd;"
+                     "2:id=3,hb=10,fd;3:id=4,hb=10,fd", 1u) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+    if (fx_configure(&fx) != 0) { g_fail++; g_checks++; fx_close(&fx); return; }
+
+    /* 被动：先把心跳攒起来（本 HAL 的 now_ms 会自动推进时间） */
+    {
+        unsigned i;
+        for (i = 0u; i < 40u; ++i) fx_cycle(&fx);
+    }
+
+    CHECK_EQ(jsdk_context_discover(fx.ctx, ids, 16u, &found, 0u), JSDK_OK);
+    CHECK_EQ(found, 4u);
+    {
+        unsigned i; int seen[5] = { 0, 0, 0, 0, 0 };
+        for (i = 0u; i < found; ++i) {
+            CHECK(ids[i] >= 1u && ids[i] <= 4u);
+            seen[ids[i]] = 1;
+        }
+        for (i = 1u; i <= 4u; ++i) CHECK(seen[i] == 1);
+    }
+    printf("      passive: found %u node(s) from heartbeats\n", found);
+
+    /* 主动探测：关掉心跳后仍应找到（靠 QUERY_STATUS 轮询） */
+    {
+        unsigned n, i;
+        for (n = 0u; n < fx.sim->n_nodes; ++n) fx.sim->nodes[n].heartbeat_rate_ms = 0u;
+        /* 排空队列里残留的心跳 */
+        for (i = 0u; i < 100u; ++i) fx_cycle(&fx);
+
+        found = 0u;
+        CHECK_EQ(jsdk_context_discover(fx.ctx, ids, 16u, &found, 4u), JSDK_OK);
+        /* 4 个节点都必须被发现 */
+        CHECK_EQ(found, 4u);
+        printf("      active probe (heartbeats off): found %u node(s)\n", found);
+    }
+
+    /* 使能中禁止发现 */
+    {
+        jsdk_joint_request_enable(fx.j, JSDK_MODE_MIT);
+        {
+            unsigned i;
+            for (i = 0u; i < 20u && !jsdk_joint_is_enabled(fx.j); ++i) fx_cycle(&fx);
+        }
+        CHECK_EQ(jsdk_joint_is_enabled(fx.j), 1);
+        found = 99u;
+        CHECK_EQ(jsdk_context_discover(fx.ctx, ids, 16u, &found, 4u),
+                 JSDK_ERR_BAD_STATE);
+        CHECK_EQ(found, 0u);
+        printf("      refused while enabled\n");
+    }
+
+    fx_close(&fx);
+}
+
+/**
+ * 5. 运维操作（WP5）
+ * ======================================================================== */
+
+static void test_ops(void)
+{
+    fix_t fx;
+    unsigned i;
+
+    printf("[5] operations: zero / calibrate / home / save / node-id / watchdog\n");
+
+    if (fx_open(&fx, "0:id=1,gear=16.0,tconst=0.0385,pmax=12.5,vmax=65,tmax=50,"
+                     "kpmax=500,kdmax=5,hb=10,timeout=30000,fd", 1u) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+    if (fx_configure(&fx) != 0) { g_fail++; g_checks++; fx_close(&fx); return; }
+
+    /* --- 零点：发 0x61 并**读回位置**确认真的归零了 --- */
+    for (i = 0u; i < 5u; ++i) fx_cycle(&fx);
+    CHECK_EQ(jsdk_joint_set_zero_here(fx.j), JSDK_OK);
+    printf("      set_zero_here: %s\n", jsdk_context_last_error(fx.ctx));
+
+    /* --- 标定：使能中必须被拒（§6.4：标定要求 IDLE） --- */
+    {
+        jsdk_joint_request_enable(fx.j, JSDK_MODE_MIT);
+        for (i = 0u; i < 20u && !jsdk_joint_is_enabled(fx.j); ++i) fx_cycle(&fx);
+        CHECK_EQ(jsdk_joint_is_enabled(fx.j), 1);
+
+        CHECK_EQ(jsdk_joint_calibrate(fx.j), JSDK_ERR_BAD_STATE);
+        CHECK(strstr(jsdk_context_last_error(fx.ctx), "disabled") != NULL);
+
+        /* 失能后可以标定 */
+        jsdk_joint_request_disable(fx.j);
+        for (i = 0u; i < 20u && jsdk_joint_is_enabled(fx.j); ++i) fx_cycle(&fx);
+        CHECK_EQ(jsdk_joint_is_enabled(fx.j), 0);
+        printf("      calibrate refused while enabled (correct), enabled -> disabled\n");
+
+        drain_tx(&fx);
+        CHECK_EQ(jsdk_joint_calibrate(fx.j), JSDK_OK);
+        printf("      calibrate: %s\n", jsdk_context_last_error(fx.ctx));
+        /* 标定期间**不得**发出任何控制帧 */
+        CHECK_EQ(count_tx(&fx, CB_MSG_MIT_CONTROL, 0), 0u);
+        CHECK_EQ(count_tx(&fx, CB_MSG_POS_CONTROL, 0), 0u);
+        CHECK_EQ(count_tx(&fx, CB_MSG_CURRENT_CONTROL, 0), 0u);
+        /* 状态必须真的走完：current_state 回到 IDLE */
+        CHECK_EQ(fx.j->current_state_raw, SIM_AS_IDLE);
+        printf("      calibrate finished: current_state=%u (%s)\n",
+               (unsigned)fx.j->current_state_raw,
+               jsdk_can_axis_state_name(fx.j->current_state_raw));
+    }
+
+    /* --- 回零：写 requested_state = 11，等它离开瞬时态 --- */
+    {
+        drain_tx(&fx);
+        CHECK_EQ(jsdk_joint_home(fx.j), JSDK_OK);
+        CHECK_EQ(fx.j->current_state_raw, SIM_AS_CLOSED_LOOP);
+        printf("      home finished: current_state=%u (%s)\n",
+               (unsigned)fx.j->current_state_raw,
+               jsdk_can_axis_state_name(fx.j->current_state_raw));
+    }
+
+    /* --- 保存配置：无应答 → 用读回校验 --- */
+    CHECK_EQ(jsdk_joint_save_config(fx.j), JSDK_OK);
+    printf("      save_config verified: %s\n", jsdk_context_last_error(fx.ctx));
+
+    /* --- 看门狗超时：写端点 73 并读回校验 --- */
+    CHECK_EQ(jsdk_joint_set_watchdog_ms(fx.j, 250u), JSDK_OK);
+    CHECK_EQ(fx.j->break_timeout_ms, 250u);
+    CHECK_EQ(fx.sim->nodes[0].break_timeout, 250u);
+    printf("      set_watchdog_ms(250) verified by read-back\n");
+
+    /* 0 ms 不是"关闭"：必须给出警告而不是静默接受 */
+    CHECK_EQ(jsdk_joint_set_watchdog_ms(fx.j, 0u), JSDK_OK);
+    CHECK(strstr(jsdk_context_last_error(fx.ctx), "NOT disabled") != NULL);
+    printf("      set_watchdog_ms(0) warns: %s\n", jsdk_context_last_error(fx.ctx));
+
+    /* 超出 u16 必须拒绝（静默截断会让客户以为设成了更大的值） */
+    CHECK_EQ(jsdk_joint_set_watchdog_ms(fx.j, 70000u), JSDK_ERR_INVALID_ARG);
+
+    /* --- 改节点号：新地址必须能应答，否则不改本地 id --- */
+    CHECK_EQ(jsdk_joint_set_node_id(fx.j, 2u, 0), JSDK_OK);
+    CHECK_EQ(fx.j->cfg.node_id, 2u);
+    CHECK_EQ(fx.sim->nodes[0].node_id, 2u);
+    CHECK_EQ(jsdk_ctx_find_joint(fx.ctx, 2u), fx.j);      /* 查找跟着走 */
+    CHECK(jsdk_ctx_find_joint(fx.ctx, 1u) == NULL);
+    printf("      set_node_id: %s\n", jsdk_context_last_error(fx.ctx));
+
+    /* 冲突检测：本总线上其它关节已占用该号时要拒绝 */
+    {
+        fix_t gx;
+        if (fx_open(&gx, "0:id=1,timeout=30000,fd;1:id=2,timeout=30000,fd", 2u) == 0) {
+            if (fx_configure(&gx) == 0) {
+                CHECK_EQ(jsdk_joint_set_node_id(&gx.ctx->joints[0], 2u, 0),
+                         JSDK_ERR_INVALID_ARG);
+                CHECK_EQ(jsdk_joint_set_node_id(&gx.ctx->joints[0], 0u, 0),
+                         JSDK_ERR_INVALID_ARG);
+                CHECK_EQ(jsdk_joint_set_node_id(&gx.ctx->joints[0], 255u, 0),
+                         JSDK_ERR_INVALID_ARG);
+                printf("      set_node_id rejects conflicts and out-of-range ids\n");
+            }
+            fx_close(&gx);
+        }
+    }
+
+    /*
+     * 冲突检测的另一半：目标号被**总线上的其它设备**占用，但那个设备不在本
+     * 上下文里（CLI/Python 只加自己关心的关节时就长这样）。
+     * 这里只有 1 个关节、总线上却有 2 台设备，所以「本上下文内冲突」检查看不到它。
+     * 若不拦，总线上会出现两个同号设备，而“新地址能应答”的验证还会被原来那台
+     * 设备满足 → 报成功。
+     */
+    {
+        fix_t hx;
+        if (fx_open(&hx, "0:id=1,timeout=30000,fd;1:id=2,timeout=30000,fd", 1u) == 0) {
+            if (fx_configure(&hx) == 0) {
+                CHECK_EQ(hx.ctx->nj, 1u);            /* 上下文里只有 node 1 */
+                CHECK_EQ(hx.sim->nodes[1].node_id, 2u);  /* 但总线上确实有 node 2 */
+                CHECK_EQ(jsdk_joint_set_node_id(hx.j, 2u, 0), JSDK_ERR_INVALID_ARG);
+                CHECK(strstr(jsdk_context_last_error(hx.ctx), "already answers") != NULL);
+                CHECK_EQ(hx.sim->nodes[0].node_id, 1u);  /* 设备没被改号 */
+
+                /* 而一个**空闲**的号仍然能改过去 */
+                CHECK_EQ(jsdk_joint_set_node_id(hx.j, 9u, 0), JSDK_OK);
+                CHECK_EQ(hx.sim->nodes[0].node_id, 9u);
+
+                /* 改成自己当前的号：探测会撞上自己 → 必须跳过探测 */
+                CHECK_EQ(jsdk_joint_set_node_id(hx.j, 9u, 0), JSDK_OK);
+                printf("      set_node_id refuses an id held by another device on the bus\n");
+            }
+            fx_close(&hx);
+        }
+    }
+
+    /* --- 复位：本地状态必须被清干净（否则会拿旧状态判断新设备） --- */
+    fx.j->first_frame_done = 1u;
+    fx.j->current_state_raw = 8u;
+    fx.j->state_known = 1u;
+    CHECK_EQ(jsdk_joint_reset_device(fx.j), JSDK_OK);
+    CHECK_EQ(fx.j->first_frame_done, 0u);
+    CHECK_EQ(fx.j->state_known, 0u);
+    CHECK_EQ(fx.j->enabled, 0u);
+    CHECK((fx.j->status_flags & JSDK_JF_SCALE_INVALID) != 0);
+    printf("      reset_device cleared local state and re-handshook\n");
+
+    fx_close(&fx);
+}
+
+/* ==========================================================================
+ * 6. WP4：反馈新鲜度与链路健康
+ * ======================================================================== */
+
+static unsigned g_fault_cb_hits;
+
+/** 故障回调（RT 安全上下文：只计数，不打印、不加锁） */
+static void faultcb_count(jsdk_joint_t *j, const jsdk_fault_info_t *info, void *user)
+{
+    (void)j; (void)info; (void)user;
+    g_fault_cb_hits++;
+}
+
+/* ==========================================================================
+ * 5b. jsdk_context_activate()（v0.14 新增覆盖）
+ *
+ * 这一段是**补漏**：整套测试此前**从未调用** activate()，于是它里面藏着一个
+ * 会让"使能"永久卡死的缺陷（见下面两个用例的注释）。
+ * ==========================================================================
+ */
+
+static void test_activate(void)
+{
+    printf("[5b] jsdk_context_activate()\n");
+
+    /* --- 1. 纯 activate()：必须真的把关节驱起来（含安全首帧） --- */
+    {
+        fix_t fx;
+        int rc;
+
+        if (fx_open(&fx, "0:id=1,gear=16.5,tconst=0.0385,pmax=12.5,vmax=65,"
+                         "tmax=50,kpmax=500,kdmax=5,hb=10,timeout=30000,fd", 1u) != 0) {
+            printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+        }
+        if (fx_configure(&fx) != 0) { g_fail++; g_checks++; fx_close(&fx); return; }
+
+        rc = jsdk_context_activate(fx.ctx);
+        if (rc != JSDK_OK) {
+            printf("      FATAL: activate -> %s (%s)\n", jsdk_status_string((jsdk_status_t)rc),
+                   jsdk_context_last_error(fx.ctx));
+            g_fail++; g_checks++; fx_close(&fx); return;
+        }
+
+        CHECK(jsdk_joint_is_enabled(fx.j));
+        /* ⚠ 只有**安全首帧真的发出去了**，tx_active / first_frame_done 才为真。
+           旧实现的 activate() 自己发 CLEAR_ERRORS/START_MOTOR 然后干等，
+           从不跑 L3 序列 —— 结果是 is_enabled() 变真、但安全首帧根本没发，
+           设备还停在默认的 POSITION 输入模式（就是 WP3 修过的"使能瞬间大跳变"，
+           只不过在 activate() 这条路上又活了一次）。 */
+        CHECK_EQ(fx.ctx->joints[0].tx_active, 1u);
+        CHECK_EQ(fx.ctx->joints[0].first_frame_done, 1u);
+        CHECK_EQ(fx.ctx->joints[0].enable_pending, 0u);
+        /* 设备侧真的被切到 MIT 输入模式（安全首帧把它从默认 POSITION 切过来）。
+           注意固件的 InputMode 与 ModeState nibble **不是**同一个东西：
+           这里看的是 `input_mode`（固件只在收到帧时才改它）。 */
+        CHECK_EQ(fx.sim->nodes[0].input_mode, SIM_INPUT_MODE_MIT);
+
+        printf("      activate() drives the joint: enabled, tx_active, "
+               "first frame sent, device in MIT input mode\n");
+        fx_close(&fx);
+    }
+
+    /* --- 2. 混用：先 request_enable() 再 activate() ---
+       这是最自然的客户写法（"我想使能，然后确认就绪"），也是头文件承诺的
+       "activate() 等价于逐个 request_enable + 等待就绪"。
+       旧实现会**永久卡死**：request_enable() 置 enable_pending = 1，
+       而 enabled 被 !enable_pending 门控，activate() 又不跑 cycle_end，
+       于是 pending 永远清不掉 → 一路超时。 */
+    {
+        fix_t fx;
+        int rc;
+
+        if (fx_open(&fx, "0:id=1,gear=16.5,tconst=0.0385,pmax=12.5,vmax=65,"
+                         "tmax=50,kpmax=500,kdmax=5,hb=10,timeout=30000,fd", 1u) != 0) {
+            g_fail++; g_checks++; return;
+        }
+        if (fx_configure(&fx) != 0) { g_fail++; g_checks++; fx_close(&fx); return; }
+
+        jsdk_joint_request_enable(fx.j, JSDK_MODE_MIT);
+        CHECK_EQ(fx.ctx->joints[0].enable_pending, 1u);
+
+        rc = jsdk_context_activate(fx.ctx);
+        if (rc != JSDK_OK) {
+            printf("      FATAL: enable()+activate() -> %s (%s)\n",
+                   jsdk_status_string((jsdk_status_t)rc),
+                   jsdk_context_last_error(fx.ctx));
+            g_fail++; g_checks++; fx_close(&fx); return;
+        }
+        CHECK(jsdk_joint_is_enabled(fx.j));
+        CHECK_EQ(fx.ctx->joints[0].enable_pending, 0u);
+        printf("      request_enable() + activate() 不冲突（只有一份使能实现）\n");
+        fx_close(&fx);
+    }
+
+    /* --- 3. 未标定 → 明确拒绝，且**不改任何状态** --- */
+    {
+        fix_t fx;
+
+        if (fx_open(&fx, "0:id=1,timeout=30000,fd", 1u) != 0) {
+            g_fail++; g_checks++; return;
+        }
+        /* 不 configure，直接 activate */
+        CHECK_EQ(jsdk_context_activate(fx.ctx), JSDK_ERR_BAD_STATE);
+        CHECK(strstr(jsdk_context_last_error(fx.ctx), "calibration") != NULL);
+        CHECK(!jsdk_joint_is_enabled(fx.j));
+        CHECK_EQ(fx.ctx->joints[0].enable_pending, 0u);   /* 没有被改坏 */
+        printf("      no calibration -> refused before touching anything\n");
+        fx_close(&fx);
+    }
+
+    /* --- 4. 幂等：已使能时再调一次不应报错、也不重复发序列 --- */
+    {
+        fix_t fx;
+        uint32_t tx_before;
+
+        if (fx_open(&fx, "0:id=1,gear=16.5,tconst=0.0385,pmax=12.5,vmax=65,"
+                         "tmax=50,kpmax=500,kdmax=5,hb=10,timeout=30000,fd", 1u) != 0) {
+            g_fail++; g_checks++; return;
+        }
+        if (fx_configure(&fx) != 0) { g_fail++; g_checks++; fx_close(&fx); return; }
+        CHECK_EQ(jsdk_context_activate(fx.ctx), JSDK_OK);
+        drain_tx(&fx);
+        tx_before = fx.ctx->bus.tx_frames;
+
+        CHECK_EQ(jsdk_context_activate(fx.ctx), JSDK_OK);
+        CHECK(fx.ctx->bus.tx_frames >= tx_before);   /* 不要求零帧，但不该爆量 */
+        CHECK(fx.ctx->bus.tx_frames - tx_before < 10u);
+        printf("      second activate() is a no-op-ish retry (%u frame(s))\n",
+               (unsigned)(fx.ctx->bus.tx_frames - tx_before));
+        fx_close(&fx);
+    }
+
+    /* --- 5. deactivate() 必须掐掉排队中的使能请求 ---
+       缺陷（WP8 self-review 发现，实测复现）：request_enable() 之后不跑周期，
+       直接 deactivate()，本函数只清了 disable_pending/seq_step/tx_active，
+       `enable_pending` 原样留着；而 advance_seq 的使能分支是**无条件**执行的，
+       于是 deactivate() 返回后的第一个 cycle_end 就把电机重新使能了 ——
+       "安全关闭"被一个陈旧请求悄悄撤销。而 deactivate() 的所有调用方
+       （jsdk-cli stop、Python Context.close()）都把它当成"断电已完成"。 */
+    {
+        fix_t fx;
+        unsigned n;
+
+        if (fx_open(&fx, "0:id=1,gear=16.5,tconst=0.0385,pmax=12.5,vmax=65,"
+                         "tmax=50,kpmax=500,kdmax=5,hb=10,timeout=30000,fd", 1u) != 0) {
+            g_fail++; g_checks++; return;
+        }
+        if (fx_configure(&fx) != 0) { g_fail++; g_checks++; fx_close(&fx); return; }
+
+        jsdk_joint_request_enable(fx.j, JSDK_MODE_MIT);   /* 只排队，不跑周期 */
+        CHECK_EQ(fx.ctx->joints[0].enable_pending, 1u);
+
+        jsdk_context_deactivate(fx.ctx);
+        CHECK_EQ(fx.ctx->joints[0].enable_pending, 0u);   /* ← 缺陷点 */
+        CHECK(!jsdk_joint_is_enabled(fx.j));
+
+        /* 关键：再跑一段周期，关节**不能**自己回来 */
+        for (n = 0u; n < 30u; ++n) fx_cycle(&fx);
+        CHECK(!jsdk_joint_is_enabled(fx.j));
+        CHECK_EQ(fx.ctx->joints[0].tx_active, 0u);
+        printf("      deactivate() cancels a pending enable (still off after 30 cycles)\n");
+        fx_close(&fx);
+    }
+
+    /* --- 6. disable() 后再 enable()：enable 必须咬得住 ---
+       缺陷（同一轮 review 发现）：request_disable() 会清 enable_pending，
+       但 request_enable() 不清 disable_pending，两个标志于是同时在排队。
+       advance_seq 先跑使能（使能生效、is_enabled 变真），使能序列收尾后
+       disable_pending 仍在 → 紧接着跑失能序列 → 关节在十几拍后**自己断开**，
+       且没有任何错误码。现场表现是"我使能了，动了一下就掉使能"。 */
+    {
+        fix_t fx;
+        unsigned n;
+        int saw_enabled = 0, saw_disabled_after = 0;
+
+        if (fx_open(&fx, "0:id=1,gear=16.5,tconst=0.0385,pmax=12.5,vmax=65,"
+                         "tmax=50,kpmax=500,kdmax=5,hb=10,timeout=30000,fd", 1u) != 0) {
+            g_fail++; g_checks++; return;
+        }
+        if (fx_configure(&fx) != 0) { g_fail++; g_checks++; fx_close(&fx); return; }
+
+        CHECK_EQ(jsdk_context_activate(fx.ctx), JSDK_OK);
+        CHECK(jsdk_joint_is_enabled(fx.j));
+
+        jsdk_joint_request_disable(fx.j);                 /* 只排队，不跑周期 */
+        jsdk_joint_request_enable(fx.j, JSDK_MODE_MIT);   /* 紧接着又要使能 */
+        CHECK_EQ(fx.ctx->joints[0].disable_pending, 0u);  /* ← 缺陷点 */
+        CHECK_EQ(fx.ctx->joints[0].enable_pending, 1u);
+
+        for (n = 0u; n < 40u; ++n) {
+            fx_cycle(&fx);
+            if (jsdk_joint_is_enabled(fx.j)) saw_enabled = 1;
+            else if (saw_enabled) { saw_disabled_after = 1; break; }
+        }
+        CHECK(saw_enabled);
+        CHECK(!saw_disabled_after);   /* 不能被残留的 disable 请求反手关掉 */
+        CHECK(jsdk_joint_is_enabled(fx.j));
+        printf("      disable()+enable(): stays enabled (no stale disable fires)\n");
+        fx_close(&fx);
+    }
+}
+
+/* ==========================================================================
+ * 5c. 8 字节参数的“精确读”（WP9）
+ *
+ * 缺陷背景：`jsdk_ctx_read_param()` 把请求里的 `ReqLen` 写死成 4，而
+ * `jsdk_joint_param_get()` 按**描述符类型长度**（u64/i64/f64 = 8）校验，
+ * 于是 8 字节端点**永远读不出来**，报的还是“设备只回了 4 字节，描述符说 8 字节”
+ * —— 把矛头指向固件/描述符，真正的原因在主站自己的请求里。
+ * ======================================================================== */
+
+static void test_wide_param_read(void)
+{
+    /* 模拟器里 serial_number 是固定常量 0x1122334455667788，可直接断言值 */
+    const unsigned long long k_serial = 0x1122334455667788ull;
+
+    printf("[5c] 8-byte parameter read (exact/chunked)\n");
+
+    /* --- 1. FD：一次请求就该拿满 8 字节 --- */
+    {
+        fix_t fx;
+        jsdk_value_t v;
+        uint32_t tx_before;
+        uint8_t  lens[4], reqlen[4];
+        uint32_t offs[4];
+        unsigned n_req;
+
+        if (fx_open(&fx, "0:id=1,gear=16.5,tconst=0.0385,pmax=12.5,vmax=65,"
+                         "tmax=50,kpmax=500,kdmax=5,hb=10,timeout=30000,fd", 1u) != 0) {
+            g_fail++; g_checks++; return;
+        }
+        if (fx_configure(&fx) != 0) { g_fail++; g_checks++; fx_close(&fx); return; }
+
+        drain_tx(&fx);
+        tx_before = fx.ctx->bus.tx_frames;
+        memset(&v, 0, sizeof v);
+        CHECK_EQ(jsdk_joint_param_get(fx.j, "serial_number", &v), JSDK_OK);
+        CHECK_EQ(v.type, JSDK_EP_U64);
+        CHECK_EQ(v.v.u64, k_serial);
+        /* FD 下一次请求就够：多了就说明在无意义地重复读 */
+        CHECK_EQ(fx.ctx->bus.tx_frames - tx_before, 1u);
+
+        /* 请求帧形状：旧式 4 B 形式，但 ReqLen 必须是 8（否则设备只给 4 B）*/
+        n_req = take_read_requests(&fx, lens, reqlen, offs, 4u);
+        CHECK_EQ(n_req, 1u);
+        CHECK_EQ(lens[0], 4u);
+        CHECK_EQ(reqlen[0], 8u);
+        CHECK_EQ(offs[0], 0u);
+
+        /* 64-bit 错误字（排障最常用的字段之一） */
+        memset(&v, 0, sizeof v);
+        CHECK_EQ(jsdk_joint_param_get(fx.j, "axis0.motor.error", &v), JSDK_OK);
+        CHECK_EQ(v.type, JSDK_EP_U64);
+        CHECK_EQ(v.v.u64, 0u);
+
+        printf("      FD: serial_number=0x%016llX, motor.error=0 (1 request each)\n",
+               (unsigned long long)k_serial);
+        fx_close(&fx);
+    }
+
+    /* --- 2. Classic：设备一次只能回 4 字节 → 必须分**两块**读满 --- */
+    {
+        fix_t fx;
+        jsdk_value_t v;
+        uint32_t tx_before;
+        uint8_t  lens[4], reqlen[4];
+        uint32_t offs[4];
+        unsigned n_req;
+
+        if (fx_open_flags(&fx, "0:id=1,gear=16.5,tconst=0.0385,pmax=12.5,vmax=65,"
+                               "tmax=50,kpmax=500,kdmax=5,hb=10,timeout=30000,"
+                               "classic", 1u, 0) != 0) {
+            g_fail++; g_checks++; return;
+        }
+        if (fx_configure(&fx) != 0) { g_fail++; g_checks++; fx_close(&fx); return; }
+
+        drain_tx(&fx);
+        tx_before = fx.ctx->bus.tx_frames;
+        memset(&v, 0, sizeof v);
+        CHECK_EQ(jsdk_joint_param_get(fx.j, "serial_number", &v), JSDK_OK);
+        CHECK_EQ(v.v.u64, k_serial);
+        /* ⚠ 必须**恰好 2 次**：1 次 = 我们只读了 4 字节却当成功（错），
+           3 次以上 = 分块逻辑在空转 */
+        CHECK_EQ(fx.ctx->bus.tx_frames - tx_before, 2u);
+
+        /* 两块请求的**帧形状**都要对：第一块旧式 4 B（offset 隐含 0），
+           第二块必须带 offset=4，否则设备会从 0 重新开始 */
+        n_req = take_read_requests(&fx, lens, reqlen, offs, 4u);
+        CHECK_EQ(n_req, 2u);
+        CHECK_EQ(lens[0], 4u);      CHECK_EQ(reqlen[0], 4u);  CHECK_EQ(offs[0], 0u);
+        CHECK_EQ(lens[1], 8u);      CHECK_EQ(reqlen[1], 4u);  CHECK_EQ(offs[1], 4u);
+
+        /* 4 字节的值在 Classic 下仍是一次搞定（不要“为了统一”多读一块） */
+        tx_before = fx.ctx->bus.tx_frames;
+        memset(&v, 0, sizeof v);
+        CHECK_EQ(jsdk_joint_param_get(fx.j, "axis0.motor.config.gear_ratio", &v),
+                 JSDK_OK);
+        CHECK_NEAR(v.v.f32, 16.5f, 1e-6);
+        CHECK_EQ(fx.ctx->bus.tx_frames - tx_before, 1u);
+
+        printf("      Classic: same value in exactly 2 requests (4 B each), "
+               "4 B value in 1\n");
+        fx_close(&fx);
+    }
+
+    /* --- 3. 短值：设备给的比要的少 → 明确报错，不把截断值当成功 --- */
+    {
+        fix_t fx;
+        uint8_t buf[8];
+        uint8_t len = 0xEEu;
+
+        if (fx_open(&fx, "0:id=1,gear=16.5,tconst=0.0385,pmax=12.5,vmax=65,"
+                         "tmax=50,kpmax=500,kdmax=5,hb=10,timeout=30000,fd", 1u) != 0) {
+            g_fail++; g_checks++; return;
+        }
+        if (fx_configure(&fx) != 0) { g_fail++; g_checks++; fx_close(&fx); return; }
+
+        /* gear_ratio 是 4 字节，却硬要 8 字节：设备只能说“没有了” */
+        CHECK_EQ(jsdk_ctx_read_param_exact(fx.ctx, 1u,
+                                           (uint16_t)242u /* gear_ratio */,
+                                           buf, 8u, &len, 0u),
+                 JSDK_ERR_PROTOCOL);
+        CHECK(strstr(jsdk_context_last_error(fx.ctx), "shorter") != NULL);
+        printf("      short value -> PROTOCOL with an actionable message\n");
+        fx_close(&fx);
+    }
+}
+
+static void test_robustness(void)
+{
+    fix_t fx;
+    unsigned i;
+
+    printf("[6] robustness: feedback freshness / link health / fault edge\n");
+
+    if (fx_open(&fx, "0:id=1,gear=16.0,tconst=0.0385,pmax=12.5,vmax=65,tmax=50,"
+                     "kpmax=500,kdmax=5,hb=10,timeout=30000,fd", 1u) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+    if (fx_configure(&fx) != 0) { g_fail++; g_checks++; fx_close(&fx); return; }
+
+    /* 阈值由观测推导：心跳 10 ms → 3×10 = 30；控制周期 1 ms → 6×1 = 6；下限 50
+       ⇒ 取 50 ms。客户不需要为它调参。 */
+    CHECK_EQ(jsdk_joint_stale_ms(fx.j), 50u);
+    printf("      stale threshold derived = %u ms\n", (unsigned)jsdk_joint_stale_ms(fx.j));
+
+    /* 心跳让反馈保持新鲜 */
+    for (i = 0u; i < 20u; ++i) fx_cycle(&fx);
+    {
+        jsdk_joint_feedback_t fb;
+        CHECK_EQ(jsdk_joint_get_feedback(fx.j, &fb), JSDK_OK);
+        CHECK_EQ(fb.online, 1);
+        CHECK((fb.status_flags & JSDK_JF_FEEDBACK_STALE) == 0);
+        CHECK(fb.age_ms < 50u);
+    }
+
+    /* 把设备的心跳**彻底关掉**，再收 5 个控制周期（这样 age 才会单调增长；
+       只是"不跑循环"的话帧会堆在 RX 环里，下一周期一次性收上来，
+       age 立刻回到 0，反而看不出问题）。 */
+    {
+        jsdk_joint_feedback_t fb;
+        unsigned n;
+
+        fx.sim->nodes[0].heartbeat_rate_ms = 0u;
+        drain_tx(&fx);
+
+        for (n = 0u; n < 120u; ++n) {
+            fx_cycle(&fx);
+            if ((fx.j->status_flags & JSDK_JF_FEEDBACK_STALE) != 0) break;
+        }
+        CHECK_EQ(jsdk_joint_get_feedback(fx.j, &fb), JSDK_OK);
+        CHECK((fb.status_flags & JSDK_JF_FEEDBACK_STALE) != 0);
+        CHECK(fb.age_ms > jsdk_joint_stale_ms(fx.j));
+        printf("      heartbeats off: age_ms=%u > threshold %u, "
+               "FEEDBACK_STALE set after %u cycles\n",
+               (unsigned)fb.age_ms, (unsigned)jsdk_joint_stale_ms(fx.j), n + 1u);
+
+        /* 粘滞：恢复后要显式清除，现场才能看到"曾经掉过" */
+        fx.sim->nodes[0].heartbeat_rate_ms = 10u;
+        for (n = 0u; n < 10u; ++n) fx_cycle(&fx);
+        CHECK_EQ(jsdk_joint_get_feedback(fx.j, &fb), JSDK_OK);
+        CHECK((fb.status_flags & JSDK_JF_FEEDBACK_STALE) != 0);   /* 仍粘滞 */
+        jsdk_joint_clear_status_flags(fx.j, JSDK_JF_FEEDBACK_STALE);
+        fx_cycle(&fx);
+        CHECK_EQ(jsdk_joint_get_feedback(fx.j, &fb), JSDK_OK);
+        CHECK((fb.status_flags & JSDK_JF_FEEDBACK_STALE) == 0);
+        printf("      flag is sticky until cleared explicitly\n");
+    }
+
+    /* 发送失败 → tx_failed 与 JSDK_JF_TX_FAILED */
+    {
+        jsdk_bus_state_t bs;
+        jsdk_joint_feedback_t fb;
+
+        jsdk_joint_request_enable(fx.j, JSDK_MODE_MIT);
+        for (i = 0u; i < 20u && !jsdk_joint_is_enabled(fx.j); ++i) fx_cycle(&fx);
+        CHECK_EQ(jsdk_joint_is_enabled(fx.j), 1);
+
+        jsdk_hal_virtual_set_tx_fail(fx.h, -1);       /* 后续全部发送失败 */
+        for (i = 0u; i < 3u; ++i) fx_cycle(&fx);
+
+        CHECK_EQ(jsdk_context_get_bus_state(fx.ctx, &bs), JSDK_OK);
+        CHECK(bs.tx_failed > 0u);
+        CHECK_EQ(jsdk_joint_get_feedback(fx.j, &fb), JSDK_OK);
+        CHECK((fb.status_flags & JSDK_JF_TX_FAILED) != 0);
+        printf("      tx failure recorded: tx_failed=%u, JSDK_JF_TX_FAILED set\n",
+               (unsigned)bs.tx_failed);
+
+        jsdk_hal_virtual_set_tx_fail(fx.h, 0);        /* 恢复 */
+        for (i = 0u; i < 5u; ++i) fx_cycle(&fx);
+        CHECK_EQ(jsdk_context_get_bus_state(fx.ctx, &bs), JSDK_OK);
+        CHECK_EQ(bs.link_errors, 0u);                 /* 虚拟后端不上报 recv 错误 */
+        CHECK_EQ(bs.nodes_online, 1u);
+    }
+
+    /* 故障边沿：回调只在 0→1 时触发一次，且错误串必须给出恢复路径 */
+    {
+        jsdk_joint_feedback_t fb;
+        uint32_t saved_endpoint[2];
+
+        g_fault_cb_hits = 0u;
+        jsdk_context_set_fault_callback(fx.ctx, faultcb_count, NULL);
+
+        /* 注入设备侧 CAN_BUS_FAILED（模拟协议级超时） */
+        fx.sim->nodes[0].error_axis |= SIM_ERR_CAN_BUS_FAILED;
+        saved_endpoint[0] = fx.sim->nodes[0].error_axis;
+        (void)saved_endpoint;
+
+        for (i = 0u; i < 3u; ++i) fx_cycle(&fx);
+
+        CHECK_EQ(jsdk_joint_is_fault(fx.j), 1);
+        CHECK_EQ(g_fault_cb_hits, 1u);                        /* 边沿 → 只一次 */
+        CHECK(strstr(jsdk_context_last_error(fx.ctx), "recovery") != NULL);
+        CHECK(strstr(jsdk_context_last_error(fx.ctx), "request_fault_reset") != NULL);
+        CHECK_EQ(jsdk_joint_get_feedback(fx.j, &fb), JSDK_OK);
+        CHECK((fb.status_flags & JSDK_JF_FEEDBACK_STALE) == 0);
+        printf("      fault edge: cb=%u, err=\"%s\"\n", g_fault_cb_hits,
+               jsdk_context_last_error(fx.ctx));
+
+        /* 再跑几轮不应重复回调 */
+        for (i = 0u; i < 3u; ++i) fx_cycle(&fx);
+        CHECK_EQ(g_fault_cb_hits, 1u);
+
+        /* 恢复路径：request_fault_reset → 故障清除 */
+        jsdk_joint_request_fault_reset(fx.j);
+        for (i = 0u; i < 30u && jsdk_joint_is_fault(fx.j); ++i) fx_cycle(&fx);
+        CHECK_EQ(jsdk_joint_is_fault(fx.j), 0);
+        printf("      recovery path: request_fault_reset cleared the fault\n");
+
+        jsdk_context_set_fault_callback(fx.ctx, NULL, NULL);
+    }
+
+    fx_close(&fx);
+}
+
+int main(void)
+{
+    setvbuf(stdout, NULL, _IONBF, 0);
+    printf("=== WP4/WP5 tests (robustness + operations) ===\n\n");
+    if (load_fixture() != 0) {
+        printf("FATAL: cannot read fixture\n");
+        return 1;
+    }
+    printf("fixture: %u bytes\n\n", (unsigned)g_json_len);
+
+    test_fault_text();   printf("\n");
+    test_params();       printf("\n");
+    test_sdo();          printf("\n");
+    test_discover();     printf("\n");
+    test_ops();          printf("\n");
+    test_activate();     printf("\n");
+    test_wide_param_read(); printf("\n");
+    test_robustness();   printf("\n");
+
+    free(g_json);
+    printf("=== %u checks, %u failures ===\n", g_checks, g_fail);
+    return g_fail != 0u ? 1 : 0;
+}
