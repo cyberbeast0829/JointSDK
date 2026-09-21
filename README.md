@@ -263,10 +263,17 @@ for (;;) {                                /* 控制循环：RT 安全 */
 #   ↑ 负数、0x 前缀、小数都支持
 
 # 看门狗超时：**0 = 关闭**设备侧协议级超时检测；非 0 = 毫秒数
-./build/jsdk-cli --if slcan --channel COM3 --node 1 --json --yes watchdog 250
-# {"ms":250,"device_reports_ms":0,"verified":false,"disabled":false}
-#   ↑ 真机实测：该端点**读回恒为 0**（写进去了也读不回），`verified:false` 就是如实说
-#     “没法确认已武装” —— 见 FIRMWARE_ISSUES F28
+./build/jsdk-cli --if slcan --channel COM3 --node 1 --json --yes watchdog 300
+# {"ms":300,"device_reports_ms":300,"verified":true,"disabled":false}
+#   ↑ 真机实测（COM3 / fw 1545）：写 300 → 读回 300，verified=true。
+#     注意：**非 0 就是真的武装**——之后若停发控制帧，设备会在 break_timeout 后
+#     置 ERROR_CAN_BUS_FAILED 并 disarm（实测过）。测试完记得写回 0 或继续喂心跳。
+
+./build/jsdk-cli --if slcan --channel COM3 --node 1 --json --yes write axis0.config.enable_watchdog 0
+# {"path":"axis0.config.enable_watchdog","id":154,"type":"bool",
+#  "requested":false,"value":false,"verified":true,"persisted":"no (use save to persist)"}
+#   ↑ 每个 write 都**读回验证**：`verified:false` / 退出码 1 表示设备没接受这一帧
+#     （曾经的坑：SDK 发的参数写帧不足 8 字节，被固件静默丢弃 —— 见 PROTOCOL_NOTES §5.4）
 
 ./build/jsdk-cli --if slcan --channel COM3 --node 1 --yes save            # 落 Flash
 ./build/jsdk-cli --if slcan --channel COM3 --node 1 --yes set-node-id 2   # 改地址（会先探测冲突）
@@ -278,6 +285,9 @@ for (;;) {                                /* 控制循环：RT 安全 */
 # 零点 / 标定 / 回零
 ./build/jsdk-cli --if slcan --channel COM3 --node 1 --yes set-zero
 ./build/jsdk-cli --if slcan --channel COM3 --node 1 --yes calibrate       # 写 requested_state=3 并等待
+#   ↑ 真机实测整条序列 **29.5 s**（子状态 4 电机标定 → 7 索引搜索 → 1），
+#     默认预算 120 s；要改就加 `--timeout-ms 300000`。
+#     跑完会读回两个 pre_calibrated 标志：true 才算真的落上了（状态跑完 ≠ 生效）。
 ./build/jsdk-cli --if slcan --channel COM3 --node 1 --yes home            # 写 requested_state=11 并等待
 
 # 唯一会驱动电机的命令：**必须**同时给 --yes 与 --hold（秒，1..60 自限时）
@@ -328,7 +338,7 @@ for (;;) {                                /* 控制循环：RT 安全 */
 | 文档 | 内容 |
 |---|---|
 | [`docs/DESIGN.zh-CN.md`](docs/DESIGN.zh-CN.md) | 总体设计、ADR、分层、API 骨架、工作包与验收、变更记录 |
-| [`docs/FIRMWARE_ISSUES.zh-CN.md`](docs/FIRMWARE_ISSUES.zh-CN.md) | **固件问题清单（交付固件团队）**：统一编号 F1~F28、类型/严重度/修复顺序、每条附固件源码锚点与 SDK 侧应对 |
+| [`docs/FIRMWARE_ISSUES.zh-CN.md`](docs/FIRMWARE_ISSUES.zh-CN.md) | **固件问题清单（交付固件团队）**：统一编号 F1~F29、类型/严重度/修复顺序、每条附固件源码锚点与 SDK 侧应对（**F28 已结案：是我们自己的 bug**，已在清单里订正） |
 | [`docs/UNITS.zh-CN.md`](docs/UNITS.zh-CN.md) | **单位与 kp/kd 公式速查**：逐帧端别表、真实刚度换算、常见错误与自查三件套 |
 | [`docs/MIGRATION.zh-CN.md`](docs/MIGRATION.zh-CN.md) | **从 EtherCAT 版迁移**：逐符号对照、六处必改语义、迁移检查表 |
 | `docs/BACKLOG.zh-CN.md`](docs/BACKLOG.zh-CN.md) | **待办与审计台账**：未完成项（A12、B6）、已完成项对照、已知限制与“记录缺失”的诚实交代 |
@@ -363,7 +373,7 @@ tools/                夹具/黄金向量生成、构建与验证脚本（`wsl_b
 | 构建 | **两套工具链都干净**：gcc（`-Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes` + `-Werror`）与 MSVC（`/W4 /WX /std:c11 /utf-8`） |
 | C 测试 | **11 套 / 30504 项断言**，0 失败（Windows MinGW gcc 13；Windows MSVC 19.44；Linux WSL gcc 9；ASan+UBSan 同样全过） |
 | ctest | **21 项**（11 套 C + 8 个示例 + `cli_text_lint` + `hw_verify_virtual`；共享库构建为 22 项，多一个 `python_bindings`） |
-| Python | **217 passed / 2 skipped**（Windows 3.12 与 Linux 3.8 结果一致）；公共 C API **114/114 已绑定，0 缺口**；`python -m jsdk_can` 与 `jsdk-cli` **24 个子命令对齐**（同款安全闸、同款退出码、同款 JSON 字段与 CSV 列） |
+| Python | **224 passed / 2 skipped**（Windows 3.12 与 Linux 3.8 结果一致）；公共 C API **114/114 已绑定，0 缺口**；`python -m jsdk_can` 与 `jsdk-cli` **25 个子命令对齐**（同款安全闸、同款退出码、同款 JSON 字段与 CSV 列） |
 | 真机 | slcan + CANable + 一台关节（node 1，fw 1545）：`scan`/`info`/`desc-*`/`read`/`batch-read`/`health`/`dump-config`/`mon` **与写路径**（原值回写 / 写探针后恢复，实测 `100 → 150 → 恢复 100`）逐条验证；`tools/hw_verify.sh` 多轮全过（3 轮 **45/45**） |
 
 **未完成与已知限制的完整清单见 [`docs/BACKLOG.zh-CN.md`](docs/BACKLOG.zh-CN.md)**

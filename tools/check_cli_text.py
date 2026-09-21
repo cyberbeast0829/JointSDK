@@ -128,6 +128,14 @@ def check_charset(root: Path) -> list[str]:
 
 
 def main(argv: list[str]) -> int:
+    # ⚠ 报告里可能含 cp936 表示不了的字符（正是本检查要找的东西）——
+    #   控制台按 GBK 解码时 print() 会直接 **UnicodeEncodeError**，于是
+    #   检查器在“找到问题”的那一刻自己崩掉（真发生过，看不出结论）。
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
     root = Path(argv[1]) if len(argv) > 1 else Path(__file__).resolve().parent.parent
     problems = check_bare_calls(root) + check_charset(root)
 

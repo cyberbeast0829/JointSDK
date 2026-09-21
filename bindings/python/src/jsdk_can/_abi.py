@@ -136,6 +136,7 @@ class ContextConfig(ctypes.Structure):
         ("master_id", c_uint8),
         ("is_fd", c_uint8),
         ("period_ns", c_uint32),
+        ("state_timeout_ms", c_uint32),
         ("auto_keepalive", c_uint8),
         ("clamp_target_position", c_uint8),
         ("enable_watchdog_hint", c_uint8),

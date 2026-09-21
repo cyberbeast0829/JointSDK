@@ -43,7 +43,7 @@ READ_CMDS = {
 
 #: 会**写设备**的子命令（需要 --yes）
 WRITE_CMDS = {"write", "watchdog", "save", "set-node-id", "reset",
-              "set-zero", "calibrate", "home"}
+              "set-zero", "calibrate", "home", "fault-reset"}
 
 #: ``estop`` 特殊：拒绝执行比误停更危险，所以**不要** --yes（与 jsdk-cli 一致）
 NO_CONFIRM_CMDS = {"estop"}
@@ -135,6 +135,10 @@ def _common_parser() -> argparse.ArgumentParser:
     #   被覆盖成 None），默认值统一由 `_DEFAULTS` 在解析后补。
     c.add_argument("--hold", type=float,
                    help="mit 的自限时（秒）；**必须 > 0**")
+    # 等状态序列跑完的预算（calibrate/home）：0/缺省 = SDK 内置默认
+    # （标定 120 s / 回零 5 s）。真机全标定要转十几圈电气角，实测 >20 s。
+    c.add_argument("--timeout-ms", dest="state_timeout_ms", type=int,
+                   help="等状态序列跑完的预算（calibrate/home）；0 = 内置默认")
     return c
 
 
@@ -189,6 +193,10 @@ def _parser() -> argparse.ArgumentParser:
 
     # --- 动作 -------------------------------------------------------------
     sub.add_parser("estop", help="广播急停（**不需要** --yes）", **kw)
+    sub.add_parser("fault-reset",
+                   help="清故障：STOP_MOTOR → CLEAR_ERRORS → 等错误位归零"
+                        "（estop/FAULT_ALERT 锁死关节后唯一的软件恢复路径；需要 --yes）",
+                   **kw)
     mt = sub.add_parser("mit", help="驱动电机（需要 --yes 与 --hold）", **kw)
     mt.add_argument("--pos", type=float, default=0.0, help="目标位置 rad")
     mt.add_argument("--vel", type=float, default=0.0, help="目标速度 rad/s")
@@ -491,23 +499,98 @@ def _parse_cli_value(text: str, type_name: str):
     return int(text, 0)          # 允许 0x 前缀，方便写位掩码类参数
 
 
+# 写进去就被设备**消费掉**的端点：读回值必然不同。
+# 固件 `axis.cpp:514` 在控制环拿到请求后立刻 `requested_state_ = AXIS_STATE_UNDEFINED`（0），
+# 所以写完之后读回几乎总是 0 —— 用读回值判“是否接受”在这里就是误报。验证要看 `current_state`。
+_WRITE_CONSUMED_PATHS = frozenset({"axis0.requested_state"})
+
+
+def _values_same(a, b) -> bool:
+    """两个值是否“同一个值”（浮点给相对容差，免得因显示精度误报）。"""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return bool(a) == bool(b)
+    if isinstance(a, float) or isinstance(b, float):
+        try:
+            x, y = float(a), float(b)
+        except (TypeError, ValueError):
+            return False
+        return abs(x - y) <= 1e-6 * max(1.0, abs(x), abs(y))
+    return a == b
+
+
 def _cmd_write(ctx: Context, args) -> int:
     j = ctx.joint(args.node)
     ep = ctx.lookup(args.path)
+
+    # ⚠ 与 C 版同一套前置校验：只读端点、类型/值域都在**发帧之前**挡住
+    #   （access 串要真实：曾经写死成 'w'，只读端点显示成 `rw`）。
+    if not ep.writable:
+        print(f"jsdk-cli: {args.path} 不可写（access={ep.access_str}）",
+              file=sys.stderr)
+        return EXIT_RUNTIME
+
     try:
         value = _parse_cli_value(args.value, ep.type_name)
     except ValueError as exc:
         print(f"{args.path}: {exc}", file=sys.stderr)
         return EXIT_USAGE
 
-    j.param_set(args.path, value)
-    got = j.param_get(args.path)
-    _emit(args, {"path": args.path, "id": ep.ep_id, "type": ep.type_name,
-                 "value": got, "written": True,
-                 "persisted": "no (use save to persist)"},
-          [f"{args.path} = {got} ({ep.type_name}) 已写入；"
-           "⚠ 不落 Flash（需要 save）"])
-    return EXIT_OK
+    # ⚠ 用 param_set_auto：按**端点声明的类型**装箱。
+    #   直接用 param_set 会把普通 int 当 u32 发，于是 u8/u16/i8/i16 端点
+    #   一律被 C 侧以 "descriptor=uint16 given=uint32" 拒绝 —— 表现成
+    #   “Python 写不进去、C 版 CLI 却可以”（这两个版本必须同一份契约）。
+    try:
+        j.param_set_auto(args.path, value)
+    except JsdkError as exc:
+        print(f"jsdk-cli: 写入失败：{exc}", file=sys.stderr)
+        return EXIT_RUNTIME
+
+    if args.path in _WRITE_CONSUMED_PATHS:
+        # 不复读（复读必是 0，会误判）；也不要谎称已确认。
+        _emit(args, {"path": args.path, "id": ep.ep_id, "type": ep.type_name,
+                     "requested": value, "value": None, "verified": None,
+                     "note": "写进去就被状态机消费；用 `state` 看 current_state",
+                     "persisted": "not applicable"},
+              [f"已写入 {args.path} = {value}（{ep.type_name}，ep {ep.ep_id}）；"
+               "该端点写进去就被状态机消费，无法用读回值判生效；看结果请用 `state`"])
+        return EXIT_OK
+
+    # ⚠⚠ **写后必须读回**：设备可能**静默丢弃**整帧（真发生过：参数写帧不足 8 字节时
+    #     固件 `cmd_param_write()` 首句直接 return，连 ACK 都不回），
+    #     以前这里只报“已写入”，说得比知道的多。
+    try:
+        back = j.param_get(args.path)
+    except JsdkError:
+        back, verified = None, False        # 读不回来 ≠ 没写成功（例如改 node_id 改变寻址）
+    else:
+        verified = _values_same(value, back)
+
+    mismatched = back is not None and not verified
+
+    if mismatched:
+        human = (f"写入未被设备接受：写 {value} 后读回 {back}"
+                 "（设备可能丢弃了该帧）")
+    elif verified:
+        human = f"已写入并读回确认：{args.path} = {back}（{ep.type_name}，ep {ep.ep_id}）"
+    else:
+        human = (f"已写入 {args.path} = {value}（{ep.type_name}，ep {ep.ep_id}）；"
+                 "读不回来，无法确认生效（若改的是 node_id 类参数，这是正常的）")
+
+    payload = {"path": args.path, "id": ep.ep_id, "type": ep.type_name,
+               "requested": value, "value": back, "verified": verified,
+               "persisted": "no (use save to persist)"}
+    if mismatched:
+        payload["error"] = "not_accepted"
+        # ⚠ 与 C 版一致：**错误走 stderr**，JSON 走 stdout（脚本按流分流）。
+        if args.json:
+            _emit(args, payload, [])
+        else:
+            print(human, file=sys.stderr)
+    else:
+        _emit(args, payload, [human + "；注意：未落 Flash（需要 save）"])
+
+    # ⚠ 退出码由**判定**决定，不能只印一行就返回 0：脚本会把“写丢了”当成功。
+    return EXIT_RUNTIME if mismatched else EXIT_OK
 
 
 def _cmd_watchdog(ctx: Context, args) -> int:
@@ -573,8 +656,22 @@ def _cmd_set_zero(ctx: Context, args) -> int:
 
 
 def _cmd_calibrate(ctx: Context, args) -> int:
-    ctx.joint(args.node).calibrate()
-    _emit(args, {"calibrated": True}, ["标定完成（电机会动）"])
+    j = ctx.joint(args.node)
+    j.calibrate()
+    # ⚠ 状态跑完了 ≠ 标定生效：把两个 pre_calibrated 标志读出来报，
+    #   否则“流程跑完但没落上”这种事只能靠客户自己发现（真机实测踩过）。
+    flags = {}
+    for path in ("axis0.motor.config.pre_calibrated",
+                 "axis0.encoder.config.pre_calibrated"):
+        try:
+            flags[path] = bool(j.param_get(path))
+        except JsdkError:
+            flags[path] = None
+    _emit(args, {"calibrated": True, "pre_calibrated": flags,
+                 "persisted": "no (use save to persist)"},
+          ["标定完成（电机会动）；"
+           + "，".join(f"{k.split('.')[1]}.pre_calibrated={v}" for k, v in flags.items())
+           + "；落 Flash 请跑 save"])
     return EXIT_OK
 
 
@@ -588,6 +685,36 @@ def _cmd_estop(ctx: Context, args) -> int:
     ctx.estop()
     _emit(args, {"estop_sent": True},
           ["已广播 ESTOP(0xC0)：所有关节立即进入安全态"])
+    return EXIT_OK
+
+
+def _cmd_fault_reset(ctx: Context, args) -> int:
+    """清故障（STOP_MOTOR → CLEAR_ERRORS → 等错误位归零）。
+
+    ⚠ `estop` / 固件的 `FAULT_ALERT(0xC1)` 会置 `ERROR_ESTOP_REQUESTED`，而
+    **写 `axis0.error = 0` 清不掉它**（实测写后同进程读回 0，~120 ms 后又变回
+    2048）。不给出这条恢复路径，客户就只能断电重启 —— 而且 `calibrate` /
+    `home` / `enable` 全都会被这个故障挡住。
+    """
+    j = ctx.joint(args.node)
+    j.fault_reset()
+    deadline = time.monotonic() + 5.0
+    while j.is_fault() and time.monotonic() < deadline:
+        ctx.cycle_begin()
+        ctx.cycle_end()
+
+    if j.is_fault():
+        msg = ("故障未清除：总线上可能还有节点在广播 ESTOP(0xC0)/FAULT_ALERT(0xC1)；"
+               "也可试 `reset`（软复位）或断电重启")
+        if args.json:
+            _emit(args, {"cleared": False, "error": "fault still present",
+                         "hint": msg}, [])
+        else:
+            print(msg, file=sys.stderr)
+        return EXIT_RUNTIME
+
+    _emit(args, {"cleared": True},
+          ["故障已清除（STOP_MOTOR → CLEAR_ERRORS → 错误位归零）"])
     return EXIT_OK
 
 
@@ -688,6 +815,7 @@ _HANDLERS = {
     "home": _cmd_home,
     # 动作
     "estop": _cmd_estop,
+    "fault-reset": _cmd_fault_reset,
     "mit": _cmd_mit,
 }
 
@@ -740,7 +868,8 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         with Context(hal, master_id=args.master_id, is_fd=is_fd,
-                     period_ns=period_ns) as ctx:
+                     period_ns=period_ns,
+                     state_timeout_ms=int(getattr(args, "state_timeout_ms", 0))) as ctx:
             ctx.add_joint(args.node, mode=Mode.MIT)
             # 三档前置（与 jsdk-cli 一致）：
             #   ① 不下载描述符 ② 只下描述符（不标定）③ 完整配置（含标定）

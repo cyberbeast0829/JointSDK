@@ -306,8 +306,10 @@ print(1 if lim[0] <= v <= lim[1] else 0)" "$v" "$p")
             ERR1=$(head -1 "$TMP_ERR"); [ -z "$ERR1" ] && ERR1=$(head -1 "$TMP_OUT")
             if [ "$RC" -ne 0 ]; then
                 bad L8-write "write $WRITE_PATH $orig rc=$RC  ${ERR1}"
-            elif [ "$(jget "d['written']")" != "True" ]; then
-                bad L8-write "write 未报 written=true  ${ERR1}"
+            # ⚠ 断言 **verified**（写后读回确认），不是旧的 `written`：
+            #   命令现在会**读回**再下结论；设备静默丢帧时 `verified=false` 且 rc=1。
+            elif [ "$(jget "d['verified']")" != "True" ]; then
+                bad L8-write "write 未报 verified=true（写入没被设备确认）  ${ERR1}"
             else
                 run_cli read "$WRITE_PATH"
                 got=$(jget "d['value']")

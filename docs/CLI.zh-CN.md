@@ -192,13 +192,31 @@ python -c "d=open('gbk.bin','rb').read();print(d[:4].hex(' '), d.decode('gbk')[:
 
 | 命令 | 说明 |
 |---|---|
-| `write <path> <value>` | 参数写。值按端点**真实类型/位宽**解析，超范围**直接拒绝**（不静默截断） |
+| `write <path> <value>` | 参数写。值按端点**真实类型/位宽**解析，超范围**直接拒绝**（不静默截断）。**写后一律读回验证**（见下） |
 | `save` | `CONFIG_SAVE(0x22)`，写后读回校验 |
 | `set-node-id N` | 改节点地址（含冲突检查、验证新地址有应答，可持久化） |
-| `watchdog MS` | 写 `can.config.break_timeout`。**`0` = 关闭**设备侧协议级超时检测（最新固件语义；旧固件把 0 当 100 ms）。⚠ 真机上该端点读回恒为 0（F28），所以输出里 `device_reports_ms` 是**独立再读**的结果，`verified:false` 表示“没确认到” |
+| `watchdog MS` | 写 `can.config.break_timeout`。**`0` = 关闭**设备侧协议级超时检测（固件源码 `can_cyberbeast.cpp:1422` 的 `if (timeout_ms == 0) return;` 就是这条语义；旧固件把 0 当 100 ms）。输出里 `device_reports_ms` 是**独立再读一次设备**的结果，`verified:true` 才算确认到 |
 | `set-zero` | `SET_ZERO(0x61)`（当前位置设为零点，不落 Flash） |
-| `reset` | `RESET_DEVICE(0x64)` |
+| `reset` | `RESET_DEVICE(0x64)`（软复位；重握手后才能继续） |
+| `fault-reset` | 清故障：`STOP_MOTOR` → `CLEAR_ERRORS(0x65)` → 等错误位归零（**不动电机**）。⚠ 它只能清**锁存位**：如果原因还在（典型：`enable_watchdog=true` 但 `watchdog_timeout=0` → 零容忍看门狗，CAN 一静默就置 `0x800`），错误位会**立刻回来** —— 那是正确行为，不是命令坏了；先改设备配置再重试 |
 
+> **`write` 的 JSON 字段与退出码（v0.27 起）**
+>
+> ```json
+> {"path":"axis0.config.enable_watchdog","id":154,"type":"bool",
+>  "requested":false,"value":false,"verified":true,
+>  "persisted":"no (use save to persist)"}
+> ```
+>
+> * `requested` = 你要求写的值；`value` = **设备读回的值**（读不回来是 `null`）；`verified` = 两者一致。
+> * **不一致 → `rc=1`**（`error:"not_accepted"`），人读输出走 stderr。
+>   旧版本只报 `written:true`（把**请求值**当结果），说得比知道的多 —— 这正是
+>   现场"写 `pre_calibrated 1` 报成功、读回还是 `false`"却查不出来的原因
+>   （根因：SDK 发的参数写帧不足 8 字节，被固件 `cmd_param_write()` 的
+>   `if (msg.len < 8) return;` **静默丢弃**；见 `PROTOCOL_NOTES §5.4`）。
+> * 读不回来的情况（如改 `node_id` 会改变寻址）只**警告**、`rc=0`；
+>   `requested_state` 这类"写进去就被状态机消费"的端点 `verified:null`，不算失败。
+>
 > **为什么 `write` 也要 `--yes`？**
 > `write axis0.motor.config.gear_ratio 8` 会让同一条 MIT 指令的实际输出差一倍 ——
 > 足以让电机跳。与其维护"哪些参数危险"的清单，不如规则统一。
@@ -207,7 +225,7 @@ python -c "d=open('gbk.bin','rb').read();print(d[:4].hex(' '), d.decode('gbk')[:
 
 | 命令 | 说明 |
 |---|---|
-| `calibrate` | 写 `requested_state = 3` 并等待状态跳转（电机会动） |
+| `calibrate` | 写 `requested_state = 3` 并等待状态跳转（电机会动）。⚠ **真机全标定实测 29.5 s**（要转十几圈电气角），所以默认预算提到 **120 s**；可用 `--timeout-ms` 覆盖。跑完会**读回两个 `pre_calibrated` 标志**（状态跑完 ≠ 标定生效） |
 | `home` | 写 `requested_state = 11` 并等待 |
 | `estop` | 广播 `ESTOP(0xC0)`，最高仲裁优先级。**不需要 `--yes`** —— 拒绝执行反而更危险 |
 | `mit` | **唯一会驱动电机的命令**，见 §4 |
@@ -425,10 +443,11 @@ jsdk-cli --if virtual scan --json
 | 限制 | 说明 |
 |---|---|
 | 真机收发未进 CI | `tests/test_cli.c` 在 `virtual` 后端断言全部子命令与安全闸；真机需人工冒烟（见 `PORTING.zh-CN.md` §7.5.3），**已脚本化**：`tools/hw_verify.sh`（L1~L8b 分层，含写路径） |
-| `watchdog` 的读回校验 | 真机上 `can.config.break_timeout` **读回恒为 0**（写 250 立刻读也是 0，而 `0` 的含义是**禁用**，见 `FIRMWARE_ISSUES` **F28**）→ 写后判定分三类：相等（含 `0 == 0`，即真的关上了）= 通过；**读回 0 而写入非 0 = “已接受但无法校验”**（保留写入值 + `verified:false`，退出码仍是 0）；其它值 = `PROTOCOL` |
-| 另一个入口 | `python -m jsdk_can` 是**同一份契约**的 Python 实现：**24 个子命令**、同款安全闸（`--yes` / `mit` 的 `--hold` / `estop` 免确认）、同款退出码 0/1/2/3、同款 JSON 字段（有对拍用例）。已知差异：C 版 `mon` 在**虚拟后端**不受墙钟约束（虚拟时钟由循环驱动），Python 版用墙钟 |
+| `watchdog` 的读回校验 | 写后判定分三类：相等（含 `0 == 0`，即真的关上了）= 通过；**读不回来**（超时等）= “已发出但无法校验”（保留写入值 + `verified:false`，退出码仍是 0）；**读回别的值** = `PROTOCOL`。真机实测（COM3 / fw 1545）：写 250 → 读回 **250**、`verified:true` ✓（历史上这条曾被误判成“端点读回恒为 0”，真实原因是当时 SDK 发的参数写帧不足 8 字节被固件静默丢弃 —— 见 `FIRMWARE_ISSUES` **F28** 与 `PROTOCOL_NOTES §5.4`） |
+| 另一个入口 | `python -m jsdk_can` 是**同一份契约**的 Python 实现：**25 个子命令**、同款安全闸（`--yes` / `mit` 的 `--hold` / `estop` 免确认）、同款退出码 0/1/2/3、同款 JSON 字段（有对拍用例）。已知差异：C 版 `mon` 在**虚拟后端**不受墙钟约束（虚拟时钟由循环驱动），Python 版用墙钟 |
 | 读参数 | 标量端点（≤ 8 字节，含 `u64`/`double`）都读得到：FD 一次请求，**Classic 自动分两块**。`object`/`json`/`endpoint_ref` 这类非标量端点没有标量尺寸，`read` 会明确报 `UNSUPPORTED`（不做“读一半”） |
 | `mon` 的实时性 | 墙钟节奏 + 非实时线程，抖动取决于操作系统。硬实时请写自己的 C 循环 |
+| `calibrate` / `home` 的预算 | 默认标定 **120 s** / 回零 **5 s**（`--timeout-ms` 可覆盖）。真机全标定实测 **29.5 s**（子状态 4 → 7 → 1），所以旧的硬编码 20 s 会在**序列还在跑**时报超时 —— 那条提示已改为区分“从未启动（带故障位）”与“已启动但未跑完”。⚠ 本项刚修完后，真机跑完会报 `pre_calibrated=false`（电机/编码器两个标志都没落上）—— 那是**设备侧**的事（固件），CLI 负责把它如实报出来 |
 | Windows 控制台中文 | 见 §1（`chcp 65001` 或 `--json`） |
 | slcan 吞吐 | 约 100~500 fps（ASCII 展开 + USB 帧调度），不适合高频控制 |
 | slcan 数据段速率 | 只有 `2000000`（`Y2`）与 `5000000`（`Y5`）有公认命令码；表外值报 `UNSUPPORTED`，传 `--data-bitrate 0` 则不碰适配器配置 |

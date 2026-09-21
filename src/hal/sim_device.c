@@ -58,6 +58,10 @@ static const sim_ep_def_t k_eps[] = {
     EP(207, "axis0.motor.fet_thermistor.temperature",       SIM_T_F32, SIM_ACC_READ,                 fet_temp),
     EP(211, "axis0.motor.motor_thermistor.temperature",     SIM_T_F32, SIM_ACC_READ,                 motor_temp),
     EP(232, "axis0.motor.current_control.Iq_measured",      SIM_T_F32, SIM_ACC_READ,                 iq_measured),
+    /* 标定标志：真机实测 ID = 240 / 394（`ep-lookup` 问出来的）。
+       ⚠ 没有它们，`calibrate` 的“状态跑完 ≠ 标定生效”这条判据在仿真上测不了。 */
+    EP(240, "axis0.motor.config.pre_calibrated",            SIM_T_BOOL,SIM_ACC_READ | SIM_ACC_WRITE, motor_pre_cal),
+    EP(394, "axis0.encoder.config.pre_calibrated",          SIM_T_BOOL,SIM_ACC_READ | SIM_ACC_WRITE, enc_pre_cal),
     EP(242, "axis0.motor.config.gear_ratio",                SIM_T_F32, SIM_ACC_READ | SIM_ACC_WRITE, gear_ratio),
     EP(247, "axis0.motor.config.torque_constant",           SIM_T_F32, SIM_ACC_READ | SIM_ACC_WRITE, torque_constant),
     EP(249, "axis0.motor.config.current_lim",               SIM_T_F32, SIM_ACC_READ | SIM_ACC_WRITE, current_lim),
@@ -525,6 +529,7 @@ static void apply_requested_state(sim_bus_t *b, sim_node_t *n, uint8_t want)
         n->armed = 0u;
         n->current_state = SIM_AS_IDLE;
         n->transient_until_ms = 0u;
+        n->cal_stage = 0u;
         break;
 
     case SIM_AS_CLOSED_LOOP:
@@ -535,10 +540,13 @@ static void apply_requested_state(sim_bus_t *b, sim_node_t *n, uint8_t want)
         break;
 
     case SIM_AS_FULL_CALIB:
-        n->armed = 0u;
-        n->current_state = SIM_AS_FULL_CALIB;
-        n->transient_until_ms = b->now_ms + SIM_TRANSIENT_MS;
-        n->settle_to = SIM_AS_IDLE;
+        /* ⚠ 报**子状态**（真机实测 4 → 7 → 1），而不是 3：
+           否则“拿 current_state == 3 当判据”的错在仿真上永远绿。 */
+        n->armed              = 0u;
+        n->cal_stage          = 1u;
+        n->current_state      = SIM_AS_MOTOR_CALIB;
+        n->transient_until_ms = b->now_ms + SIM_CAL_STAGE_MS;
+        n->settle_to          = SIM_AS_IDLE;
         break;
 
     case SIM_AS_HOMING:
@@ -595,6 +603,16 @@ static void handle_param_write(sim_bus_t *b, sim_node_t *n,
         }
         return;
     }
+
+    /* ⚠⚠ 复刻固件的**帧长门限**：`cmd_param_write()` 首句 `if (msg.len < 8) return;`
+       —— 短帧整帧丢弃。模型里也要丢，否则“bool/u16 写了等于没写”这种 bug
+       在仿真上永远是绿的（真机就是这么被隷了很久：u32/f32 刚好 8 字节而“看似正常”）。 */
+    if (f->len < CB_PARAM_WRITE_REQ_MIN) { b->bad_len_drops++; return; }
+
+    /* 故障注入（`dropwrite`）：像门限命中那样**静默**吃掉这一帧，
+       不回 ACK、不改值、不计任何统计（真机上就是这么无声无息的）。
+       用来验证“写后读回”确实抓得住丢帧。 */
+    if (n->drop_writes) return;
 
     if (cb_param_unpack_write_req(f->data, f->len, &flags, &ep, value, &vlen) != 0) {
         return;
@@ -1198,10 +1216,28 @@ void sim_tick(sim_bus_t *b, uint32_t now_ms)
             /* ---- 瞬时状态（标定/回零）到期 → 落到 settle_to ---- */
             if (n->transient_until_ms != 0u
                 && (int32_t)(t - n->transient_until_ms) >= 0) {
-                n->current_state      = n->settle_to;
-                n->state_change_ms    = t;      /* 上位机靠它确认“跳转已完成” */
-                n->transient_until_ms = 0u;
-                if (n->settle_to == SIM_AS_IDLE) n->armed = 0u;
+                if (n->cal_stage == 1u) {
+                    /* 电机标定跑完 → 进第二个子状态（真机实测：7 = 索引搜索），
+                       并置 motor.pre_calibrated（固件在电机标定成功后就置）。 */
+                    n->motor_pre_cal      = 1u;
+                    n->cal_stage          = 2u;
+                    n->current_state      = SIM_AS_ENC_INDEX_SEARCH;
+                    n->state_change_ms    = t;
+                    n->transient_until_ms = t + SIM_CAL_STAGE_MS;
+                } else if (n->cal_stage == 2u) {
+                    /* 第二个子状态跑完 → 编码器标定生效，回静息 */
+                    n->enc_pre_cal        = 1u;
+                    n->cal_stage          = 0u;
+                    n->current_state      = n->settle_to;
+                    n->state_change_ms    = t;
+                    n->transient_until_ms = 0u;
+                    n->armed              = 0u;
+                } else {
+                    n->current_state      = n->settle_to;
+                    n->state_change_ms    = t;  /* 上位机靠它确认“跳转已完成” */
+                    n->transient_until_ms = 0u;
+                    if (n->settle_to == SIM_AS_IDLE) n->armed = 0u;
+                }
             }
 
             /* ---- break_timeout：仅对已武装（收到过 is_ctrl 帧）的节点生效 ----
@@ -1374,6 +1410,9 @@ int sim_configure(sim_bus_t *b, const char *spec)
             if (!matched) { TRY_KEY("disarm");  if (matched) { b->nodes[idx].armed = 0u; p += adv; } }
             if (!matched) { TRY_KEY("enabled"); if (matched) { p += adv; } }
             if (!matched) { TRY_KEY("disabled");if (matched) { b->nodes[idx].node_id = 0u; p += adv; } }
+            /* 故障注入：静默丢弃参数写（复刻固件 `if (msg.len < 8) return;`）。
+               **不走总线的正常路径**，就是“写进去没反应、也不报错”的真机语义。 */
+            if (!matched) { TRY_KEY("dropwrite");if (matched) { b->nodes[idx].drop_writes = 1u; p += adv; } }
 
             #define TRY_F32(k, field)                                              \
                 if (!matched) {                                                    \

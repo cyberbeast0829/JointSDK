@@ -354,6 +354,10 @@ static void test_safety_gates(void)
     RUN_CLI(&r, VIF, "watchdog", "200");
     CHECK(r.rc == 3);
 
+    /* 清故障也要 --yes（会发 STOP_MOTOR + CLEAR_ERRORS 序列） */
+    RUN_CLI(&r, VIF, "fault-reset");
+    CHECK(r.rc == 3);
+
     /* --- mit：先要 --yes，再要 --hold --- */
     RUN_CLI(&r, VIF, "mit", "--pos", "0", "--hold", "1");
     CHECK(r.rc == 3);
@@ -397,8 +401,12 @@ static void test_write_path(void)
         g_fail++; g_checks++;
     } else {
         g_checks++;
-        expect_has(&r, "out", "\"written\"");
+        /* ⚠ 字段从 "written" 改成 requested/value/verified：CLI **不再**
+           把“请求值”当成“已写入”报告（见 [11]）。 */
+        expect_has(&r, "out", "\"requested\"");
         expect_has(&r, "out", "\"value\"");
+        expect_has(&r, "out", "\"verified\":true");
+        CHECK(strstr(r.out, "\"written\"") == NULL);
     }
 
     /* 类型不符必须在客户端就被挡住（不静默截断） */
@@ -503,6 +511,18 @@ static void test_system_cmds(void)
     RUN_CLI(&r, VIF, "estop");
     CHECK(r.rc == 0);
     expect_has(&r, "out", "ESTOP");
+
+    /*
+     * --- fault-reset：**软件里唯一的恢复路径** ---
+     * `estop` / 固件的 `FAULT_ALERT(0xC1)` 会置 `ERROR_ESTOP_REQUESTED`，而
+     * 写 `axis0.error = 0` 清不掉它（真机实测：写后读回 0，~120 ms 后又变回 2048）
+     * —— 必须能发 `STOP_MOTOR` → `CLEAR_ERRORS` 这套序列。
+     * （真机上若总线上还有别的节点在广播 ESTOP/FAULT_ALERT，它会失败并给出提示，
+     *   所以这里只断言"虚拟后端无故障 → cleared=true"。）
+     */
+    RUN_CLI(&r, VIF, "--json", "--yes", "fault-reset");
+    CHECK(r.rc == 0);
+    expect_has(&r, "out", "\"cleared\":true");
 
     /* --- reset：写设备 → 无 `--yes` 必须拒绝（退出码 3） --- */
     RUN_CLI(&r, VIF, "reset");
@@ -652,6 +672,99 @@ static void test_write_value_exit_codes(void)
     CHECK(r.rc == 0);                 /* 0x 前缀仍是合法写法 */
 }
 
+/**
+ * [11] `write` 必须**读回验证**。
+ *
+ * 现场故障：真机上 `write axis0.motor.config.pre_calibrated 1` 报成功，读回却是
+ * `false`（参数写帧不足 8 字节 → 固件 `cmd_param_write()` 首句 `if (msg.len < 8) return;`
+ * 静默丢弃）。CLI 当时把**请求值**当结果打印，于是“说得比知道的多”。
+ * 本组用例：
+ *   - 正常写 → `verified:true`，人读输出“读回确认”；
+ *   - 设备静默丢帧（`dropwrite` 故障注入）→ **退出码 1** + 明确报“未被接受”；
+ *   - 只读端点 → 拒绝，且 access 串不能把只读端点写成 `rw`；
+ *   - `requested_state`（写进去就被状态机消费）→ 不误报，`verified:null`；
+ *   - 改 `node_id` 这类“改变寻址”的写 → 读不回来只警告，退出码仍 0。
+ */
+static void test_write_verify(void)
+{
+    run_t r;
+
+    printf("[11] write read-back verification\n");
+
+    /* (1) 正常写：bool（写前是 5~6 字节帧的那个宽度）和 u16 都要能确认 */
+    RUN_CLI(&r, VIF, "--yes", "write", "axis0.config.enable_watchdog", "0");
+    CHECK(r.rc == 0);
+    expect_has(&r, "out", "读回确认");
+
+    RUN_CLI(&r, VIF, "--json", "--yes", "write", "can.config.break_timeout", "250");
+    CHECK(r.rc == 0);
+    expect_has(&r, "out", "\"verified\":true");
+    /* ⚠ 不能另开一次 RUN_CLI 读回：每次调用是**新的虚拟总线**，
+       状态不跨调用保留。读回值就在这次写的 JSON 里（"value":250）。 */
+    expect_has(&r, "out", "\"value\":250");
+
+    /* (2) 设备静默丢弃参数写 → 必须报失败（这就是现场那个故障） */
+    RUN_CLI(&r, "--if", "virtual", "--channel", CH ",dropwrite",
+            "--yes", "write", "axis0.motor.config.gear_ratio", "8");
+    CHECK(r.rc == 1);
+    expect_has(&r, "err", "未被设备接受");
+
+    RUN_CLI(&r, "--if", "virtual", "--channel", CH ",dropwrite",
+            "--json", "--yes", "write", "axis0.motor.config.gear_ratio", "8");
+    CHECK(r.rc == 1);
+    expect_has(&r, "out", "\"verified\":false");
+
+    /* (3) 只读端点：拒绝 + access 串要真实（曾经写死成 'w'，只读端点显示 `rw`）*/
+    RUN_CLI(&r, VIF, "--yes", "write", "hw_version_major", "9");
+    CHECK(r.rc == 1);
+    expect_has(&r, "err", "不可写");
+    expect_has(&r, "err", "access=r-");
+
+    /* (4) 写进去就被状态机消费的端点：不误报为失败 */
+    RUN_CLI(&r, VIF, "--json", "--yes", "write", "axis0.requested_state", "1");
+    CHECK(r.rc == 0);
+    expect_has(&r, "out", "\"verified\":null");
+
+    /* (5) 改变寻址的写：读不回来只警告 */
+    RUN_CLI(&r, VIF, "--yes", "write", "axis0.config.can.node_id", "3");
+    CHECK(r.rc == 0);
+
+    printf("      verified true / silent-drop fails with rc=1 / access=r- / "
+           "consumed ep / addr change\n");
+}
+
+/**
+ * [12] 标定的**预算**与**结果**。
+ *
+ * 现场一次真实的 `calibrate`：电机完整转了 29.5 s（子状态 4 → 7 → 1），
+ * 而 CLI 却在 20 s 就报 timeout（硬编码太短），把“还没跑完”说得像“没写进去”。
+ * 这里钉住两件事：
+ *  ① `--timeout-ms` 真的接到了 SDK 的预算上（给 1 ms 必须报超时）；
+ *  ② 跑完之后要报**两个 pre_calibrated 标志**（状态跑完 ≠ 标定生效）。
+ */
+static void test_calibrate_timeout(void)
+{
+    run_t r;
+
+    printf("[12] calibrate budget (--timeout-ms) + pre_calibrated report\n");
+
+    /* --timeout-ms：等状态序列跑完的预算（真机全标定实测 29.5 s）。
+       给 1 ms → 必须报超时（证明旋钮真的接到了 SDK 的 cfg 上），
+       而不是默默用内置的 120 s。 */
+    RUN_CLI(&r, VIF, "--timeout-ms", "1", "--yes", "calibrate");
+    CHECK(r.rc == 1);
+    expect_has(&r, "err", "timeout");
+
+    /* 默认预算下标定要能跑完，并且**报告两个 pre_calibrated 标志**
+       （状态跑完 ≠ 标定生效）。 */
+    RUN_CLI(&r, VIF, "--json", "--yes", "calibrate");
+    CHECK(r.rc == 0);
+    expect_has(&r, "out", "\"motor_pre_calibrated\":true");
+    expect_has(&r, "out", "\"encoder_pre_calibrated\":true");
+
+    printf("      --timeout-ms honoured / calibrate reports pre_calibrated flags\n");
+}
+
 /* ==========================================================================
  * main
  * ======================================================================== */
@@ -679,6 +792,10 @@ int main(void)
     test_mon_csv();
     printf("\n");
     test_write_value_exit_codes();
+    printf("\n");
+    test_write_verify();
+    printf("\n");
+    test_calibrate_timeout();
 
     printf("\n=== %u checks, %u failures ===\n", g_checks, g_fail);
     return (g_fail == 0u) ? 0 : 1;

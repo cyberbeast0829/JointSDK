@@ -163,6 +163,7 @@ class Context:
                  desc_mode: DescMode | int = DescMode.DYNAMIC,
                  arena_size: int | None = None,
                  period_ns: int = 1_000_000,
+                 state_timeout_ms: int = 0,
                  auto_keepalive: bool = True,
                  max_joints: int = 8,
                  lib_path: str | None = None) -> None:
@@ -186,6 +187,8 @@ class Context:
         self.cfg.master_id = int(master_id)
         self.cfg.is_fd = 1 if is_fd else 0
         self.cfg.period_ns = int(period_ns)
+        # 等状态序列跑完的预算（calibrate/home）：0 = SDK 内置默认（标定 120 s / 回零 5 s）
+        self.cfg.state_timeout_ms = int(state_timeout_ms)
         self.cfg.auto_keepalive = 1 if auto_keepalive else 0
         self.cfg.max_joints = int(max_joints)
 

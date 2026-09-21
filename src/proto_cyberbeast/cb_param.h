@@ -92,6 +92,24 @@ extern "C" {
 #define CB_PARAM_SEG_MIN_LEN    5u    /**< 分段写的 TotalLen 下限 */
 #define CB_PARAM_READ_REQ_MIN   4u    /**< 单读请求最短（无 offset） */
 #define CB_PARAM_READ_REQ_FULL  8u    /**< 单读请求带 offset */
+
+/**
+ * 单帧参数写请求的**最短帧长**（字节）。
+ *
+ * ⚠⚠ 固件 `CANCyberBeast::cmd_param_write()` 的**第一句**就是：
+ *
+ * ```cpp
+ * if (msg.len < 8) return;            // 整帧静默丢弃，连 ACK 都不回
+ * ```
+ *
+ * 也就是说“4 字节头 + 1/2 字节值”（bool / u8 / u16）**根本不会被执行**。
+ * 真机上表现为：写 bool / u16 报成功、读回旧值；只有 u32 / f32（刚好 8 字节）能生效。
+ * 而 `cmd_param_read()` 的门限是 4（所以读一直是好的）—— 两边不对称，极容易错。
+ *
+ * 因此发送侧**一律补齐到 8 字节**：`dst[3]`（真值字节数）不变，
+ * 固件拿到的仍然是“长度正确”的值（它只把 `data_len` 个字节交给端点处理器）。
+ */
+#define CB_PARAM_WRITE_REQ_MIN  8u    /**< 单帧写请求最短帧长（固件硬要求 ≥ 8） */
 #define CB_PARAM_ACK_LEN        8u    /**< 写确认固定 8 B */
 
 /* ==========================================================================

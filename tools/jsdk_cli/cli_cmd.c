@@ -117,6 +117,35 @@ static void value_to_json(cli_json_t *j, const char *key, const jsdk_value_t *v)
     }
 }
 
+/** 两个值是否“同一个值”（浮点给 1e-6 相对容差，免得因显示精度误报）。 */
+static int value_same(const jsdk_value_t *a, const jsdk_value_t *b)
+{
+    double x, y, m;
+
+    if (a->type != b->type) return 0;
+    switch (a->type) {
+    case JSDK_EP_BOOL: return (a->v.boolean != 0) == (b->v.boolean != 0);
+    case JSDK_EP_U8:   return a->v.u8  == b->v.u8;
+    case JSDK_EP_I8:   return a->v.i8  == b->v.i8;
+    case JSDK_EP_U16:  return a->v.u16 == b->v.u16;
+    case JSDK_EP_I16:  return a->v.i16 == b->v.i16;
+    case JSDK_EP_U32:  return a->v.u32 == b->v.u32;
+    case JSDK_EP_I32:  return a->v.i32 == b->v.i32;
+    case JSDK_EP_U64:  return a->v.u64 == b->v.u64;
+    case JSDK_EP_I64:  return a->v.i64 == b->v.i64;
+    case JSDK_EP_F32:  x = (double)a->v.f32; y = (double)b->v.f32; break;
+    case JSDK_EP_F64:  x = a->v.f64;         y = b->v.f64;         break;
+    default:           return 0;
+    }
+    if (x != x || y != y) return 0;              /* NaN 视为不同（不想拿它当“成功”） */
+    m = (x < 0.0 ? -x : x);
+    if ((y < 0.0 ? -y : y) > m) m = (y < 0.0 ? -y : y);
+    if (m < 1.0) m = 1.0;
+    return ((x - y) < 0.0 ? (y - x) : (x - y)) <= 1e-6 * m;
+}
+
+/** 值的可读文本（供人看的输出用）。 */
+
 /** 按端点类型把文本解析成 jsdk_value_t（`write` 用）。 */
 /**
  * 把命令行文本按端点类型解析成值。
@@ -1051,6 +1080,19 @@ static int cmd_desc_import(cli_app_t *a)
  *   实际输出差一倍 —— 那足以让电机跳起来。凡是写设备的一律要 `--yes`，
  *   规则统一比"哪些参数危险"更可靠。
  */
+/**
+ * 写进去就被设备**消费掉**的端点：读回值必然和写进去的不一样。
+ *
+ * 固件 `axis.cpp:514` 在控制环拿到请求后立刻 `requested_state_ = AXIS_STATE_UNDEFINED;`
+ * （0）—— 所以 `write axis0.requested_state 3` 之后读回几乎总是 0。
+ * 拿读回值判“是否接受”在这里就是误报；验证要走 `current_state`
+ * （`calibrate` / `home` / `state` 就是这么做的）。
+ */
+static int ep_write_consumed(const char *path)
+{
+    return path != NULL && strcmp(path, "axis0.requested_state") == 0;
+}
+
 static int cmd_write(cli_app_t *a)
 {
     uint16_t ep_id = 0u;
@@ -1070,8 +1112,11 @@ static int cmd_write(cli_app_t *a)
     st = jsdk_endpoint_lookup(a->ctx, a->o.args[0], &ep_id, &type, &access);
     if (st != JSDK_OK) { cli_error(a, a->o.args[0], st); return CLI_EXIT_FAIL; }
     if (!(access & JSDK_EP_ACCESS_W)) {
+        /* ⚠ 第二个字符以前是**写死的 'w'**，于是一个只读端点会显示成 `access=rw`
+           （“明明说是 rw 却不让我写”）。 */
         cli_fprintf(a->err, "jsdk-cli: %s 不可写（access=%c%c）\n", a->o.args[0],
-                (access & JSDK_EP_ACCESS_R) ? 'r' : '-', 'w');
+                (access & JSDK_EP_ACCESS_R) ? 'r' : '-',
+                (access & JSDK_EP_ACCESS_W) ? 'w' : '-');
         return CLI_EXIT_FAIL;
     }
     switch (text_to_value(a->o.args[1], type, &val)) {
@@ -1090,20 +1135,82 @@ static int cmd_write(cli_app_t *a)
     st = jsdk_joint_param_set(a->joint, a->o.args[0], &val);
     if (st != JSDK_OK) { cli_error(a, "write", st); return CLI_EXIT_FAIL; }
 
-    if (a->o.json) {
-        cli_json_t j;
-        cli_json_init(&j, a->out, 0);
-        cli_json_str(&j, "path", a->o.args[0]);
-        cli_json_i64(&j, "id", (long long)ep_id);
-        cli_json_str(&j, "type", jsdk_ep_type_string(type));
-        value_to_json(&j, "value", &val);
-        cli_json_bool(&j, "written", 1);
-        cli_json_str(&j, "persisted", "no (use save to persist)");
-        cli_json_finish(&j);
-    } else {
-        cli_fprintf(a->out, "已写入 %s = %s（%s，ep %u）\n", a->o.args[0], a->o.args[1],
-                jsdk_ep_type_string(type), (unsigned)ep_id);
-        cli_fprintf(a->out, "注意：未落 Flash；需要持久化请再跑 `save`。\n");
+    if (ep_write_consumed(a->o.args[0])) {
+        /* 不复读（复读必是 0，会误判成“未被接受”）；也不要谎称已确认。 */
+        if (a->o.json) {
+            cli_json_t j;
+            cli_json_init(&j, a->out, 0);
+            cli_json_str(&j, "path", a->o.args[0]);
+            cli_json_i64(&j, "id", (long long)ep_id);
+            cli_json_str(&j, "type", jsdk_ep_type_string(type));
+            value_to_json(&j, "requested", &val);
+            cli_json_null(&j, "value");
+            cli_json_null(&j, "verified");
+            cli_json_str(&j, "note", "写进去就被状态机消费；用 `state` 看 current_state");
+            cli_json_str(&j, "persisted", "not applicable");
+            cli_json_finish(&j);
+        } else {
+            cli_fprintf(a->out, "已写入 %s = %s（%s，ep %u）\n",
+                        a->o.args[0], a->o.args[1], jsdk_ep_type_string(type),
+                        (unsigned)ep_id);
+            cli_fprintf(a->out, "  该端点写进去就被状态机消费（固件立刻复位为 0），"
+                                "无法用读回值判生效\n");
+            cli_fprintf(a->out, "  要看结果请用 `state`（读 current_state）或 "
+                                "`calibrate` / `home`。\n");
+        }
+        return CLI_EXIT_OK;
+    }
+
+    /* ⚠⚠ **写后必须读回**：设备可能**静默丢弃**整帧（真发生过 —— 参数写帧不足 8 字节时，
+       固件 `cmd_param_write()` 首句直接 return，连 ACK 都不回），
+       而以前这里直接把“请求值”当成“已写入”打印 —— 说得比知道的多。 */
+    {
+        jsdk_value_t  back;
+        char          txt[64];
+        int           have = (jsdk_joint_param_get(a->joint, a->o.args[0], &back)
+                              == JSDK_OK);
+        int           same = have ? value_same(&val, &back) : 0;
+
+        if (same) value_to_text(&back, txt, sizeof txt);
+        else      snprintf(txt, sizeof txt, "?");
+
+        if (a->o.json) {
+            cli_json_t j;
+            cli_json_init(&j, a->out, 0);
+            cli_json_str(&j, "path", a->o.args[0]);
+            cli_json_i64(&j, "id", (long long)ep_id);
+            cli_json_str(&j, "type", jsdk_ep_type_string(type));
+            value_to_json(&j, "requested", &val);
+            if (have) value_to_json(&j, "value", &back);
+            else      cli_json_null(&j, "value");
+            cli_json_bool(&j, "verified", same);
+            /* ⚠ 退出码必须由**判定**决定，不能只在人读分支里返回：
+               否则脚本拿 `--json` 时会把“写丢了”当成功（rc=0）。 */
+            if (have && !same) cli_json_str(&j, "error", "not_accepted");
+            cli_json_str(&j, "persisted", "no (use save to persist)");
+            cli_json_finish(&j);
+        } else if (!have) {
+            /* 读不回来 ≠ 没写成功：改 `node_id` 这类参数会**改变寻址**，
+               读完自然超时。这里只警告，不改退出码。 */
+            cli_fprintf(a->out, "已写入 %s = %s（%s，ep %u）\n",
+                        a->o.args[0], a->o.args[1], jsdk_ep_type_string(type),
+                        (unsigned)ep_id);
+            cli_fprintf(a->out, "  写入已发出，但**读不回来**，无法确认生效"
+                                "（若改的是 node_id 类参数，这是正常的）\n");
+        } else if (!same) {
+            value_to_text(&back, txt, sizeof txt);
+            cli_fprintf(a->err,
+                "jsdk-cli: 写入未被设备接受：写 %s 后读回 %s（设备可能丢弃了该帧）\n",
+                a->o.args[1], txt);
+        } else {
+            cli_fprintf(a->out, "已写入并读回确认：%s = %s（%s，ep %u）\n",
+                        a->o.args[0], txt, jsdk_ep_type_string(type),
+                        (unsigned)ep_id);
+            cli_fprintf(a->out, "注意：未落 Flash；需要持久化请再跑 `save`。\n");
+        }
+
+        /* 读回值与写入值不一致 = 设备没接受这一帧 → 非零退出（JSON/人读一致） */
+        if (have && !same) return CLI_EXIT_FAIL;
     }
     return CLI_EXIT_OK;
 }
@@ -1294,13 +1401,46 @@ static int cmd_calibrate(cli_app_t *a)
         cli_json_str(&j, "warning", "motor moves during full calibration");
         cli_json_finish(&j);
     } else {
-        cli_fprintf(a->out, "开始全标定（电机会动，耗时可能数秒）…\n");
+        cli_fprintf(a->out, "开始全标定（电机会动，可能数十秒）…\n");
     }
 
     st = jsdk_joint_calibrate(a->joint);
     if (st != JSDK_OK) { cli_error(a, "calibrate", st); return CLI_EXIT_FAIL; }
 
-    if (!a->o.json) cli_fprintf(a->out, "标定完成（状态已离开瞬时态）\n");
+    /*
+     * ⚠ **状态跑完了 ≠ 标定生效**。固件在电机标定/编码器偏置各会置一个
+     *   `pre_calibrated`，而 `check_pre_calibrated()` 又会在编码器没就绪时把它
+     *   清回 false —— 所以结束之后必须**读回两个标志**才知道到底落上了没有
+     *   （真机实测踩过：“流程跑完了”但 `encoder.pre_calibrated` 仍是 false）。
+     */
+    {
+        jsdk_value_t mv, ev;
+        int have_m = (jsdk_joint_param_get(a->joint,
+                        "axis0.motor.config.pre_calibrated", &mv) == JSDK_OK);
+        int have_e = (jsdk_joint_param_get(a->joint,
+                        "axis0.encoder.config.pre_calibrated", &ev) == JSDK_OK);
+        int m_ok = have_m && mv.v.boolean != 0;
+        int e_ok = have_e && ev.v.boolean != 0;
+
+        if (a->o.json) {
+            cli_json_t j;
+            cli_json_init(&j, a->out, 0);
+            cli_json_bool(&j, "calibrated", 1);
+            cli_json_bool(&j, "motor_pre_calibrated", have_m ? m_ok : 0);
+            cli_json_bool(&j, "encoder_pre_calibrated", have_e ? e_ok : 0);
+            cli_json_str(&j, "persisted", "no (use save to persist)");
+            cli_json_finish(&j);
+        } else {
+            cli_fprintf(a->out, "标定完成：motor.pre_calibrated=%s encoder.pre_calibrated=%s\n",
+                        have_m ? (m_ok ? "true" : "false") : "?",
+                        have_e ? (e_ok ? "true" : "false") : "?");
+            if (!e_ok) {
+                cli_fprintf(a->out, "  [注意] 编码器偏置没落上（pre_calibrated=false）："
+                                    "闭环使能会被拒；先看 `err`，必要时重跑或查编码器\n");
+            }
+            cli_fprintf(a->out, "  注意：未落 Flash；需要持久化请再跑 `save`。\n");
+        }
+    }
     return CLI_EXIT_OK;
 }
 
@@ -1322,6 +1462,61 @@ static int cmd_home(cli_app_t *a)
         cli_json_finish(&j);
     } else {
         cli_fprintf(a->out, "回零完成\n");
+    }
+    return CLI_EXIT_OK;
+}
+
+/**
+ * fault-reset：清故障（`STOP_MOTOR` → `CLEAR_ERRORS(0x65)` → 等错误位归零）。
+ *
+ * ⚠ 为什么必须单独有一条命令：`estop` / 固件的 `FAULT_ALERT(0xC1)` 会置
+ *   `ERROR_ESTOP_REQUESTED`，而**写 `axis0.error = 0` 清不掉它**（实测写后同进程
+ *   读回 0，~120 ms 后再读又变回 2048）。不给出这条恢复路径，客户遇到锁死的关节
+ *   就只能断电重启 —— 而且 `calibrate` / `home` / `enable` 全都会被它挡住。
+ *   这是**唯一**能在软件里恢复的路径（失败时还有 `reset-device` 软复位）。
+ */
+static int cmd_fault_reset(cli_app_t *a)
+{
+    unsigned spin = 0u;
+    int      rc = require_yes(a, "fault-reset");
+
+    if (rc != 0) return rc;
+
+    jsdk_joint_request_fault_reset(a->joint);
+
+    /* 非阻塞请求：靠跑周期推进（和其它命令同一套 advance_seq 语义） */
+    while (spin < 3000u && jsdk_joint_is_fault(a->joint)) {
+        jsdk_context_poll(a->ctx, 0u);
+        spin++;
+    }
+
+    if (jsdk_joint_is_fault(a->joint)) {
+        if (a->o.json) {
+            cli_json_t j;
+            cli_json_init(&j, a->out, 0);
+            cli_json_bool(&j, "cleared", 0);
+            cli_json_str(&j, "error", "fault still present");
+            cli_json_str(&j, "hint",
+                         "总线上可能还有节点在广播 ESTOP(0xC0)/FAULT_ALERT(0xC1)；"
+                         "也可试 `reset-device`（软复位）或断电重启");
+            cli_json_finish(&j);
+        } else {
+            cli_fprintf(a->err, "jsdk-cli: 故障未清除 —— %s\n",
+                        jsdk_context_last_error(a->ctx));
+            cli_fprintf(a->err, "  提示：总线上可能还有节点在广播 ESTOP(0xC0)/"
+                                "FAULT_ALERT(0xC1)；\n");
+            cli_fprintf(a->err, "        也可试 `reset-device`（软复位）或断电重启。\n");
+        }
+        return CLI_EXIT_FAIL;
+    }
+
+    if (a->o.json) {
+        cli_json_t j;
+        cli_json_init(&j, a->out, 0);
+        cli_json_bool(&j, "cleared", 1);
+        cli_json_finish(&j);
+    } else {
+        cli_fprintf(a->out, "故障已清除（STOP_MOTOR → CLEAR_ERRORS → 错误位归零）\n");
     }
     return CLI_EXIT_OK;
 }
@@ -1535,6 +1730,8 @@ static const cmd_t CMDS[] = {
     { "save",           cmd_save,           CLI_DESC_ONLY, 0 },
     { "set-node-id",    cmd_set_node_id,    CLI_DESC_ONLY, 0 },
     { "reset",          cmd_reset,          CLI_DESC_ONLY, 0 },
+    /* 清故障：需要描述符（要发 STOP_MOTOR/CLEAR_ERRORS 序列并读回错误位）+ 跑周期 */
+    { "fault-reset",    cmd_fault_reset,    CLI_DESC_FULL, 1 },
     /* **描述符 + 标定**：要物理量、要动电机的命令才需要 */
     { "health",         cmd_health,         CLI_DESC_FULL, 0 },
     /* watchdog **必须是 FULL 档**：它写的是 `can.config.break_timeout`，而那个端点 ID

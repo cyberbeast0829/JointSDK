@@ -38,6 +38,8 @@ void cli_usage(FILE *f, const char *argv0)
         "  --node N             目标节点 ID（默认 1）\n"
         "  --probe N            scan 的主动探测上限（默认 16，0 = 仅被动）\n"
         "  --timeout MS         单次操作超时（默认 3000）\n"
+        "  --timeout-ms MS      等状态序列跑完的预算（calibrate/home）\n"
+        "                       默认标定 120000 / 回零 5000（全标定要转十几圈电气角）\n"
         "  --json               机器可读输出\n"
         "  --rate-hz N          mon 的采样率（默认 10）\n"
         "  --duration S         运行时长，0 = 直到 Ctrl-C（默认 0）\n"
@@ -74,7 +76,9 @@ void cli_usage(FILE *f, const char *argv0)
         "动作子命令（需 --yes）\n"
         "  calibrate                     写 requested_state = 3 并等待\n"
         "  home                          写 requested_state = 11 并等待\n"
-        "  estop                         广播 ESTOP(0xC0)\n"
+        "  estop                         广播 ESTOP(0xC0)（**全局广播**，打到总线上所有节点）\n"
+        "  fault-reset                   清故障：STOP_MOTOR → CLEAR_ERRORS → 等错误位归零\n"
+        "                                （estop/FAULT_ALERT 锁死关节后唯一的软件恢复路径）\n"
         "  mit [--pos R --vel R --kp K --kd D --tau T] --hold S\n"
         "                                唯一会驱动电机的命令\n",
         argv0 ? argv0 : "jsdk-cli");
@@ -215,7 +219,8 @@ int cli_opts_parse(cli_opts_t *o, int argc, char **argv, FILE *err)
                 { "--filter",      12 },  { "--pos",         13 },
                 { "--vel",         14 },  { "--kp",          15 },
                 { "--kd",          16 },  { "--tau",         17 },
-                { "--stiffness",   18 },  { "--baud",        19 }
+                { "--stiffness",   18 },  { "--baud",        19 },
+                { "--timeout-ms",  21 }
             };
             unsigned k;
             int      hit = 0;
@@ -254,6 +259,11 @@ int cli_opts_parse(cli_opts_t *o, int argc, char **argv, FILE *err)
                     o->max_probe = u;
                     break;
                 case 7:  if (parse_u32(v, &o->timeout_ms) != 0) CLI_BAD_VALUE(); break;
+                case 21:
+                    /* 等状态序列跑完的预算（标定/回零）。全标定真机实测 >20 s，
+                       默认给到 120 s；客户如果缩短它，超时提示会说“还没跑完”。 */
+                    if (parse_u32(v, &o->state_timeout_ms) != 0) CLI_BAD_VALUE();
+                    break;
                 case 8:
                     if (parse_i32(v, &o->rate_hz) != 0
                         || o->rate_hz <= 0 || o->rate_hz > 1000) CLI_BAD_VALUE();
@@ -586,6 +596,11 @@ static int cli_init_ctx(cli_app_t *a)
     } else {
         cfg->period_ns = 0u;   /* 0 = 不声明控制周期（SDK 跳过那条安全闸） */
     }
+
+    /* 等状态序列跑完的预算（calibrate/home）：0 = SDK 内置默认
+       （标定 120 s、回零 5 s）。`--timeout-ms` 可覆盖 —— 真机上全标定要转
+       十几圈电气角，实测 >20 s，旧的硬编码 20 s 会在**序列还在跑**时报超时。 */
+    cfg->state_timeout_ms = a->o.state_timeout_ms;
 
     /* arena 先给上（大小按 RETAIN_ALL 的保守推荐值）；下载描述符时再用。
        ⚠ arena 本身要由我们释放（否则每次 run 漏 32 KB）；cfg 由 a 持有。 */

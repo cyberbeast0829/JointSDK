@@ -328,13 +328,20 @@ size_t cb_param_pack_write_req(uint8_t *dst, size_t cap, uint16_t ep_id,
     if (value_len == 0u || value_len > CB_PARAM_MAX_VALUE) return 0u;
     if (!value) return 0u;
 
+    /* ⚠⚠ 帧长必须 ≥ CB_PARAM_WRITE_REQ_MIN（8）：固件 `cmd_param_write()` 首句
+       就是 `if (msg.len < 8) return;` —— 短帧整帧丢掉、连 ACK 都不回。
+       bool(5B)/u8(5B)/u16(6B) 都曾经因此**写了等于没写**（真机实测），
+       而 u32/f32 刚好 8B 所以一直正常 —— 这个不对称让 bug 藏了很久。
+       `dst[3] = value_len` 仍写**真实长度**，固件只把这么多字节交给端点处理器。 */
     need = 4u + (size_t)value_len;
+    if (need < CB_PARAM_WRITE_REQ_MIN) need = CB_PARAM_WRITE_REQ_MIN;
     if (cap < need) return 0u;
 
     dst[0] = 0u;
     cb_be_put_u16(dst + 1, ep_id);
     dst[3] = value_len;
     for (i = 0u; i < value_len; ++i) dst[4u + i] = value[i];
+    for (i = (uint8_t)(4u + value_len); i < (uint8_t)need; ++i) dst[i] = 0u;
     return need;
 }
 

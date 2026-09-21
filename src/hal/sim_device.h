@@ -85,6 +85,8 @@ extern "C" {
 #define SIM_CM_POSITION 3u
 /** `Axis::AxisState` */
 #define SIM_AS_IDLE              1u
+#define SIM_AS_MOTOR_CALIB       4u   /* 全标定的第一个子状态 */
+#define SIM_AS_ENC_INDEX_SEARCH  7u   /* 真机实测的第二个子状态 */
 #define SIM_AS_CLOSED_LOOP       8u
 #define SIM_AS_FULL_CALIB        3u   /* AXIS_STATE_FULL_CALIBRATION_SEQUENCE */
 #define SIM_AS_HOMING           11u   /* AXIS_STATE_HOMING */
@@ -92,6 +94,19 @@ extern "C" {
 
 /** 标定/回零瞬时状态持续多久（ms）—— 真实固件是几百 ms 到数秒。 */
 #define SIM_TRANSIENT_MS        50u
+
+/**
+ * 全标定的**子状态**各持续多久（ms）。
+ *
+ * ⚠⚠ 模型必须报**子状态**：真机上 `FULL_CALIBRATION_SEQUENCE(3)` 期间
+ * `current_state` 是 4（电机标定）→ 7（索引搜索）→ 1，**从不等于 3**。
+ * 以前模型直接报 3 且只持续 `SIM_TRANSIENT_MS`(50 ms)，于是：
+ *   ① 上位机拿“== 3”当判据的 bug 在仿真上**永远绿**；
+ *   ② 上位机改成限速轮询（真机必须这么做）之后，50 ms 的子状态
+ *      **被整个错过** → 误报 “never left idle”。
+ * 现在按真机的量级建模（实测整条序列 29.5 s，两段共 ~30 s）。
+ */
+#define SIM_CAL_STAGE_MS       2000u
 
 /** 端点值类型（线宽，与 JSON 描述符的 type 字符串一致） */
 typedef enum {
@@ -160,6 +175,8 @@ typedef struct {
     float    pos_estimate;         /* 372  axis0.encoder.pos_estimate        f32 r  电机端 turns */
     float    vel_estimate;         /* 378  axis0.encoder.vel_estimate        f32 r  电机端 turns/s */
     int32_t  cpr;                  /* 390  axis0.encoder.config.cpr          i32 rw */
+    uint8_t  motor_pre_cal;        /* 240  axis0.motor.config.pre_calibrated   bool rw */
+    uint8_t  enc_pre_cal;          /* 394  axis0.encoder.config.pre_calibrated bool rw */
 
     /* ---- 非端点字段 ---- */
     uint32_t is_fd;                /* 该节点用 CAN FD 通信 */
@@ -167,6 +184,10 @@ typedef struct {
     uint8_t  estop;
     uint8_t  life;
     uint8_t  bcast_seen;
+    uint8_t  drop_writes;          /* 故障注入：像固件 `cmd_param_write()` 的
+                                      `if (msg.len < 8) return;` 那样**静默丢弃**
+                                      PARAM_WRITE（不回 ACK、不改值）。
+                                      用于验证“写后读回”真的能抓到丢帧。 */
 
     uint32_t last_cmd_ms;          /* is_ctrl 帧上次到达（0 = 从未收到） */
     uint32_t last_heartbeat_ms;
@@ -175,6 +196,7 @@ typedef struct {
     uint32_t transient_until_ms;   /* > now_ms 时 current_state 停在瞬时态 */
     uint8_t  settle_to;            /* 瞬时态结束后回到哪个状态 */
     uint32_t requested_hits;       /* 通过端点写入 requested_state 的次数 */
+    uint8_t  cal_stage;            /* 全标定子状态进度：0=未开始 1=电机标定 2=索引搜索 */
     uint32_t param_err_count;      /* 因装不下而回 ERR 的批量请求次数 */
     uint8_t  tx_seq;               /* ⚠ 设备本地滚动计数器（固件 tx_seq_[axis]++）
                                       响应帧用它，**不回显请求的 Seq** */

@@ -636,11 +636,34 @@ motor.config.torque_lim = cur_limit_A × torque_constant   ← ⚠ 持久改写
 
 **Classic 且 `data_len > 4`** → 自动分段：每块 4 字节，末块 `flags.bit7 = 0`。
 
+> ⚠⚠ **最短请求帧 = 8 字节**（即"负载总长 = 4 + 值宽"必须 ≥ 8，也就是**值宽 ≥ 4**）。
+> 固件 `cmd_param_write()` 的**第一句**是
+> `if (msg.len < 8) return;` —— 不足 8 字节的参数写帧被**整帧静默丢弃**：
+> 既不回 ACK、也不改值、也不报错。于是 `bool`(5 B) / `u8`(5 B) / `u16`(6 B)
+> 端点的写入全都"看着成功、实际没写进去"，而 `u32`/`f32`(8 B) 恰好正常 ——
+> 极难定位（本项目为此查了很久，见 `FIRMWARE_ISSUES` F28）。
+> 主站两种合规做法：
+> ① 值宽 < 4 时把帧**补零到 8 字节**（`dst[3]` 仍写**真实**值宽 —— SDK 的做法）；
+> ② 用 Classic 的分段形式凑够 8 字节。
+> ⚠ 固件对短帧**不回任何错误**，所以主站**不能**靠"有没有 ACK"判断这一帧是否被接受；
+> 写后读回是唯一的确认手段。
+
 > ⚠ 设备侧装配状态（`ParamWriteAsmState`）在下列情况会**中止**：
 > 丢块、端点 ID 变化、主站 ID 变化。
 > → SDK 必须逐块串行发送，且**同一装配过程中不得插入其他参数写**。
 
 ### 5.5 CONFIG_SAVE (0x22) / CONFIG_RESET (0x23)
+
+> ⚠⚠ **`axis0.current_state`（端点 142）在跑序列时报的是“子状态”。**
+> 真机实测（fw 1545）写 `requested_state = 3`（FULL_CALIBRATION_SEQUENCE）后：
+> `current_state` 走 **4（MOTOR_CALIBRATION）→ 7（ENCODER_INDEX_SEARCH）→ 1（IDLE）**，
+> **从不等于 3**，整条序列约 **29.5 s**；而 `requested_state` 在 1 ms 内就被**消费**回 0。
+> 推论：
+> * 上位机**不能**用“`current_state == 3`”当“已进入标定”的判据 —— 会得到
+>   “写进去了但状态不动”的假象；正确判据是“**离开静息态**（IDLE/CLOSED_LOOP_CONTROL）”。
+> * 回到静息态**不等于成功**：失败路径就是“进子状态 → 出错 → 回静息”，
+>   成败要看 `axis0.error` / QUERY_ERROR(0x45) 的明细位。
+> * 回零（`requested_state = 11`）则**确实**停 11，跑完停在 8（CLOSED_LOOP_CONTROL）。
 
 **载荷**：无　**响应**：无
 

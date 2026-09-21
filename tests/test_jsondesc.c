@@ -272,6 +272,9 @@ static void test_incremental_equivalence(void)
                  a.store.arena.blob_used) == 0);
 
     /* 再按 62 字节（CAN FD 的 JSON 载荷）分块喂一次 */
+    env_teardown(&b);          /* ⚠ 必须先把上一次的 64 KiB 还回去：
+                                  否则这里会**直接覆盖** b.mem 而泄漏
+                                  （ASan 的 LeakSanitizer 会报 65536 B）*/
     env_setup(&b, 65536u, JSDK_DESC_RETAIN_ALL);
     rc = jsdk_jsondesc_init(&p, &b.cfg, &b.store);
     CHECK_EQ(rc, JSDK_OK);

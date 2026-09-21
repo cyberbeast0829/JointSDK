@@ -808,6 +808,24 @@ static void test_ops(void)
         CHECK_EQ(count_tx(&fx, CB_MSG_CURRENT_CONTROL, 0), 0u);
         /* 状态必须真的走完：current_state 回到 IDLE */
         CHECK_EQ(fx.j->current_state_raw, SIM_AS_IDLE);
+        /*
+         * ⚠ 这两条是**等待判据的牙齿**：模型现在按真机报**子状态**
+         *   （4 电机标定 → 7 索引搜索），**从不等于请求值 3**；如果判据退回
+         *   “current_state == 3”，`jsdk_joint_calibrate()` 就会超时 → 上面那条
+         *   `JSDK_OK` 断言直接失败。
+         * 同时“跑完 ≠ 生效”：两个 pre_calibrated 必须真的被置上。
+         */
+        CHECK_EQ(fx.sim->nodes[0].motor_pre_cal, 1u);
+        CHECK_EQ(fx.sim->nodes[0].enc_pre_cal, 1u);
+        {
+            jsdk_value_t v;
+            CHECK_EQ(jsdk_joint_param_get(fx.j, "axis0.motor.config.pre_calibrated",
+                                          &v), JSDK_OK);
+            CHECK_EQ(v.v.boolean, 1);
+            CHECK_EQ(jsdk_joint_param_get(fx.j, "axis0.encoder.config.pre_calibrated",
+                                          &v), JSDK_OK);
+            CHECK_EQ(v.v.boolean, 1);
+        }
         printf("      calibrate finished: current_state=%u (%s)\n",
                (unsigned)fx.j->current_state_raw,
                jsdk_can_axis_state_name(fx.j->current_state_raw));
@@ -821,6 +839,28 @@ static void test_ops(void)
         printf("      home finished: current_state=%u (%s)\n",
                (unsigned)fx.j->current_state_raw,
                jsdk_can_axis_state_name(fx.j->current_state_raw));
+    }
+
+    /*
+     * --- 预算旋钮：`cfg.state_timeout_ms` 必须真的生效 ---
+     * 真机上全标定要 29.5 s（旧的硬编码 20 s 会在序列**还在跑**时报超时），
+     * 而客户也可能把预算调小。这里给 1 ms：必须报**超时**，且提示是
+     * “did not finish”（已经开始了），不是“never left idle”。
+     */
+    {
+        /* ⚠ 要改的是**上下文里已复制的那份**（`jsdk_context_init()` 会把 cfg
+           拷贝进去），改 `fx.cfg` 对运行中的上下文不起作用。 */
+        uint32_t keep = fx.ctx->cfg.state_timeout_ms;
+
+        fx.ctx->cfg.state_timeout_ms = 100u;   /* < 第一段子状态的 2000 ms */
+        drain_tx(&fx);
+        CHECK_EQ(jsdk_joint_calibrate(fx.j), JSDK_ERR_TIMEOUT);
+        /* 预算太短时**也不能**胡乱归因：这里已经看到过程开始了，
+           所以必须是 “did not finish”，而不是 “never left idle”。 */
+        CHECK(strstr(jsdk_context_last_error(fx.ctx), "did not finish") != NULL);
+        printf("      state_timeout_ms=100 -> timeout: %s\n",
+               jsdk_context_last_error(fx.ctx));
+        fx.ctx->cfg.state_timeout_ms = keep;
     }
 
     /* --- 保存配置：无应答 → 用读回校验 --- */
@@ -1525,6 +1565,62 @@ static void test_watchdog_disabled(void)
     fx_close(&fx);
 }
 
+/**
+ * **短值写入**（bool / u8 / u16）必须真的生效。
+ *
+ * ⚠⚠ 这里曾经有个藏了很久的真缺陷：固件 `cmd_param_write()` 首句是
+ *   `if (msg.len < 8) return;`（整帧丢弃、连 ACK 都不回），而发送侧按
+ *   `4 + value_len` 组帧 ⇒ bool/u8 = 5 B、u16 = **6 B** 全部被丢掉；
+ *   只有 u32/f32 刚好 8 B 能生效 —— 所以“写参数能用”这个印象是假的。
+ *   真机表现：`write <bool> 1` 报成功、再读还是旧值；`can.config.break_timeout`
+ *   （u16）写什么都没反应，还一度被误判成固件问题（FIRMWARE_ISSUES F28）。
+ *
+ * 现在发送侧一律补齐到 8 字节，**仿真设备也复刻了同一门限**，
+ * 所以这条用例在缺了补齐时会红。
+ */
+static void test_write_short_values(void)
+{
+    fix_t fx;
+    jsdk_value_t v;
+
+    printf("[11] 短值写入：bool / u8 / u16 必须真的进设备（帧长 ≥ 8）\n");
+
+    if (fx_open(&fx, "0:id=1,gear=16.0,tconst=0.0385,pmax=12.5,vmax=65,tmax=50,"
+                     "kpmax=500,kdmax=5,hb=10,timeout=30000,fd", 1u) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+    if (fx_configure(&fx) != 0) { g_fail++; g_checks++; fx_close(&fx); return; }
+
+    /* --- u16（端点 73，也是 F28 那个端点）--- */
+    v.type = JSDK_EP_U16; v.v.u16 = 250u;
+    CHECK_EQ(jsdk_joint_param_set(fx.j, "can.config.break_timeout", &v), JSDK_OK);
+    CHECK_EQ(fx.sim->nodes[0].break_timeout, 250u);        /* 设备侧真的变了 */
+    CHECK_EQ(jsdk_joint_param_get_u32(fx.j, "can.config.break_timeout", &v.v.u32),
+             JSDK_OK);
+    CHECK_EQ(v.v.u32, 250u);
+    printf("      u16 break_timeout -> %u（设备侧已生效）\n",
+           (unsigned)fx.sim->nodes[0].break_timeout);
+
+    /* --- bool（端点 154）--- */
+    v.type = JSDK_EP_BOOL; v.v.boolean = 0;
+    CHECK_EQ(jsdk_joint_param_set(fx.j, "axis0.config.enable_watchdog", &v), JSDK_OK);
+    CHECK_EQ(fx.sim->nodes[0].enable_watchdog, 0u);
+    v.v.boolean = 1;
+    CHECK_EQ(jsdk_joint_param_set(fx.j, "axis0.config.enable_watchdog", &v), JSDK_OK);
+    CHECK_EQ(fx.sim->nodes[0].enable_watchdog, 1u);
+    printf("      bool enable_watchdog 0 -> 1（设备侧已生效）\n");
+
+    /* --- u8（端点 287 control_mode）--- */
+    v.type = JSDK_EP_U8; v.v.u8 = 3u;
+    CHECK_EQ(jsdk_joint_param_set(fx.j, "axis0.controller.config.control_mode", &v),
+             JSDK_OK);
+    CHECK_EQ(fx.sim->nodes[0].control_mode, 3u);
+    printf("      u8 control_mode -> %u（设备侧已生效）\n",
+           (unsigned)fx.sim->nodes[0].control_mode);
+
+    fx_close(&fx);
+}
+
 static void test_robustness(void)
 {
     fix_t fx;
@@ -1672,6 +1768,7 @@ int main(void)
     test_handshake_retry(); printf("\n");
     test_watchdog_readback(); printf("\n");
     test_watchdog_disabled(); printf("\n");
+    test_write_short_values(); printf("\n");
     test_robustness();   printf("\n");
 
     free(g_json);

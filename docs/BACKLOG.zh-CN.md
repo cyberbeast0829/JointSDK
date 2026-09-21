@@ -359,7 +359,8 @@ if (timeout_ms == 0) return;             // 超时检测被禁用
 ```
 
 ⇒ `0` = 禁用，而且**是默认值**（设备出厂即无协议超时保护）。此前 SDK 与两份文档都写着
-“0 → 按 100 ms 处理”，那是**旧固件的行为**，也是 F28 一开始被误判的根源。
+“0 → 按 100 ms 处理”，那是**旧固件的行为**（也是 F28 一开始被误判的根源之一：当时
+“写 250 却读回 0”被解读成“端点不落地”，真因见 §2.5 末尾 —— 是我们的写帧太短）。
 
 **改了什么**（每一处都能被下面列出的用例发现）：
 
@@ -384,20 +385,112 @@ if (timeout_ms == 0) return;             // 超时检测被禁用
 - `tests/test_joint.c`：快照 `break_timeout_ms == 0`（= 禁用，不再被归一成 100）；
 - **变异 4/4 全部被检出**：keepalive 照补 / `0` 当门限比 / 模型 `0 → 100` / `device_ms` 归一。
 
-**真机验证**（fw 1545，COM3）：
+**真机验证**（fw 1545，COM3；**v0.27 复测，此前那组“读回恒 0”的结论已推翻**）：
 
 ```console
 $ jsdk-cli --if slcan --channel COM3 --node 1 --json read can.config.break_timeout
 {"path":"can.config.break_timeout","type":"uint16","value":0,"value_text":"0"}
-$ jsdk-cli … --json dump-config        → "break_timeout_ms":0      （与 read 一致了）
-$ jsdk-cli … --json --yes watchdog 250 → {"ms":250,"device_reports_ms":0,"verified":false,…}
+$ jsdk-cli … --json dump-config        → "break_timeout_ms":0      （与 read 一致）
+$ jsdk-cli … --json --yes watchdog 300 → {"ms":300,"device_reports_ms":300,"verified":true,…}   ✓
 $ jsdk-cli … --json --yes watchdog 0   → {"ms":0,"device_reports_ms":0,"verified":true,"disabled":true}
-$ python -m jsdk_can … --json --yes watchdog 250 → 与 C 版**逐字段一致**
+$ python -m jsdk_can … --json --yes watchdog 300 → 与 C 版**逐字段一致**
 ```
 
-> 📌 顺带把 **F28 的事实层改正了**：该端点不是“写入生效但读不到”，而是
-> **写 250 后同进程立刻读仍是 0**（`sdo.data` 证实发出的就是 `FA 00`）⇒
-> **客户端无法武装协议超时保护**，严重度由“中”升为“高”。
+> 📌 **F28 已结案：是我们自己的 bug，不是固件缺陷**。
+> 本项当初因为“写 250 之后同进程立刻读仍是 0”而判为“端点不落地”，但真因是
+> **SDK 发出的参数写帧不足 8 字节**（`bool`/`u8` = 5 B、`u16` = 6 B），
+> 被固件 `cmd_param_write()` 首句 `if (msg.len < 8) return;` **整帧静默丢弃**
+> （不回 ACK、不改值）。这就是现场那两句症状的**同一个根因**：
+> “写 `pre_calibrated 1` 报成功但读回 `false`”、“`calibrate --yes` 进不去状态 3”。
+> 修复：`cb_param_pack_write_req()` 一律补齐到 ≥ 8 B（`dst[3]` 仍写真实值宽），
+> 仿真设备**复刻**同一门限（否则离线测试永远抓不到），两版 CLI 的 `write` 一律**写后读回**
+> 并在不一致时 `rc=1`。
+
+
+---
+
+### 2.5b 参数写帧**最短 8 字节**（v0.27，现场故障的根因）
+
+现场两句话：“`write axis0.motor.config.pre_calibrated 1` 报成功但读回 `false`”、
+“`calibrate --yes` 报 `device never entered state 3`，电机不动”。**同一个根因**：
+
+```
+固件 cmd_param_write() 第一句：  if (msg.len < 8) return;      // 整帧静默丢弃，不回 ACK
+SDK 按 4 + 值宽 打包：           bool/u8 = 5 B、u16 = 6 B、u32/f32 = 8 B
+                                → 短帧全被吞，宽帧恰好正常（于是“有些参数能写、有些写不动”）
+```
+
+`axis0.requested_state` 是 **u8** ⇒ `calibrate` / `home` 在真机上**从未成功过**；`break_timeout` 是
+**u16** ⇒ 见 §2.5（已被误判成固件 F28）。
+
+| 层 | 修复 | 能发现它坏掉的检查 |
+|---|---|---|
+| 打包 | `cb_param_pack_write_req()` 补齐到 ≥ 8 B（`CB_PARAM_WRITE_REQ_MIN`；`dst[3]` 仍写**真实**值宽） | `tests/test_ops.c [11] test_write_short_values`（u16/bool/u8 必须到达设备）+ 变异 |
+| 仿真设备 | **复刻同一门限**（`f->len < 8` → 丢弃） | 不复制门限时离线测试**永远绿** —— 这正是它藏这么久的原因 |
+| CLI | `write` 一律**写后读回**：`requested/value/verified`，不一致 → `rc=1` | `tests/test_cli.c [11]`（含 `dropwrite` 故障注入 → 必须 `rc=1`）；Python 侧 6 条对拍 |
+| Python 库 | 新增 `param_set_auto()`：按端点声明类型装箱 | `test_joint.py` 的 u16 往返 + 值域拒绝 |
+| 工具 | `hw_verify.sh` L8 断言 `verified`（旧断言 `written` 已废） | 真机 `--write-probe` 一轮不通过即红 |
+
+**真机结果**（COM3 / fw 1545）：`hw_verify.sh --runs 3 --write-probe` **48/48 全绿**；
+`pre_calibrated`、`break_timeout` 0→250→0、`enable_watchdog` 全部写→读回 `verified:true`。
+
+> ⚠ 教训：**怀疑固件之前先数一下自己发出的帧长**。同一个 bug 在仿真上永远是绿的，
+> 因为仿真器当时没有复制固件的早期返回 —— “模型必须复刻固件的门限”这条已写进
+> `sim_device.c` 的注释与本表。
+
+### 2.5c “关节一直进故障”与 `fault-reset`（v0.27，含一次误判的订正）
+
+现场现象：两次 CLI 调用之间，`axis0.error` 就是 `0x800`，`health` 报 `err_code 8 / err_name CAN_TIMEOUT`；
+写 `axis0.error 0` / 发 `CLEAR_ERRORS` 都能让它**瞬时变 0**，但 ~120 ms 后又回到 `0x800`。
+
+**我一开始认错了根因**（以为是 `estop` 锁存，实为）：对照固件枚举，`0x800` 是
+**`ERROR_WATCHDOG_TIMER_EXPIRED`**（esstop 是 `0x4000`，本次**从未出现过**）。真因是设备配置：
+
+```
+axis0.config.enable_watchdog = true
+axis0.config.watchdog_timeout = 0.0        // ← get_watchdog_reset() = 0
+get_watchdog_reset() = clamp(watchdog_timeout,0,…) * current_meas_hz = 0
+watchdog_check():  value > 0 ? value-- : (error_ |= WATCHDOG_TIMER_EXPIRED)
+                     ↑ 0 就是“零容忍”：只要这一周期没收到帧（只有 do_command() 才 watchdog_feed）就置位
+```
+
+⇒ 任何**CAN 静默空隙**（进程退出/命令之间）都会锁存 0x800，而 `detect_error_code()` 把它映射成
+`ERR_CAN_TIMEOUT`，把人往波特率/线缆上带。修复/应对：
+
+| 项 | 内容 |
+|---|---|
+| 设备侧（用户可改） | `axis0.config.watchdog_timeout = 0.1`（或 `enable_watchdog = false`）；⚠ `watchdog_timeout = 0` **不是禁用** |
+| 新增命令 | `fault-reset`（`STOP_MOTOR` → `CLEAR_ERRORS` → 等错误位归零，不动电机）；能清锁存位，**但原因还在就会立刻回来 —— 这是正确行为** |
+| 固件问题 | 记为 **F29**（含两个不同根因共用一个 `ERR_CAN_TIMEOUT` 报错名） |
+
+### 2.5d `calibrate` 的等待判据错了（v0.27，真机实测暴露）
+
+`request_state_and_wait()` 原判据是“`current_state` **等于**请求值”（例如 3）才算“已进入”，
+只见“离开”就返回成功。真机实测两个都错：
+
+| 事实（实测） | 后果 |
+|---|---|
+| 跑 `FULL_CALIBRATION_SEQUENCE` 时 `current_state` 报的是**子状态**（4 MOTOR_CALIBRATION → 6 ENCODER_OFFSET_CALIBRATION → 7 INDEX_SEARCH），**从不等于 3** | 一次**真的跑起来了**（电机都转了）的标定被判成“device never entered state 3”并超时 ← 害我把排查方向全押在“写没写进去” |
+| 回到空闲**也不等于成功**（标定失败 = 进子状态 → 出错 → 回空闲） | 标定失败也报 OK |
+
+已改为：① 判据是“**离开静息态**”（静息 = IDLE(1) / CLOSED_LOOP_CONTROL(8)，后者是**回零**成功后的定格）；
+② 结束时**抓一次 QUERY_ERROR 六类明细**，有故障位就报 `PROTOCOL` 并把位名写进 `last_error`；
+③ 超时路径也带上故障明细（“状态完全没动”最常见的原因就是**锁存故障让状态机拒绝启动**）。
+
+真机现在的输出（同一台设备、同一个配置）：
+
+```console
+$ jsdk-cli --if slcan --channel COM3 --node 1 --json --yes calibrate
+{"action":"calibrate","warning":"motor moves during full calibration"}
+jsdk-cli: calibrate 失败：protocol-error
+         joint 0(node 1): state 3 ran but the device reports a fault:
+         detail_err=0x00000102(ENCODER_FAILED) axis_error=0x00000000
+         mit_err=ENCODER hb=axis|encoder can_state=IDLE
+```
+
+`0x102` = 轴 `ENCODER_FAILED`(0x100) + 编码器 `CPR_POLEPAIRS_MISMATCH`(0x2)：编码器**偏置标定的扫描**
+实测位移与期望值（cpr 16384 / pole_pairs 14 / `calib_range` 2% → 期望 16384 counts）偏差超限。
+设备侧要查：转子能否自由转动（抱闸/机械卡滞）、`calibration_current`(5 A) 是否够、编码器方向。
 
 ---
 

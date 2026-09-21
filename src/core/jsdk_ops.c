@@ -64,11 +64,92 @@ static int write_u8_ep(jsdk_joint_t *j, uint16_t ep, uint8_t v)
  *
  * 把①单独列出来很重要：只看"最终不等于 3"会把"压根没开始"当成"标定完成"。
  */
+/**
+ * “序列正在跑”的状态集合（固件 `AxisState`）：启动序列 / 全标定 / 电机标定 /
+ * 编码器偏置 / 索引搜索 / LOCKIN 自转 / 方向探测 / 回零 / HALL 标定 / 齿槽标定。
+ *
+ * ⚠ 全标定（3）在运行期间报的是**子状态**（真机实测 4 → 7 → 1），**从不等于 3** ——
+ * 拿“等于请求值”当“已进入”，会把一次真跑起来的标定误判成“没开始”；
+ * 反过来也不能把“不等于请求值”当“跑完了”（子状态本身就与请求值不等）。
+ */
+static int state_is_busy(uint8_t st)
+{
+    switch (st) {
+    case 2u:  /* STARTUP_SEQUENCE                  */
+    case 3u:  /* FULL_CALIBRATION_SEQUENCE         */
+    case 4u:  /* MOTOR_CALIBRATION                 */
+    case 6u:  /* ENCODER_OFFSET_CALIBRATION        */
+    case 7u:  /* ENCODER_INDEX_SEARCH              */
+    case 9u:  /* LOCKIN_SPIN                       */
+    case 10u: /* ENCODER_DIR_FIND                  */
+    case 11u: /* HOMING（回零期间就停在这个值）       */
+    case 12u: /* ENCODER_HALL_POLARITY_CALIBRATION */
+    case 13u: /* ENCODER_HALL_PHASE_CALIBRATION    */
+    case 14u: /* ANTICOGGING_CALIBRATION           */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/**
+ * “等状态跑完”时的轮询间隔（ms）。子状态是**秒**级；而全速刷（以前就是：每轮一次
+ * param read，实测 ~2500 次/s）会挤爆 115200 的 slcan 适配器（理论上限 ~380 次交换/s）——
+ * 真机实测 100757 次读取里后 2/3 全部超时，而设备**其实 29.5 s 就跑完了**。
+ */
+#define JSDK_STATE_POLL_MS 200u
+
+/**
+ * 还没看到“离开静息”之前的轮询间隔（ms）：**起始判决必须快**。
+ * 真机子状态是秒级，但仿真模型（以及未来可能更快的固件）可能只持续几十 ms；
+ * 用 200 ms 去撒，会把整个瞬时过程**漏掉** → 误报“never left idle”。
+ */
+#define JSDK_STATE_POLL_MS_FAST 20u
+
+/** 等状态序列跑完的预算：配置没给就用该操作的内置默认。 */
+static uint32_t state_budget_ms(const jsdk_joint_t *j, uint32_t fallback_ms)
+{
+    uint32_t v = j->ctx->cfg.state_timeout_ms;
+    return (v != 0u) ? v : fallback_ms;
+}
+
+/**
+ * 设备当前是否有故障（抓一次 QUERY_ERROR(0x45) 六类明细）。
+ *
+ * @param fb  可选输出：人可读的一行（`jsdk_joint_describe_fault` 格式）
+ * @return 1 = 有故障；0 = 干净；**-1 = 查不到**（别把“查不到”当成“没故障”）
+ */
+static int device_fault(jsdk_joint_t *j, char *fb, size_t cap)
+{
+    jsdk_fault_info_t info;
+
+    if (fb != NULL && cap > 0u) fb[0] = '\0';
+    if (jsdk_joint_query_error_detail(j, &info) != JSDK_OK) return -1;
+    if ((info.motor_error | info.encoder_error | info.sensorless_error
+         | info.controller_error | info.system_error | info.axis_error) == 0u) {
+        return 0;
+    }
+    if (fb != NULL && cap > 0u) (void)jsdk_joint_describe_fault(j, fb, cap);
+    return 1;
+}
+
+/**
+ * 写 `requested_state = transient` 并等序列跑完。
+ *
+ * 三条判据都是真机踩出来的（详见 `docs/BACKLOG.zh-CN.md` §2.5d）：
+ *   ① “已进入” = **离开静息态**，不是“等于请求值”（全标定只报子状态 4/7）；
+ *   ② “跑完了” = 回到**静息态**（IDLE 或 CLOSED_LOOP_CONTROL）；
+ *   ③ “成功” = 跑完**且设备没报故障**（锁存故障时轴会直接拒绝启动）。
+ * 另外轮询必须限速，且单次读失败不能当成“状态没变”。
+ */
 static jsdk_status_t request_state_and_wait(jsdk_joint_t *j, uint8_t transient,
                                             uint32_t timeout_ms)
 {
     uint32_t t0;
-    unsigned spin = 0u;
+    uint32_t next_poll;
+    uint32_t poll_ms = JSDK_STATE_POLL_MS_FAST;
+    uint32_t last_now = 0u;
+    unsigned frozen = 0u;      /* 时钟连续多少次没动的计数（只用于冻结兜底） */
     int seen_transient = 0;
 
     if (j->ep_requested_state == 0u) {
@@ -88,34 +169,97 @@ static jsdk_status_t request_state_and_wait(jsdk_joint_t *j, uint8_t transient,
     }
 
     t0 = j->ctx->cfg.hal.now_ms(j->ctx->cfg.hal.user);
+    next_poll = t0;
 
     for (;;) {
-        uint8_t st = 0u;
+        uint8_t  st;
+        uint32_t now = j->ctx->cfg.hal.now_ms(j->ctx->cfg.hal.user);
 
-        if (read_current_state(j, &st) == 0) {
-            j->current_state_raw = st;
-            if ((uint8_t)st == transient) {
-                seen_transient = 1;
-            } else if (seen_transient) {
-                j->ctx->now_ms = j->ctx->cfg.hal.now_ms(j->ctx->cfg.hal.user);
-                j->ctrl_blocked = 0u;
-                jsdk_ctx_seterr(j->ctx, "node %u left state %u (now %u)",
-                                (unsigned)j->cfg.node_id, (unsigned)transient,
-                                (unsigned)st);
-                return JSDK_OK;
-            }
+        j->ctx->now_ms = now;
+        if (jsdk_elapsed(now, t0) >= timeout_ms) break;
+
+        /*
+         * ⚠ 兜底只能看“**时钟是否冻住**”，不能用“循环次数上限”：
+         *   真机 HAL 下 `recv()` 无数据时立即返回，一轮只有几百 ns —— 次数上限
+         *   会在**几秒内**被撞到，于是 120 s 的预算在 4.4 s 就报超时
+         *   （实测踩过：提示写着 “within 120000 ms”，墙钟只过了 4.4 s）。
+         *   而虚拟 HAL 的时钟只在测试推时间轴时前进，所以确实需要这个兜底。
+         */
+        if (now != last_now) {
+            last_now = now;
+            frozen = 0u;
+        } else if (++frozen >= 200000u) {
+            break;                 /* 时钟冻住（仿真 HAL 未推进）→ 只能放弃 */
         }
 
-        j->ctx->now_ms = j->ctx->cfg.hal.now_ms(j->ctx->cfg.hal.user);
-        if (jsdk_elapsed(j->ctx->now_ms, t0) >= timeout_ms) break;
-        if (++spin >= 200000u) break;      /* 时钟冻结的仿真 HAL 兜底 */
+        if (jsdk_elapsed(now, next_poll) < poll_ms) {
+            /*
+             * 空闲期间**只收不发**（排掉 RX，免得适配器缓冲溢出丢帧）。
+             * ⚠ 这里**不能**用 `jsdk_context_poll()`：它跑的是完整周期
+             *   （cycle_begin + cycle_end），会按需补发 keepalive 控制帧 ——
+             *   标定期间往正在标定的轴上送 MIT 帧是不该做的事。
+             */
+            jsdk_can_frame_t f;
+            int n = j->ctx->cfg.hal.recv(j->ctx->cfg.hal.user, &f);
+
+            if (n > 0) {
+                j->ctx->bus.rx_frames++;
+                j->ctx->bus.link_up = 1u;
+                j->ctx->last_rx_ms = now;
+                (void)jsdk_ctx_handle_frame(j->ctx, &f);
+            }
+            continue;
+        }
+        next_poll = now;
+
+        if (read_current_state(j, &st) != 0) {
+            /* 单次读失败**不是**“状态没变”（真机上偶发超时之后就恢复了）。 */
+            continue;
+        }
+
+        j->current_state_raw = st;
+        if (state_is_busy(st)) {
+            seen_transient = 1;
+            poll_ms = JSDK_STATE_POLL_MS;   /* 已确认开始了 → 转入慢轮询 */
+        } else if (seen_transient) {
+            char fb[192];
+            int  f;
+
+            j->ctrl_blocked = 0u;
+            f = device_fault(j, fb, sizeof fb);
+            /* 回到静息态**不等于**成功：标定失败就是“进子状态 → 出错 → 回静息”。 */
+            if (f == 1) {
+                jsdk_joint_seterr(j,
+                    "state %u ran but the device reports a fault: %s"
+                    "（先清故障（`fault-reset`）再重试）",
+                    (unsigned)transient, fb);
+                return JSDK_ERR_PROTOCOL;
+            }
+            jsdk_ctx_seterr(j->ctx, "node %u finished state %u (back to rest%s)",
+                            (unsigned)j->cfg.node_id, (unsigned)transient,
+                            f == 0 ? ", no fault" : ", fault check unavailable");
+            return JSDK_OK;
+        }
     }
 
     j->ctrl_blocked = 0u;
-    jsdk_joint_seterr(j, seen_transient
-        ? "state %u did not finish within %u ms"
-        : "device never entered state %u (write accepted but state unchanged?)",
-        (unsigned)transient, (unsigned)timeout_ms);
+    {
+        char fb[192] = {0};
+        int  f = device_fault(j, fb, sizeof fb);
+
+        if (seen_transient) {
+            jsdk_joint_seterr(j, "state %u did not finish within %u ms%s%s",
+                              (unsigned)transient, (unsigned)timeout_ms,
+                              f == 1 ? " | device fault: " : "", f == 1 ? fb : "");
+        } else {
+            /* 状态**完全没动**：实测最常见的原因是**锁存故障**让状态机拒绝启动
+               （写被接受、值也被消费，但状态就是不动）。 */
+            jsdk_joint_seterr(j, "device never left idle after requesting state %u"
+                                 " (waited %u ms)%s%s",
+                              (unsigned)transient, (unsigned)timeout_ms,
+                              f == 1 ? " | device fault: " : "", f == 1 ? fb : "");
+        }
+    }
     return JSDK_ERR_TIMEOUT;
 }
 
@@ -182,14 +326,16 @@ jsdk_status_t jsdk_joint_calibrate(jsdk_joint_t *j)
         return JSDK_ERR_BAD_STATE;
     }
 
-    return request_state_and_wait(j, 3u, 20000u);   /* AXIS_STATE_FULL_CALIBRATION_SEQUENCE */
+    return request_state_and_wait(j, 3u,
+                                  state_budget_ms(j, JSDK_STATE_TIMEOUT_CALIBRATE_MS));
 }
 
 jsdk_status_t jsdk_joint_home(jsdk_joint_t *j)
 {
     if (!jsdk_joint_check(j)) return JSDK_ERR_INVALID_ARG;
     if (!j->calibrated) return JSDK_ERR_BAD_STATE;
-    return request_state_and_wait(j, 11u, 5000u);
+    return request_state_and_wait(j, 11u,
+                                  state_budget_ms(j, JSDK_STATE_TIMEOUT_HOME_MS));
 }
 
 /* ==========================================================================

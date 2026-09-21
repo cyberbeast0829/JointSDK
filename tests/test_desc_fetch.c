@@ -466,6 +466,10 @@ static void test_filtered_stop(void)
         CHECK_EQ(cb_desc_fetch_is_ok(&f), 1);
     }
 
+    /* ⚠ 关掉这一轮的 HAL：后面 3c) 会用 `hal_open` **重建**同一个 hf，
+       不关的话上一轮的 bus / 描述符副本就漏了（ASan 当场报 leak）。 */
+    hal_close(&hf);
+
     /* --- 3c) 边界：最后一个 filter 恰好在**末帧**才满足 ---------------------
        `.get_drv_fault.drv_fault`（id 521）是描述符里**最后一个**端点，其
        `"id"`/`"type"` 落在第 662 帧（字节 41007~41012）内。若“提前终止”判定

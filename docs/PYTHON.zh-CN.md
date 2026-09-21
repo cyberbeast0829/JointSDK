@@ -76,6 +76,7 @@ ctx = Context(
     desc_retain=DescRetain.ALL,  # 保留全部端点（约 24.9 KB RAM）；只留关键路径可降到 <1 KB
     desc_filter=["axis0.motor.config.gear_ratio", "axis0.config.can.node_id"],
     period_ns=1_000_000,         # 期望周期（keepalive 与超时判定用）
+    state_timeout_ms=0,          # 等状态序列跑完的预算；0 = 内置默认（标定 120 s / 回零 5 s）
     auto_keepalive=True,
     max_joints=8,
 )
@@ -145,11 +146,12 @@ vel/tau/kp/kd 取 0 —— 所以"使能瞬间"电机既不跳向残留目标也
 - `j.set_watchdog_ms(0)` = **关闭**设备侧协议级超时检测（最新固件语义：
   `auto_stop_if_timeout()` 首句就是 `if (timeout_ms == 0) return;`）。
   注意保护只在该设备**收到过控制帧后**才武装 —— 纯电流模式武装不了（固件 F19）；
-- **写后读回校验在真机上有个例外（F28）**：实机 `can.config.break_timeout` 的**读回恒为 0**
-  （写 250 立刻读也是 0，而 `0` = 禁用），所以 `set_watchdog_ms()` 把读回分成三类：
-  等于写入值（含写 0）→ 校验通过；**读回 0 而写入非 0 → 置 `StatusFlag.WATCHDOG_UNVERIFIED`、
-  保留写入值（继续喂狗是安全方向）、但返回成功**；其它值 → 报 `PROTOCOL`。
-  CLI 两版都会**独立再读一次设备**并输出 `device_reports_ms` + `verified`，不回显写入值；
+- **写后读回校验**：`set_watchdog_ms()` 把读回分成三类：等于写入值（含写 0）→ 校验通过；
+  **读不回来**（超时）→ 置 `StatusFlag.WATCHDOG_UNVERIFIED`、保留写入值（继续喂狗是安全方向）、但返回成功；
+  其它值 → 报 `PROTOCOL`。CLI 两版都会**独立再读一次设备**并输出 `device_reports_ms` + `verified`，不回显写入值。
+  真机实测（COM3 / fw 1545）：`watchdog 300` → `{"ms":300,"device_reports_ms":300,"verified":true}` ✓
+  （历史上“该端点读回恒为 0”的结论是**误判**，根因见 `FIRMWARE_ISSUES` F28：当时 SDK 发的参数
+  写帧不足 8 字节，被固件 `if (msg.len < 8) return;` 静默丢弃）
 - 纯 CURRENT 模式的客户端**不会**武装设备的超时保护（固件问题 F19，见 `FIRMWARE_ISSUES.zh-CN.md`），别把它当安全兜底。
 
 ---
@@ -243,8 +245,19 @@ j.param_get("axis0.motor.config.gear_ratio")          # 类型由端点决定
 j.param_get_u32("axis0.config.can.node_id")
 j.param_get_bool("axis0.config.enable_watchdog")
 j.param_set("axis0.controller.config.vel_limit", 5.0)  # 类型不符 → 明确拒绝
+j.param_set_auto("can.config.break_timeout", 250)       # ✅ 按**端点声明的类型**装箱
 j.param_get_batch(p1, p2, p3, p4)                      # FD 下打包成一帧；Classic 自动逐条
 ```
+
+`param_set` 与 `param_set_auto` 的分工（**两个都要有**）：
+
+| | 装箱依据 | 适用 |
+|---|---|---|
+| `param_set(path, v)` | **Python 类型**（`bool`→bool、`float`→f32、`int`→u32/i32） | 你确实知道端点类型；类型不符要**报错**（防止“靠猜写错值”） |
+| `param_set_auto(path, v)` | **端点声明的类型**（先查描述符：u8/u16/i8/i16/u32/i32/u64/i64/bool/f32/f64 全覆盖，超值域报 `PROTOCOL`） | 命令行/脚本的便利入口：`param_set(path, 250)` 写 u16 端点会被当成 u32 发而被 C 侧拒（`descriptor=uint16 given=uint32`）——用这个就没坑 |
+
+> ⚠ `param_set_auto` 修的是真发生过的事：Python 版 **u8/u16/i8/i16 端点根本写不进去**
+> （看着像“写了没反应”），而 C 版 CLI 却可以。`python -m jsdk_can write` 现在就是走它。
 
 设计原则：
 
@@ -325,7 +338,7 @@ $ python tools/_abi_gap.py
 
 ---
 
-## 10. 命令行入口（与 `jsdk-cli` 对齐，**24 个子命令**）
+## 10. 命令行入口（与 `jsdk-cli` 对齐，**25 个子命令**）
 
 ```bash
 # 只读类

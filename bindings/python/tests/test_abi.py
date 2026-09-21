@@ -31,7 +31,8 @@ def test_abi_types_all_match(lib):
 
 def test_abi_table_sizes_are_sane():
     """抽查几个尺寸：如果哪天有人改了字段顺序而没同步表，这里会先响。"""
-    assert ctypes.sizeof(_abi.ContextConfig) == 128
+    # 136 = 128 + `state_timeout_ms`(u32，v0.27 新增：calibrate/home 的预算)
+    assert ctypes.sizeof(_abi.ContextConfig) == 136
     assert ctypes.sizeof(_abi.JointFeedback) == 112
     assert ctypes.sizeof(_abi.CanHal) == 48
     assert ctypes.sizeof(_abi.CanFrame) == 72

@@ -220,6 +220,34 @@ def test_param_set_u32_roundtrip(ctx_joint):
     assert j.param_get_u32("axis0.config.can.heartbeat_rate_ms") == 20
 
 
+def test_param_set_auto_adapts_to_declared_width(ctx_joint):
+    """``param_set_auto`` 按**端点声明的类型**装箱：u16 端点给普通 int 也能写。
+
+    这是现场故障的同一族问题：`param_set()` 把普通 int 当 u32 发，u16 端点被
+    C 侧拒绝（descriptor=uint16 given=uint32）→ 看着“写不进去”。
+    """
+    _ctx, j = ctx_joint
+    j.param_set_auto("can.config.break_timeout", 250)          # u16
+    assert j.param_get("can.config.break_timeout") == 250
+
+    j.param_set_auto("axis0.config.enable_watchdog", True)     # bool
+    assert j.param_get_bool("axis0.config.enable_watchdog") is True
+
+    j.param_set_auto("axis0.motor.config.gear_ratio", 8)       # f32 端点给 int
+    assert j.param_get("axis0.motor.config.gear_ratio") == pytest.approx(8.0)
+
+
+def test_param_set_auto_range_is_checked(ctx_joint):
+    """超出该类型值域 → PROTOCOL（**不静默截断**）。"""
+    _ctx, j = ctx_joint
+    with pytest.raises(jsdk_can.JsdkProtocolError):
+        j.param_set_auto("can.config.break_timeout", 99999)      # u16 装不下
+    with pytest.raises(jsdk_can.JsdkProtocolError):
+        j.param_set_auto("can.config.break_timeout", -1)
+    with pytest.raises(jsdk_can.JsdkProtocolError):
+        j.param_set_auto("can.config.break_timeout", 1.5)        # 整数端点给小数
+
+
 def test_param_set_float_roundtrip(ctx_joint):
     _ctx, j = ctx_joint
     j.param_set("axis0.controller.config.vel_limit", 3.5)

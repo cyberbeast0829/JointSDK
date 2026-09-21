@@ -54,6 +54,8 @@ typedef struct {
     /* --- 子命令专用 --- */
     unsigned    max_probe;   /**< --probe，主动探测上限，默认 16 */
     uint32_t    timeout_ms;  /**< --timeout，单次操作超时，默认 3000 */
+    uint32_t    state_timeout_ms; /**< --timeout-ms，等状态序列跑完的预算（calibrate/home）；
+                                       0 = SDK 内置默认（标定 120 s / 回零 5 s） */
     int         csv;         /**< --csv：**输出格式开关**（CSV 代替 NDJSON/表格） */
     const char *csv_file;    /**< --csv-file <file>：额外把同一份 CSV 写到文件 */
     const char *filter;      /**< --filter <prefix>（ep-list） */

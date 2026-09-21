@@ -439,6 +439,18 @@ typedef struct {
                                          can.config.baud_rate 匹配，协议无运行时协商。 */
     uint32_t period_ns;             /**< 期望控制周期（ns），用于 keepalive 与超时判定。0 = 自动。 */
 
+    /** 等“状态序列跑完”的预算（ms）：`jsdk_joint_calibrate()` / `jsdk_joint_home()`
+        这类“写 requested_state → 等它跑完”的阻塞命令。
+
+        **0 = 用各自的内置默认**（标定 `JSDK_STATE_TIMEOUT_CALIBRATE_MS` = 120000，
+        回零 `JSDK_STATE_TIMEOUT_HOME_MS` = 5000）；非 0 = 两个都用这个值。
+
+        ⚠ 为什么标定默认是 **120 s**（原来是硬编码 20 s）：全标定要转**十几圈电气角**
+          （`calib_scan_distance` 是电气弧度，本机 87.96 rad ÷ 2π = 14 圈；
+          真机实测整条序列 >20 s）。旧值会在**序列还在跑**时就报“timeout”，
+          把“没写进去”和“还没跑完”两件完全不同的事混成同一个提示。 */
+    uint32_t state_timeout_ms;
+
     uint8_t  auto_keepalive;        /**< 1（默认）= cycle_end 内按需自动补喂狗帧。
                                          只对**设备侧开着**的协议超时（`break_timeout > 0`）
                                          生效；`0` = 设备侧已禁用超时 ⇒ 无狗可喂，
@@ -465,6 +477,12 @@ typedef struct {
 
 /** 填充默认值（hal 置零，master_id = 1，is_fd = 1，auto_keepalive = 1）。 */
 JSDK_API void jsdk_context_config_default(jsdk_context_config_t *cfg);
+
+/** `calibrate()` 的默认预算（ms）：全标定要转十几圈电气角，实测 >20 s。 */
+#define JSDK_STATE_TIMEOUT_CALIBRATE_MS 120000u
+
+/** `home()` 的默认预算（ms）：回零只是一段限速运动。 */
+#define JSDK_STATE_TIMEOUT_HOME_MS        5000u
 
 /* --------------------------------------------------------------------------
  * 6.2 关节配置

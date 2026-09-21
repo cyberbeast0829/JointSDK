@@ -609,11 +609,68 @@ class Joint:
         return _value_to_python(v)
 
     def param_set(self, path: str, value: object) -> None:
-        """按路径写参数。``value`` 的类型要与端点匹配（否则 ``PROTOCOL``）。"""
+        """按路径写参数。``value`` 的类型要与端点匹配（否则 ``PROTOCOL``）。
+
+        ⚠ **严格版**：``int`` 一律按 u32/i32 发。要写 u8/u16/i8/i16 端点，
+          用 :meth:`param_set_auto`（按端点声明类型装箱）或
+          :meth:`param_set_u32`（C 侧按真实位宽收窄）。
+        """
         v = _python_to_value(value)
         self._chk(self._lib.jsdk_joint_param_set(self._ptr, path.encode("utf-8"),
                                                  ctypes.byref(v)),
                   f"param_set({path})")
+
+    def param_set_auto(self, path: str, value: object) -> None:
+        """写参数，**按端点声明的类型**给值装箱（``param_set`` 的便利版）。
+
+        :param value: ``bool`` / ``int`` / ``float``（字符串由调用方解析）
+        :raises JsdkProtocolError: 值超出该类型值域（**不静默截断**）、
+                                   或端点类型不是标量
+
+        为什么需要它：``param_set()`` 靠 **Python 类型**猜线上宽度，
+        ``param_set(path, 250)`` 会被当成 u32 发；端点其实是 u16 时，C 侧会以
+        “descriptor=uint16 given=uint32” 拒绝 —— 于是 u8/u16/i8/i16 端点
+        **从 Python 根本写不进去**（看着像“写了没反应”）。
+        这里改成先查描述符、再按端点的真实类型打包，于是：
+
+        >>> j.param_set_auto("can.config.break_timeout", 250)   # u16 端点，直接可用
+        >>> j.param_set_auto("axis0.config.enable_watchdog", True)   # bool
+        >>> j.param_set_auto("axis0.motor.config.gear_ratio", 8)     # f32 端点给 int
+        """
+        ep = self._ctx.lookup(path)                  # 未命中抛 NOT_FOUND
+        t = EpType(int(ep.type))
+
+        if t in (EpType.F32, EpType.F64):
+            v = _abi.Value()
+            v.type = int(t)
+            _VALUE_SETTERS[t](v, float(value))
+        elif t is EpType.BOOL:
+            if not isinstance(value, (bool, int)):
+                raise_for_status(int(Status.PROTOCOL), "param_set_auto",
+                                 f"{path}: bool 端点只接受 0/1/true/false")
+            v = _abi.Value()
+            v.type = int(t)
+            _VALUE_SETTERS[t](v, value)
+        elif t in _INT_RANGES:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise_for_status(
+                    int(Status.PROTOCOL), "param_set_auto",
+                    f"{path}: {ep.type_name} 端点需要整数（收到 {type(value).__name__}）")
+            lo, hi = _INT_RANGES[t]
+            if not lo <= value <= hi:
+                raise_for_status(
+                    int(Status.PROTOCOL), "param_set_auto",
+                    f"{path}: {value} 超出 {ep.type_name} 值域（{lo}..{hi}）")
+            v = _abi.Value()
+            v.type = int(t)
+            _VALUE_SETTERS[t](v, value)
+        else:
+            raise_for_status(int(Status.UNSUPPORTED), "param_set_auto",
+                             f"{path}: 类型 {ep.type_name} 不是标量")
+
+        self._chk(self._lib.jsdk_joint_param_set(self._ptr, path.encode("utf-8"),
+                                                 ctypes.byref(v)),
+                  f"param_set_auto({path})")
 
     def param_get_f32(self, path: str) -> float:
         out = _abi.c_float()
@@ -805,6 +862,19 @@ class Joint:
 # 值转换辅助
 # ==========================================================================
 
+
+#: 各整数类型的值域（用于 param_set_auto 的**显式**范围校验：
+#: 超出就报 PROTOCOL，不静默截断 —— 与 C 版 CLI 的 text_to_value 行为一致）。
+_INT_RANGES = {
+    EpType.U8:  (0, 255),
+    EpType.I8:  (-128, 127),
+    EpType.U16: (0, 65535),
+    EpType.I16: (-32768, 32767),
+    EpType.U32: (0, 4294967295),
+    EpType.I32: (-2147483648, 2147483647),
+    EpType.U64: (0, 18446744073709551615),
+    EpType.I64: (-9223372036854775808, 9223372036854775807),
+}
 
 _VALUE_SETTERS = {
     EpType.U8: lambda v, x: setattr(v.v, "u8", int(x)),

@@ -99,6 +99,7 @@ void jsdk_context_config_default(jsdk_context_config_t *cfg)
     cfg->master_id              = CB_DEFAULT_MASTER_ID;
     cfg->is_fd                  = 1u;
     cfg->period_ns              = 0u;
+    cfg->state_timeout_ms       = 0u;   /* 0 = 各操作用自己的内置默认（标定 120 s / 回零 5 s） */
     cfg->auto_keepalive         = 1u;
     cfg->clamp_target_position  = 0u;   /* 默认：拒绝并改发安全帧（§6.10） */
     cfg->enable_watchdog_hint   = 0u;   /* 默认：不擅自改客户设备配置 */

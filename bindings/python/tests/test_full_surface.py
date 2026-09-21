@@ -358,8 +358,111 @@ def test_cli_write_reports_readback(lib_dir):
     assert p["id"] == 182
     assert p["type"] == "uint32"
     assert p["value"] == 100
-    assert p["written"] is True
+    assert p["requested"] == 100
+    assert p["verified"] is True
+    assert "written" not in p          # 旧字段：只报“请求已发出”，说得比知道的多
     assert "save" in p["persisted"]
+
+
+# 与 C 版测试（tests/test_cli.c [11]）同一组现场：
+# 真机上 `write ...pre_calibrated 1` 报成功、读回却是 false —— 参数写帧不足 8 字节被
+# 固件 `cmd_param_write()` 的 `if (msg.len < 8) return;` 静默丢弃。
+_CH_DROP = "0:id=1,gear=16.5,hb=10,timeout=30000,fd,dropwrite"
+
+
+def test_cli_write_must_fail_when_device_drops_frame(lib_dir):
+    """设备静默丢帧时 `write` **必须**报失败（退出码 1），不能报成功。"""
+    r = run_module("--if", "virtual", "--json", "--channel", _CH_DROP,
+                   "--yes", "write", "axis0.motor.config.gear_ratio", "8",
+                   lib_dir=lib_dir)
+    assert r.returncode == 1, (r.returncode, r.stdout, r.stderr)
+    p = json.loads(r.stdout)
+    assert p["verified"] is False
+    assert p["value"] != 8 or p["value"] is None
+    assert p["error"] == "not_accepted"
+
+    # 人读模式也要说清楚，并且退出码一致
+    r = run_module("--if", "virtual", "--channel", _CH_DROP,
+                   "--yes", "write", "axis0.motor.config.gear_ratio", "8",
+                   lib_dir=lib_dir)
+    assert r.returncode == 1, (r.returncode, r.stderr)
+    assert "未被设备接受" in r.stderr
+
+
+def test_cli_write_consumed_endpoint_is_not_a_failure(lib_dir):
+    """`axis0.requested_state` 写进去就被状态机消费（固件立刻复位为 0）→
+    不能拿读回值判“是否接受”，否则会对一个**正常**的写误报失败。"""
+    r = run_module("--if", "virtual", "--json", "--yes",
+                   "write", "axis0.requested_state", "1", lib_dir=lib_dir)
+    assert r.returncode == 0, r.stderr
+    p = json.loads(r.stdout)
+    assert p["verified"] is None
+    assert p["value"] is None
+    assert "state" in p["note"]
+
+
+def test_cli_write_rejects_readonly_with_true_access_string(lib_dir):
+    """只读端点要拒绝，且 access 串要**真实**（以前写死成 'w'，只读端点显示 `rw`）。"""
+    r = run_module("--if", "virtual", "--yes", "write", "hw_version_major", "9",
+                   lib_dir=lib_dir)
+    assert r.returncode == 1
+    assert "不可写" in r.stderr
+    assert "access=r-" in r.stderr
+
+
+def test_cli_write_out_of_range_refused(lib_dir):
+    """超出端点值域要**拒绝**，不能靠固件截断（与 C 版 CLI 的退出码一致）。"""
+    r = run_module("--if", "virtual", "--yes", "write",
+                   "can.config.break_timeout", "99999", lib_dir=lib_dir)
+    assert r.returncode == 1, (r.returncode, r.stderr)
+    assert "超出" in r.stderr
+
+    # 无符号端点给负数 = 值域错（u16 不能表示 -1）
+    r = run_module("--if", "virtual", "--yes", "write",
+                   "can.config.break_timeout", "-1", lib_dir=lib_dir)
+    assert r.returncode == 1, (r.returncode, r.stderr)
+
+
+def test_cli_calibrate_reports_flags_and_honours_timeout_ms(lib_dir):
+    """`calibrate` 要报两个 `pre_calibrated`（状态跑完 ≠ 标定生效），
+    并且 `--timeout-ms` 要真的接到 SDK 的预算上（给 1 ms 必须报超时）。"""
+    r = run_module("--if", "virtual", "--json", "--yes", "calibrate",
+                   lib_dir=lib_dir)
+    assert r.returncode == 0, r.stderr
+    p = json.loads(r.stdout)
+    assert p["calibrated"] is True
+    assert p["pre_calibrated"]["axis0.motor.config.pre_calibrated"] is True
+    assert p["pre_calibrated"]["axis0.encoder.config.pre_calibrated"] is True
+
+    r = run_module("--if", "virtual", "--timeout-ms", "1", "--yes", "calibrate",
+                   lib_dir=lib_dir)
+    assert r.returncode == 1, (r.returncode, r.stderr)
+    assert "timeout" in r.stderr
+
+
+def test_cli_write_every_integer_width(lib_dir):
+    """**所有位宽**的端点都要能写：u8/u16/i8/u32/... 都覆盖。
+
+    以前 `param_set()` 把普通 int 一律当 u32 发，于是 u16 端点被 C 侧以
+    “descriptor=uint16 given=uint32” 拒绝 —— Python 版 CLI **写不了**这些端点。
+    """
+    cases = [
+        ("can.config.break_timeout", "250", "uint16"),
+        ("axis0.config.can.node_id", "1", "uint32"),
+    ]
+    for path, text, tname in cases:
+        r = run_module("--if", "virtual", "--json", "--yes", "write",
+                       path, text, lib_dir=lib_dir)
+        assert r.returncode == 0, (path, r.stderr)
+        p = json.loads(r.stdout)
+        assert p["type"] == tname, (path, p["type"])
+        assert p["requested"] == int(text), path
+
+    # float 端点给整数文本也要能写（C 版 CLI 一直是好的）
+    r = run_module("--if", "virtual", "--json", "--yes", "write",
+                   "axis0.motor.config.gear_ratio", "8", lib_dir=lib_dir)
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)["value"] == 8.0
 
 
 def test_cli_info_and_err_shapes(lib_dir):
@@ -548,6 +651,7 @@ _COMMAND_SMOKE: list[list[str]] = [
     ["save", "--yes"], ["set-node-id", "--yes", "2"], ["reset", "--yes"],
     ["set-zero", "--yes"], ["calibrate", "--yes"], ["home", "--yes"],
     ["estop"],
+    ["fault-reset", "--yes"],
     ["mit", "--yes", "--hold", "1", "--pos", "0", "--kp", "1", "--kd", "0.1"],
 ]
 
