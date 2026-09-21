@@ -343,6 +343,20 @@ def test_set_watchdog(ctx_joint):
     _ctx, j = ctx_joint
     j.set_watchdog_ms(250)
     assert j.param_get_u32("can.config.break_timeout") == 250
+    # 虚拟设备会如实回显 → 必须“校验通过”，不得置 UNVERIFIED
+    assert not j.feedback().has_flag(StatusFlag.WATCHDOG_UNVERIFIED)
+
+
+def test_set_watchdog_zero_means_disabled(ctx_joint):
+    """``0`` = **关闭**设备侧协议级超时检测（最新固件语义；旧固件把 0 当 100 ms）。
+
+    这条曾经反着写（“0 ≠ 关闭”），所以留一条用例钉住新语义：
+    关闭也要**读回确认**，而且不能被当成“校验失败”。
+    """
+    _ctx, j = ctx_joint
+    j.set_watchdog_ms(0)
+    assert j.param_get_u32("can.config.break_timeout") == 0
+    assert not j.feedback().has_flag(StatusFlag.WATCHDOG_UNVERIFIED)
 
 
 def test_save_config(ctx_joint):

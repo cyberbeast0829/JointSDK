@@ -2,9 +2,14 @@
 *.obj
 *.d
 build*/
-bsh/
+bsh*/
 dist/
 bindings/python/dist/
 *.egg-info/
 .pytest_cache
 *.whl
+
+# 由 -DJSDK_BUILD_PYTHON=ON 填进来的共享库（构建产物，勿提交；见 docs/RELEASE.zh-CN.md）
+bindings/python/src/jsdk_can/lib/*.dll
+bindings/python/src/jsdk_can/lib/*.so*
+bindings/python/src/jsdk_can/lib/*.dylib

@@ -16,10 +16,8 @@ import jsdk_can
 from jsdk_can import Status, VirtualHal
 from jsdk_can.errors import _MAP, error_for_status, raise_for_status
 
-from conftest import virtual_spec
+from conftest import SRC, lib_dir, run_module, virtual_spec  # noqa: F401
 
-REPO_PY = Path(__file__).resolve().parents[1]
-SRC = REPO_PY / "src"
 
 
 # ==========================================================================
@@ -131,59 +129,18 @@ def test_last_error_is_attached_to_exception(ctx_joint):
 # ==========================================================================
 
 
-def run_module(*args: str, lib_dir: str) -> subprocess.CompletedProcess:
-    env = {
-        "JSDK_LIB_PATH": lib_dir,
-        "PYTHONPATH": str(SRC),
-        # Windows 下控制台默认 GBK，子进程里统一 UTF-8
-        "PYTHONIOENCODING": "utf-8",
-    }
-    import os
-    full_env = dict(os.environ)
-    full_env.update(env)
-    # ⚠ 必须显式 encoding="utf-8"：`text=True` 会按**本机 locale**（Windows 上是
-    #   GBK）解码子进程输出，而子进程按 PYTHONIOENCODING 写的是 UTF-8 ——
-    #   中文会变成乱码，断言随之中文匹配失败（看着像功能坏了，其实是解码问题）。
-    return subprocess.run([sys.executable, "-m", "jsdk_can", *args],
-                          capture_output=True, text=True,
-                          encoding="utf-8", errors="replace",
-                          env=full_env, timeout=120)
-
-
-@pytest.fixture(scope="module")
-def lib_dir():
-    """
-    子进程要能找到共享库。优先级：环境变量 → **包内自带的 lib/**。
-
-    ⚠ 原先这里**硬要求** `JSDK_LIB_PATH`，于是"刚 clone 下来跑 `pytest`"会得到
-    10 个 error（而不是 fail），而且提示看起来像配置问题 —— 但包内其实**就有**
-    一份 `src/jsdk_can/lib/libjsdk_can.{dll,so}`（CMake 的 JSDK_BUILD_PYTHON
-    会把库拷进去，wheel 里也随包分发）。既然包自己带着库，测试就不该要求
-    调用者先导出环境变量。环境变量仍然优先（用于指向别的构建）。
-    """
-    import os
-    from pathlib import Path
-
-    d = os.environ.get("JSDK_LIB_PATH", "").strip()
-    if d:
-        return d
-
-    bundled = Path(__file__).resolve().parents[1] / "src" / "jsdk_can" / "lib"
-    if bundled.is_dir() and any(bundled.iterdir()):
-        return str(bundled)
-
-    pytest.fail(
-        "找不到共享库：包内 lib/ 是空的，也没设 JSDK_LIB_PATH。\n"
-        "先构建：cmake -S . -B bsh -DJSDK_BUILD_SHARED=ON -DJSDK_BUILD_PYTHON=ON "
-        "&& cmake --build bsh\n"
-        f"（已查找：{bundled}）"
-    )
-
-
 def test_module_help(lib_dir):
+    """帮助必须把**安全闸**写在明面上（本入口现在与 jsdk-cli 功能对齐）。
+
+    早期这里断言的是帮助里的"只读"两个字 —— 那时这一入口只做只读子集。
+    现在写/动作命令都在（这是有意的扩展），所以改钉**真正的契约**：
+    ① 帮助里出现 `--yes`（写类命令的闸）；② 列出会动电机的 `mit`。
+    """
     r = run_module("--help", lib_dir=lib_dir)
     assert r.returncode == 0
-    assert "只读" in r.stdout
+    assert "--yes" in r.stdout
+    assert "mit" in r.stdout
+    assert "estop" in r.stdout
 
 
 def test_module_scan_json(lib_dir):
@@ -247,13 +204,52 @@ def test_module_mon_bounded(lib_dir):
     assert "pos_rad" in lines[0]
 
 
-def test_module_rejects_write_subcommands(lib_dir):
-    """本入口只做只读：写类子命令必须不存在。"""
-    for cmd in ("write", "mit", "save", "set-zero", "calibrate"):
-        r = run_module(cmd, lib_dir=lib_dir)
-        assert r.returncode != 0, f"{cmd} 不该被接受"
+def test_module_gates_write_subcommands(lib_dir):
+    """写类子命令**必须存在**，但不加 ``--yes`` 时必须被安全闸拒绝（退出码 3）。
+
+    ⚠ 本条与它的前身（``test_module_rejects_write_subcommands``）是**相反的契约**：
+    那时这一入口只做只读子集，写类命令必须“不存在”。现在与 `jsdk-cli` 功能对齐，
+    它们存在 —— 所以这条用例改钉“存在、但默认拒绝”。
+    """
+    for cmd in (("write", "axis0.config.can.node_id", "1"),
+                ("mit", "--pos", "0"),
+                ("save",), ("set-zero",), ("calibrate",), ("home",),
+                ("watchdog", "100"), ("reset",)):
+        r = run_module("--if", "virtual", *cmd, lib_dir=lib_dir)
+        assert r.returncode == 3, \
+            f"{' '.join(cmd)} 不加 --yes 必须被拒（rc={r.returncode}）"
+        assert "--yes" in r.stderr
+
+    # estop 是例外：拒绝执行比误停更危险
+    r = run_module("--if", "virtual", "estop", lib_dir=lib_dir)
+    assert r.returncode == 0, r.stderr
 
 
 def test_module_bad_backend(lib_dir):
     r = run_module("--if", "nosuchbus", "scan", lib_dir=lib_dir)
     assert r.returncode != 0
+
+
+def test_redirected_output_is_utf8(lib_dir):
+    """
+    重定向时必须是 UTF-8 —— 不能靠用户设 `PYTHONIOENCODING`。
+
+    Windows 下 Python 重定向时默认用 **locale 编码**（中文机器是 cp936），于是：
+      - 与 C 版 `jsdk-cli`（重定向时写 UTF-8）**不一致**，同一条流水线两种编码；
+      - 输出里出现 CP936 表示不了的字符（`⚠` U+26A0 之类）会直接
+        `UnicodeEncodeError` 崩掉。
+
+    ⚠ 这里**故意**不带 `PYTHONIOENCODING`：带上它这个用例就永远是绿的，
+      等于把这个坑重新盖回去（原来的 `run_module()` 就一直带着它）。
+    """
+    import os
+
+    env = dict(os.environ)
+    env.pop("PYTHONIOENCODING", None)
+    env["PYTHONPATH"] = str(SRC)
+    env["JSDK_LIB_PATH"] = lib_dir
+    r = subprocess.run([sys.executable, "-m", "jsdk_can", "--help"],
+                       capture_output=True, env=env, timeout=120)
+    assert r.returncode == 0, r.stderr
+    text = r.stdout.decode("utf-8")          # 不是 UTF-8 → UnicodeDecodeError
+    assert any("\u4e00" <= ch <= "\u9fff" for ch in text), "帮助文本里应当有中文"

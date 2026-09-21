@@ -436,10 +436,43 @@ void cb_be_put_i32(uint8_t *b, int32_t v);
 void cb_be_put_u64(uint8_t *b, uint64_t v);
 void cb_be_put_f32(uint8_t *b, float v);
 
+/* --------------------------------------------------------------------------
+ * 小端存取器：**只用于参数值**（PARAM_READ 0x20 / PARAM_WRITE 0x21 的载荷）
+ *
+ * ⚠⚠ 为什么参数值是小端，而帧字段是大端（实测结论，与协议文档 P7 写的
+ *     "全协议 Big-Endian" 不一致）：
+ *
+ *   固件的参数通路是把端点值**原样 memcpy** 进/出 CAN 载荷的：
+ *     `can_cyberbeast.cpp` 的 `cmd_param_read()`   → `endpoint_handler(..., &output_buffer)`
+ *                                                     → `memcpy(&txmsg.buf[4], &value_buf[offset], n)`
+ *     `can_cyberbeast.cpp` 的 `cmd_param_write()`  → `input_buffer{&msg.buf[4], data_len}`
+ *                                                     → `endpoint_handler(...)`
+ *   所以线上就是 **ARM 主机序 = 小端**。
+ *
+ *   真机实测三例（slcan + CANable，读回来的值）：
+ *     `node_id`            = 0x01000000（应为 1）
+ *     `heartbeat_rate_ms`  = 0x64000000（应为 100）
+ *     `gear_ratio`         = 8.9e-41（应为 7.75）
+ *   三个都恰好是"字节反序"，而且读写走的是同一份 memcpy 路径。
+ *
+ *   控制帧（MIT/POS/VEL/…）与查询响应（0x40/0x46/0x49）**仍然是大端**
+ *   —— 那些字段是固件手写拆字节的（`float_to_uint` / `float_to_big_endian_bytes`）。
+ *   旁证：`info` 从 0x46 读回的 `fw_version = 1544` 用大端解才合理，
+ *   小端会得到 134610944 这种荒谬值。
+ * ------------------------------------------------------------------------ */
 uint16_t cb_le_get_u16(const uint8_t *b);
+int16_t  cb_le_get_i16(const uint8_t *b);
 uint32_t cb_le_get_u32(const uint8_t *b);
-void     cb_le_put_u16(uint8_t *b, uint16_t v);
-void     cb_le_put_u32(uint8_t *b, uint32_t v);
+int32_t  cb_le_get_i32(const uint8_t *b);
+uint64_t cb_le_get_u64(const uint8_t *b);
+float    cb_le_get_f32(const uint8_t *b);
+
+void cb_le_put_u16(uint8_t *b, uint16_t v);
+void cb_le_put_i16(uint8_t *b, int16_t v);
+void cb_le_put_u32(uint8_t *b, uint32_t v);
+void cb_le_put_i32(uint8_t *b, int32_t v);
+void cb_le_put_u64(uint8_t *b, uint64_t v);
+void cb_le_put_f32(uint8_t *b, float v);
 
 /**
  * 平台自检：验证 float 为 IEEE-754 单精度且字节序访问正确。
@@ -868,7 +901,7 @@ size_t cb_ctrl_min_len(uint8_t msgtype, int classic);
  *   `ERROR_CAN_BUS_FAILED` + `disarm()` —— 尽管 CURRENT 一直在发。
  *   两种都不好；SDK 的 `auto_keepalive` 必须周期插入一条 `is_ctrl` 帧来两头兼顾。
  *
- * @note 任何帧都会喂 ODrive 自身的 `axis.watchdog_feed()`（`do_command()` 开头
+ * @note 任何帧都会喂驱动器自身的 `axis.watchdog_feed()`（`do_command()` 开头
  *       无条件调用），那是**另一套机制**，不要与上面这个协议级超时混淆。
  */
 int cb_ctrl_expects_response(uint8_t msgtype);
@@ -1627,6 +1660,24 @@ extern "C" {
 
 /** JSON 文本的第一个字节（用于第一帧的交叉校验） */
 #define CB_DESC_JSON_FIRST_BYTE  0x7Bu   /* '{' */
+/** 描述符的根也可以是数组：**本固件就是** `[{"name":...,"id":0,...}]`。
+    两者都说明"这一帧是 offset=0 的数据帧"，不是元数据帧。 */
+#define CB_DESC_JSON_FIRST_ARR   0x5Bu   /* '[' */
+
+/**
+ * 元数据帧之前最多容忍多少个"不像元数据帧"的 0x25 帧。
+ *
+ * ⚠ 真机必需：请求发出前后，适配器/设备里可能还残留**上一条被中断的传输**
+ *   （超时 / Ctrl-C / 报错退出）的帧。它们必须被跳过，而不是当成
+ *   "本次的元数据帧" —— 否则会报出让人看不懂的 `total_len must be 1..65535`，
+ *   而且每次退出又会留下新的残留，形成自锁（slcan 现场实测）。
+ *
+ * ⚠ **不要把这个值设小**：slcan 上一条（被中断的）流的**尾巴可以有几百帧**
+ *   （真机实测：64 帧预算当场不够用，而一次完整传输是 600+ 帧）。
+ *   真正的时间上限由 `desc.timeout_ms`（默认 3000 ms）负责 —— 这里只是防止
+ *   "设备根本不是在跟我们说话"时无限等下去。
+ */
+#define CB_DESC_MAX_SKIPPED      4096u
 
 /* --------------------------------------------------------------------------
  * 失败原因（静态字符串，便于日志与测试断言）
@@ -1634,8 +1685,10 @@ extern "C" {
 
 #define CB_DESC_ERR_NONE          ((const char *)0)
 #define CB_DESC_ERR_FRAME_LEN     "0x25 frame length must be 8 (Classic) or 64 (FD)"
-#define CB_DESC_ERR_META_EXPECTED "first 0x25 frame must be the metadata frame"
+#define CB_DESC_ERR_META_EXPECTED "0x25 frame is not the metadata frame (and not a usable data frame)"
 #define CB_DESC_ERR_META_TOTAL    "metadata total_len must be 1..65535"
+#define CB_DESC_ERR_META_SKIPPED  "no metadata frame before running out of patience: " \
+                                  "the 0x25 stream is a stale one from an earlier transfer?"
 #define CB_DESC_ERR_OFFSET        "chunkOffset out of sequence"
 #define CB_DESC_ERR_PARSE         "JSON parser rejected the descriptor"
 #define CB_DESC_ERR_ARENA         "endpoint arena exhausted"
@@ -1667,7 +1720,8 @@ typedef struct {
     uint16_t crc;            /**< 来自元数据帧（VersionCRC） */
     uint32_t next_offset;    /**< 期望的下一个 chunkOffset */
     uint32_t bytes_scanned;  /**< 已喂给解析器的字节数 */
-    uint32_t frames_rx;      /**< 收到的 0x25 帧数（含元数据帧） */
+    uint32_t frames_rx;      /**< 收到的 0x25 帧数（含元数据帧与被跳过的残留帧） */
+    uint32_t skipped_rx;     /**< 元数据帧之前被跳过的 0x25 帧数（上一次传输的残留） */
     uint32_t last_report;    /**< 上次回调进度时的字节数（节流用） */
 
     uint8_t  started;        /**< 已经收到过元数据帧 */
@@ -1739,6 +1793,17 @@ int cb_desc_fetch_frame(cb_desc_fetch_t *f, const uint8_t *payload, size_t len);
 
 /** 传输是否已结束（成功或失败）。 */
 int cb_desc_fetch_is_done(const cb_desc_fetch_t *f);
+
+/**
+ * **本次传输是否已经开始**：元数据帧已收到并接受。
+ *
+ * 为什么需要它：调用方判断"要不要重发 `0x24` 请求"时，
+ *   **不能用"收到了多少帧"当依据** —— RX 里可能有上一次被中断传输的**残留帧**
+ *   （真机实测：一次失败会看到 680 帧残留、而我们的请求从没到达设备），
+ *   那时"收到帧"与"请求被设备接受"完全不是一回事。
+ *   正确的依据是"有没有进入本次传输"，即本函数。
+ */
+int cb_desc_fetch_started(const cb_desc_fetch_t *f);
 
 /**
  * 传输是否**可用**：未失败，且（完整收到 或 按 filter 提前终止且 filter 全命中）。
@@ -1995,8 +2060,19 @@ uint16_t cb_desc_cache_crc16(const void *data, size_t len);
  */
 #define JSDK_ACTIVATE_TIMEOUT_MS 5000u
 
-/** `can.config.break_timeout == 0` 在固件里按 **100 ms** 处理（0 ≠ 关闭）。 */
-#define JSDK_WD_DEFAULT_MS   100u
+/**
+ * 设备侧协议级超时被禁用时的取值（`can.config.break_timeout == 0`）。
+ *
+ * ⚠⚠ **最新固件语义（本项目 v0.25 修正）**：`auto_stop_if_timeout()` 首句就是
+ *   `if (timeout_ms == 0) return;`，且 `Config_t::break_timeout` 的**默认值就是 0**
+ *   ⇒ **0 = 超时检测被禁用**，不是“按 100 ms 处理”。
+ *   旧固件（本项目早期真机联调时）确实把 0 当 100 ms，当时的适配是错的，
+ *   它曾经把“没武装”显示成“100 ms 已武装”，非常容易误导（见 FIRMWARE_ISSUES F28）。
+ *
+ * 凡是从 `jsdk_watchdog_device_ms()` 取超时的地方，都必须把 `JSDK_WD_DISABLED_MS`
+ * 当作“**无狗可喂 / 无门限可比较**”处理，而不是“一个很小的超时”。
+ */
+#define JSDK_WD_DISABLED_MS  0u
 
 /** 未提供 period_ns 时，式微序列用这个周期估算（ms）。 */
 #define JSDK_CFG_PERIOD_FALLBACK_MS  1u
@@ -2090,7 +2166,7 @@ struct jsdk_joint {
     uint16_t ep_requested_state, ep_current_state, ep_node_id, ep_break_timeout;
 
     /* ---- 设备侧配置读回 ---- */
-    uint32_t break_timeout_ms;    /**< can.config.break_timeout（0 → 固件当 100 ms） */
+    uint32_t break_timeout_ms;    /**< can.config.break_timeout；**0 = 设备侧超时检测已禁用** */
     uint32_t node_id_readback;    /**< axis0.config.can.node_id */
     uint32_t heartbeat_rate_ms;   /**< axis0.config.can.heartbeat_rate_ms（0 = 设备不发心跳） */
     uint8_t  current_state_raw;   /**< axis0.current_state（固件 AxisState 0..16） */
@@ -2362,7 +2438,13 @@ void jsdk_watchdog__cycle_end(jsdk_context_t *ctx);
 
 /**
  * 设备侧协议级超时（`can.config.break_timeout`，单位 ms）。
- * @note 读回的 0 在固件里按 **100 ms** 处理 —— 0 **不是**“关闭”（PROTOCOL_NOTES §2.5）。
+ *
+ * @return `> 0` = 超时毫秒数（设备侧已武装后才生效）；**`JSDK_WD_DISABLED_MS`（0）
+ *          = 设备侧超时检测已禁用**（最新固件语义，见 PROTOCOL_NOTES §4.6）。
+ *         句柄无效时也返回 0（“未知”按“不巡喂”处理）。
+ *
+ * ⚠ 调用方必须把 0 当作“**没有门限**”而不是“一个很小的超时”：
+ *   例如 `period_ms >= wd` 这种校验在 0 时会**恒真**，必须显式跳过。
  */
 uint32_t jsdk_watchdog_device_ms(const jsdk_joint_t *j);
 
@@ -2419,10 +2501,9 @@ int jsdk_ctx_read_param_exact(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_
 /**
  * 阻塞写一个参数值（配置阶段）；写完等 8 字节静默 ACK。
  *
- * @param val 值字节，**必须是线上大端序**（与全协议一致）。
- *            直接传主机序的 `uint16_t *` 会得到字节交换后的值 —— 本项目胉过
- *            （250 变成 64000）。要写数值请用 `jsdk_joint_param_set*()`，
- *            它内部会做 `cb_be_put_*()`。
+ * @param val 值字节，**必须是线上小端序**（设备端参数通路是 memcpy 主机序；
+ *            控制帧/查询响应才是大端，见 `cb_frame.h` 的 `cb_le_*` 说明）。
+ *            要写数值请用 `jsdk_joint_param_set*()`，它内部会做 `cb_le_put_*()`。
  */
 int jsdk_ctx_write_param(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_id,
                          const void *val, uint8_t len, uint32_t timeout_ms);
@@ -2674,7 +2755,15 @@ extern "C" {
 #define SIM_MIT_KP_DEFAULT           500.0f
 #define SIM_MIT_KD_DEFAULT           5.0f
 #define SIM_MIT_TAU_DEFAULT          50.0f
-#define SIM_BREAK_TIMEOUT_DEFAULT_MS 100u
+/**
+ * 仿真节点的 `can.config.break_timeout` 默认值。
+ *
+ * ⚠ **0 = 协议级超时检测被禁用** —— 与最新固件的默认值（`Config_t::break_timeout = 0`）
+ *   以及 `auto_stop_if_timeout()` 的首句 `if (timeout_ms == 0) return;` 一致。
+ *   旧模型把 0 当 100 ms，会让“未武装”看起来像“已武装 100 ms”（曾被真机扇了一耳光，
+ *   见 FIRMWARE_ISSUES F28）。要模拟“已武装”请在节点规格里显式写 `timeout=<ms>`。
+ */
+#define SIM_BREAK_TIMEOUT_DEFAULT_MS 0u
 #define SIM_JSON_FRAMES_PER_CYCLE    50u     /**< 固件 kMaxJsonFramesPerCycle */
 #define SIM_NODE_ID_DEFAULT          1u
 #define SIM_DEFAULT_VBUS             48.0f
@@ -3787,6 +3876,65 @@ void cb_be_put_f32(uint8_t *b, float v)
     cb_be_put_u32(b, w);
 }
 
+/* --------------------------------------------------------------------------
+ * 小端存取器：**只用于参数值** —— 理由见 cb_frame.h（固件 memcpy 主机序）。
+ * ------------------------------------------------------------------------ */
+
+uint16_t cb_le_get_u16(const uint8_t *b);   /* 定义在文件后面（原有实现） */
+
+int16_t cb_le_get_i16(const uint8_t *b)
+{
+    return (int16_t)cb_le_get_u16(b);
+}
+
+uint32_t cb_le_get_u32(const uint8_t *b);   /* 定义在文件后面（原有实现） */
+
+int32_t cb_le_get_i32(const uint8_t *b)
+{
+    return (int32_t)cb_le_get_u32(b);
+}
+
+uint64_t cb_le_get_u64(const uint8_t *b)
+{
+    return (uint64_t)cb_le_get_u32(b)
+         | ((uint64_t)cb_le_get_u32(b + 4) << 32);
+}
+
+float cb_le_get_f32(const uint8_t *b)
+{
+    uint32_t w = cb_le_get_u32(b);
+    float    f;
+    memcpy(&f, &w, sizeof f);      /* 位模式搬移，避免对齐/别名问题 */
+    return f;
+}
+
+void cb_le_put_u16(uint8_t *b, uint16_t v);  /* 定义在文件后面（原有实现） */
+
+void cb_le_put_i16(uint8_t *b, int16_t v)
+{
+    cb_le_put_u16(b, (uint16_t)v);
+}
+
+void cb_le_put_u32(uint8_t *b, uint32_t v);  /* 定义在文件后面（原有实现） */
+
+void cb_le_put_i32(uint8_t *b, int32_t v)
+{
+    cb_le_put_u32(b, (uint32_t)v);
+}
+
+void cb_le_put_u64(uint8_t *b, uint64_t v)
+{
+    cb_le_put_u32(b, (uint32_t)(v));
+    cb_le_put_u32(b + 4, (uint32_t)(v >> 32));
+}
+
+void cb_le_put_f32(uint8_t *b, float v)
+{
+    uint32_t w;
+    memcpy(&w, &v, sizeof w);
+    cb_le_put_u32(b, w);
+}
+
 uint16_t cb_le_get_u16(const uint8_t *b)
 {
     return (uint16_t)(((uint16_t)b[1] << 8) | (uint16_t)b[0]);
@@ -4340,34 +4488,55 @@ int cb_desc_frame_len_valid(size_t len)
  * 帧处理
  * ======================================================================== */
 
-/** 元数据帧：解析 total_len / crc 并做全部合法性校验。 */
-static int take_metadata(cb_desc_fetch_t *f, const uint8_t *payload, size_t len)
+/**
+ * 校验（**不改状态**）：这一帧是不是本次传输的元数据帧？
+ *
+ * 与旧实现的区别：旧版把"校验 + 提交"写在一起，并且认为"请求之后的第一个
+ * 0x25 帧就是元数据帧" —— 真机上不成立（见 CB_DESC_MAX_SKIPPED 的说明）。
+ */
+static int check_metadata(const uint8_t *payload, size_t len, uint32_t *total_out,
+                          uint16_t *crc_out, const char **why)
 {
     uint32_t total;
 
     if (len < CB_DESC_META_MIN_LEN) {
-        return dfail(f, CB_DESC_ERR_FRAME_LEN, JSDK_ERR_PROTOCOL);
+        *why = CB_DESC_ERR_FRAME_LEN;
+        return JSDK_ERR_PROTOCOL;
     }
 
     /* 元数据帧的头两字节恒为 0 */
     if (payload[0] != 0u || payload[1] != 0u) {
-        return dfail(f, CB_DESC_ERR_META_EXPECTED, JSDK_ERR_PROTOCOL);
+        *why = CB_DESC_ERR_META_EXPECTED;
+        return JSDK_ERR_PROTOCOL;
     }
 
     /* 交叉校验：若第 3 字节是 JSON 起始符，说明这其实是 offset = 0 的数据帧，
-       即设备跳过了元数据帧。此时无法得知 total_len，只能整体失败。 */
-    if (payload[2] == CB_DESC_JSON_FIRST_BYTE) {
-        return dfail(f, CB_DESC_ERR_META_EXPECTED, JSDK_ERR_PROTOCOL);
+       即设备跳过了元数据帧（或这是上一次传输的残留）。
+       ⚠ 必须同时认 `{` 与 `[`：本固件的描述符是**数组**（`[{"name":...`），
+         只认 `{` 的话这个检查形同虚设 —— 真机上它把 offset=0 的数据帧放进来，
+         然后报出难懂的 "total_len must be 1..65535"（现场踩过）。 */
+    if (payload[2] == CB_DESC_JSON_FIRST_BYTE || payload[2] == CB_DESC_JSON_FIRST_ARR) {
+        *why = CB_DESC_ERR_META_EXPECTED;
+        return JSDK_ERR_PROTOCOL;
     }
 
     total = le32(payload + 2);
     if (total == 0u || total > CB_DESC_MAX_TOTAL_LEN) {
         /* ⚠ > 65535 必须硬拒绝：chunkOffset 只有 u16，固件会静默回绕 */
-        return dfail(f, CB_DESC_ERR_META_TOTAL, JSDK_ERR_PROTOCOL);
+        *why = CB_DESC_ERR_META_TOTAL;
+        return JSDK_ERR_PROTOCOL;
     }
 
+    *total_out = total;
+    *crc_out   = le16(payload + 6);
+    return JSDK_OK;
+}
+
+/** 校验通过 → 正式认领这一帧为元数据帧。 */
+static int take_metadata(cb_desc_fetch_t *f, uint32_t total, uint16_t crc)
+{
     f->total_len   = total;
-    f->crc         = le16(payload + 6);
+    f->crc         = crc;
     f->next_offset = 0u;
     f->started     = 1u;
     f->last_report = 0u;
@@ -4468,7 +4637,34 @@ int cb_desc_fetch_frame(cb_desc_fetch_t *f, const uint8_t *payload, size_t len)
     f->frames_rx++;
 
     if (!f->started) {
-        return take_metadata(f, payload, len);
+        uint32_t    total = 0u;
+        uint16_t    crc   = 0u;
+        const char *why   = CB_DESC_ERR_NONE;
+
+        if (check_metadata(payload, len, &total, &crc, &why) != JSDK_OK) {
+            /*
+             * 不是元数据帧 → **跳过**，继续等本次传输真正的元数据帧。
+             *
+             * 为什么不能直接失败：协议只保证"元数据帧是**本次传输**的第一帧"，
+             * 不保证"它是我们请求后看到的第一个 0x25 帧"。真机（slcan）实测：
+             * 上一条被中断的传输会让设备手里握着一帧待发，我们一打开适配器
+             * 它就涌出来 → 旧实现把它当元数据帧 → 报出看不懂的
+             * "total_len must be 1..65535" → 退出 → **又留下新的残留** →
+             * 自锁，现场表现是"刚才还能连，现在怎么都连不上"。
+             *
+             * 上限 CB_DESC_MAX_SKIPPED：不能无限等（那会把"设备根本没答"
+             * 变成"卡住"），超了就当"这条流不是给我的"。
+             */
+            if (f->skipped_rx >= CB_DESC_MAX_SKIPPED) {
+                /* 把最后一条被拒绝帧的具体原因留在 err_detail 里便于排障 */
+                if (why) f->err_detail = why;
+                return dfail(f, CB_DESC_ERR_META_SKIPPED, JSDK_ERR_PROTOCOL);
+            }
+            if (why) f->err_detail = why;   /* 跳过的也记下原因（排障用） */
+            f->skipped_rx++;
+            return JSDK_OK;
+        }
+        return take_metadata(f, total, crc);
     }
     if (len < CB_DESC_DATA_HDR_BYTES) {
         return dfail(f, CB_DESC_ERR_FRAME_LEN, JSDK_ERR_PROTOCOL);
@@ -4483,6 +4679,11 @@ int cb_desc_fetch_frame(cb_desc_fetch_t *f, const uint8_t *payload, size_t len)
 int cb_desc_fetch_is_done(const cb_desc_fetch_t *f)
 {
     return (f && f->done) ? 1 : 0;
+}
+
+int cb_desc_fetch_started(const cb_desc_fetch_t *f)
+{
+    return (f && f->started) ? 1 : 0;
 }
 
 int cb_desc_fetch_is_ok(const cb_desc_fetch_t *f)
@@ -6621,7 +6822,7 @@ int jsdk_ctx_read_param_exact(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_
  * | 5..8 B | **FD** | 一帧写完（4 + 8 = 12 B ≤ 64） |
  * | 5..8 B | **Classic** | **必须分段**：每块 4 B，末块补齐（固件在 Classic 下不接受单帧长值） |
  *
- * @param val 值字节，**必须是线上大端序**（见头文件说明）。
+ * @param val 值字节，**必须是线上小端序**（参数值小端；见 `cb_frame.h`）。
  */
 int jsdk_ctx_write_param(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_id,
                          const void *val, uint8_t len, uint32_t timeout_ms)
@@ -6716,11 +6917,11 @@ static int read_f32(jsdk_context_t *ctx, uint8_t node, uint16_t ep_id, float *ou
 
     if (jsdk_ctx_read_param(ctx, node, ep_id, buf, &len, 0u) != JSDK_OK) return -1;
     if (len < 4u) return -1;
-    *out = cb_be_get_f32(buf);
+    *out = cb_le_get_f32(buf);      /* ⚠ 参数值小端，见 cb_frame.h */
     return 0;
 }
 
-/** 读一个整数端点（1/2/4 字节，小端无关：协议是 BE，但数值宽度按类型）。 */
+/** 读一个整数端点（1/2/4 字节）；⚙ 参数值是**小端**（设备端 memcpy 主机序）。 */
 static int read_int(jsdk_context_t *ctx, uint8_t node, uint16_t ep_id,
                     jsdk_ep_type_t type, uint32_t *out)
 {
@@ -6732,11 +6933,10 @@ static int read_int(jsdk_context_t *ctx, uint8_t node, uint16_t ep_id,
     if (jsdk_ctx_read_param(ctx, node, ep_id, buf, &len, 0u) != JSDK_OK) return -1;
     if (len < need) return -1;
 
-    /* 设备回的是**大端**的原始字节；按类型宽度取 */
     switch (type) {
     case JSDK_EP_U8:  case JSDK_EP_BOOL: *out = (uint32_t)buf[0]; break;
-    case JSDK_EP_U16: *out = (uint32_t)cb_be_get_u16(buf); break;
-    case JSDK_EP_U32: *out = cb_be_get_u32(buf); break;
+    case JSDK_EP_U16: *out = (uint32_t)cb_le_get_u16(buf); break;
+    case JSDK_EP_U32: *out = cb_le_get_u32(buf); break;
     default: return -1;
     }
     return 0;
@@ -6751,6 +6951,54 @@ static void handshake(jsdk_context_t *ctx, uint8_t node)
 {
     (void)jsdk_ctx_send(ctx, CB_PRI_QUERY, CB_MSG_QUERY_STATUS, node, NULL, 0u);
     ctx->tx_seq = cb_seq_next(ctx->tx_seq);
+}
+
+/**
+ * 握手尝试次数 / 每次等应答的上限。
+ *
+ * ⚠ 为什么是"短超时 × 多次重发"而不是"一次等 3 s"：
+ *   设备的 master_id 是从**收到的帧**里学来的（`source_id == 0` 时它完全不回复），
+ *   所以**握手帧丢了就等于整个会话哑掉**——真机（slcan）实测丢帧率约 1/10，
+ *   而且丢的就是"打开端口后的头几帧"。中位应答时间只有几毫秒，
+ *   把 3 s 预算花在"干等一帧永不到来的帧"上没有任何好处；拆成 6×50 ms
+ *   既能把丢失的首帧补上，又把失败时的等待从 3 s 降到 ~300 ms。
+ */
+#define JSDK_HANDSHAKE_TRIES   6u
+#define JSDK_HANDSHAKE_WAIT_MS 50u
+
+/**
+ * 握手并**确认它真的生效**：发 `QUERY_STATUS`，等它的应答（MsgType 0x00），
+ * 没等到就重发（最多 `JSDK_HANDSHAKE_TRIES` 次）。
+ *
+ * 为什么不能只发一次：设备的 `master_id` 是从**收到的帧**里学来的
+ * （`source_id == 0` 时它不回复任何东西）。所以握手帧丢了 = 整个会话哑掉，
+ * 现场表现为 `configure()` 超时、而描述符/心跳看起来都正常。
+ * 握手本身是幂等的（`QUERY_STATUS` 不改任何状态），重发无副作用。
+ *
+ * 成功后顺手把这一帧当作首次反馈吃进去（少一次等待）。
+ */
+static jsdk_status_t handshake_verified(jsdk_context_t *ctx, jsdk_joint_t *j)
+{
+    unsigned i;
+
+    for (i = 0u; i < JSDK_HANDSHAKE_TRIES; ++i) {
+        jsdk_can_frame_t rsp;
+
+        handshake(ctx, j->cfg.node_id);
+        if (jsdk_ctx_wait_response(ctx, CB_MSG_MIT_CONTROL, j->cfg.node_id,
+                                   &rsp, JSDK_HANDSHAKE_WAIT_MS) == JSDK_OK) {
+            jsdk_joint__on_mit_response(j, rsp.data, rsp.len);
+            return JSDK_OK;
+        }
+    }
+
+    jsdk_joint_seterr(j,
+        "no response to handshake after %u attempts (node %u, %u ms each): "
+        "check node_id / wiring / master_id; if the port was just opened, the "
+        "adapter may be dropping the first frames",
+        (unsigned)JSDK_HANDSHAKE_TRIES, (unsigned)j->cfg.node_id,
+        (unsigned)JSDK_HANDSHAKE_WAIT_MS);
+    return JSDK_ERR_TIMEOUT;
 }
 
 /**
@@ -6880,22 +7128,49 @@ static jsdk_status_t calibrate_joint(jsdk_context_t *ctx, jsdk_joint_t *j)
         uint32_t period_ms = (uint32_t)(ctx->cfg.period_ns / 1000000u);
         uint32_t wd = jsdk_watchdog_device_ms(j);
 
-        if (ctx->cfg.enable_watchdog_hint && j->ep_break_timeout != 0u) {
+        if (ctx->cfg.enable_watchdog_hint && j->ep_break_timeout != 0u
+            && (wd == 0u || (period_ms != 0u && period_ms >= wd))) {
+            /* 主动武装：只在**需要**时才改设备 —— 当前是禁用（0），或者现有的超时
+               比我们的控制周期还短（回路本来就喂不住）。设备本来设得很宽松时
+               不动它：把 30000 ms 改成 2×周期只会让设备**更容易**被误停。
+               写完必须**读回确认** —— 真机上这个端点的读回恒为 0（F28），
+               也就是说“写成功”并不能证明“已经武装”。 */
             uint16_t want = (uint16_t)(period_ms * 2u);
-            uint8_t  want_be[2];
+            uint8_t  want_le[2];
             if (want < 2u) want = 2u;
-            cb_be_put_u16(want_be, want);      /* ⚠ 线上一律大端 */
+            cb_le_put_u16(want_le, want);      /* ⚠ 参数值小端，见 cb_frame.h */
             if (write_param_sync(ctx, j->cfg.node_id, j->ep_break_timeout,
-                                 want_be, 2u, 0u) == JSDK_OK) {
-                j->break_timeout_ms = want;
-                wd = want;
+                                 want_le, 2u, 0u) == JSDK_OK) {
+                uint8_t  buf[8];
+                uint8_t  len = 0u;
+                uint32_t back = 0u;
+                if (jsdk_ctx_read_param(ctx, j->cfg.node_id, j->ep_break_timeout,
+                                        buf, &len, 0u) == JSDK_OK && len >= 2u) {
+                    back = cb_le_get_u16(buf);
+                }
+                if (back == want) {
+                    j->break_timeout_ms = back;             /* 读回一致 = 真的武装了 */
+                } else {
+                    /* 读回不是我们要的值：**保守地认为“未武装”**。
+                       ⚠ 这里不能报致命错误 —— 设备完全可以合法地把该功能关着；
+                         但必须让客户知道“这一步没成”，否则他会以为有保护。 */
+                    j->break_timeout_ms = jsdk_watchdog_device_ms(j);
+                    jsdk_joint_seterr(j,
+                        "watchdog hint: wrote break_timeout = %u ms but the device "
+                        "reads back %u (see FIRMWARE_ISSUES F28): treat the protocol "
+                        "watchdog as NOT armed", (unsigned)want, (unsigned)back);
+                }
             }
+            wd = jsdk_watchdog_device_ms(j);
         }
-        if (period_ms != 0u && period_ms >= wd) {
+        /* ⚠ 只有**确实开着**超时（wd > 0）时，“周期必须小于超时”才有意义。
+           0 = 禁用 ⇒ 没有门限要满足，绝不能拿 0 去比较（那会让每个循环命令都被拒）。 */
+        if (wd != JSDK_WD_DISABLED_MS && period_ms != 0u && period_ms >= wd) {
             jsdk_joint_seterr(j,
                 "control period %u ms >= device break_timeout %u ms: the loop "
-                "cannot feed the protocol watchdog", (unsigned)period_ms,
-                (unsigned)wd);
+                "cannot feed the protocol watchdog (set break_timeout = 0 to "
+                "disable it on the device, or shorten the period)",
+                (unsigned)period_ms, (unsigned)wd);
             return JSDK_ERR_BAD_STATE;
         }
     }
@@ -6947,20 +7222,9 @@ jsdk_status_t jsdk_context_configure(jsdk_context_t *ctx)
     for (i = 0u; i < ctx->nj; ++i) {
         jsdk_joint_t *j = &ctx->joints[i];
 
-        handshake(ctx, j->cfg.node_id);
-        {
-            /* 握手帧的应答顺手确认设备在不在 */
-            jsdk_can_frame_t rsp;
-            if (jsdk_ctx_wait_response(ctx, CB_MSG_MIT_CONTROL, j->cfg.node_id,
-                                       &rsp, JSDK_CFG_TIMEOUT_MS) == JSDK_OK) {
-                jsdk_joint__on_mit_response(j, rsp.data, rsp.len);
-            } else {
-                jsdk_joint_seterr(j, "no response to handshake (node %u): check "
-                                     "node_id / wiring / master_id",
-                                  (unsigned)j->cfg.node_id);
-                return JSDK_ERR_TIMEOUT;
-            }
-        }
+        jsdk_status_t hst = handshake_verified(ctx, j);
+
+        if (hst != JSDK_OK) return hst;
 
         st = calibrate_joint(ctx, j);
         if (st != JSDK_OK) return st;
@@ -7246,7 +7510,8 @@ jsdk_status_t jsdk_joint_read_config_snapshot(jsdk_joint_t *j,
     out->mit_max_kd       = j->range.kd_max;
     out->torque_constant  = j->torque_constant;
     out->node_id          = j->node_id_readback ? j->node_id_readback : j->cfg.node_id;
-    out->heartbeat_rate_ms = 0u;               /* 由 P1 的心跳配置 API 补齐 */
+    /* 设备真值（标定阶段读回）。⚠ 语义已确认：**0 = 固件关闭了心跳**，不是"没读到" */
+    out->heartbeat_rate_ms = j->heartbeat_rate_ms;
     out->break_timeout_ms = jsdk_watchdog_device_ms(j);
     out->valid            = j->calibrated ? 1 : 0;
     return JSDK_OK;
@@ -7965,8 +8230,65 @@ static void store_init(jsdk_context_t *ctx)
                                 ? ctx->cfg.desc.max_endpoints : 2048u;
 }
 
-/** 至少有一个关节已被使能 → 禁止下载（DESIGN §6.6 硬约束 1）。 */
+/**
+ * 丢掉 RX 里**已有的**帧，直到总线安静下来（连续 @p quiet_ms 没有新帧）。
+ *
+ * ⚠ 请求 `0x24` 之前必须做，真机（slcan）实测的现场：
+ *   上一条被中断的传输（超时 / Ctrl-C / 报错退出）会让设备停在半路、继续把
+ *   剩下的帧发完；我们重新打开适配器（`C`→`Y5`→`O`）时它们就涌出来。
+ *   不清掉的话，这些残留会：
+ *     1. 被 fetch 当成"本次的元数据帧"（fetch 自己也会跳过，但那是有界的）；
+ *     2. **吃掉 `desc.timeout_ms` 的预算** —— 真机上残留尾巴可以有 1.5 s 以上，
+ *        而一次完整的 38 KB 传输本身也要 ~1.3 s，3 s 默认超时直接不够，
+ *        表现为"第一次连不上、第二次就好了"（实测）。
+ *   所以这里要**等它发完**再请求：请求前清干净，超时预算就全留给自己的传输。
+ *
+ * 这里只读"已经排好的"帧，不主动等待数据；唯一的等待是"静默窗口"，
+ * 而且有 @p max_frames 与 @p quiet_ms 双重上限，不会把调用者卡死。
+ *
+ * @param max_frames 最多丢多少帧（硬上限）
+ * @param quiet_ms   连续多久没有帧就算"安静"（典型 100 ms）
+ */
+static void desc_drain_rx(jsdk_context_t *ctx, unsigned max_frames, uint32_t quiet_ms)
+{
+    jsdk_can_frame_t junk;
+    uint32_t         last;
+    unsigned         i;
 
+    if (!ctx->cfg.hal.recv) return;
+
+    last = ctx->cfg.hal.now_ms(ctx->cfg.hal.user);
+    for (i = 0u; i < max_frames; ++i) {
+        if (ctx->cfg.hal.recv(ctx->cfg.hal.user, &junk) == 1) {
+            last = ctx->cfg.hal.now_ms(ctx->cfg.hal.user);
+            continue;
+        }
+        if ((uint32_t)(ctx->cfg.hal.now_ms(ctx->cfg.hal.user) - last) >= quiet_ms) break;
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * “首个请求丢了”的重发策略
+ *
+ * ⚠ 真机实测（slcan + CANable）：打开端口之后的**第一条请求概率性丢失**
+ *   （适配器在 `C`/`Y5`/`O` 之后还要配置自己的 CAN 控制器）。丢的次数不确定，
+ *   单次 250 ms 重试会撞上“还没就绪”，表现就是“第一次跑失败、再跑一次成功”。
+ *   设备对 `0x24` 幂等（重复请求会从头重发），所以多试几次无副作用。
+ *
+ * 递增间隔：0.25 s → 0.6 s → 1.2 s（共 4 次尝试）。仅当**一帧都没收到**时启用。
+ * ------------------------------------------------------------------------ */
+
+#define JSDK_DESC_REQUEST_RETRIES 3u
+
+static uint32_t jsdk_desc_retry_delay_ms(unsigned retry_index)
+{
+    static const uint16_t k_delay_ms[JSDK_DESC_REQUEST_RETRIES] = { 250u, 600u, 1200u };
+
+    return (retry_index < JSDK_DESC_REQUEST_RETRIES) ? k_delay_ms[retry_index]
+                                                    : 0xFFFFFFFFu;
+}
+
+/** 至少有一个关节已被使能 → 禁止下载（DESIGN §6.6 硬约束 1）。 */
 /**
  * 从 @p node 完整下载并解析描述符（**阻塞**）。
  *
@@ -7978,8 +8300,8 @@ static jsdk_status_t desc_fetch_from(jsdk_context_t *ctx, uint8_t node)
     uint8_t req[CB_DESC_REQ_LEN];
     uint32_t deadline;
     size_t   req_len;
-    unsigned spin = 0u;
-    const unsigned spin_cap = 4000000u;
+    uint32_t spin_clock = 0u;   /* 与 frozen 一起做"时钟冻结"检测 */
+    unsigned frozen = 0u;
 
     store_init(ctx);
 
@@ -7993,6 +8315,12 @@ static jsdk_status_t desc_fetch_from(jsdk_context_t *ctx, uint8_t node)
     req_len = cb_desc_build_request(req, sizeof req, 0u);
     if (req_len == 0u) return JSDK_ERR_INVALID_ARG;
 
+    /*
+     * 上限取 4096 帧 / 100 ms 静默：真机上一条被中断的流的尾巴可以有几百帧、
+     * 持续 1 s 以上（实测），要等它发完再请求，否则残留会占掉超时预算。
+     */
+    desc_drain_rx(ctx, 4096u, 100u);
+
     if (jsdk_ctx_send(ctx, CB_PRI_CONFIG, CB_MSG_JSON_DESC_READ, node,
                       req, (uint8_t)req_len) != 0) {
         jsdk_ctx_seterr(ctx, "descriptor request to node %u could not be sent",
@@ -8004,6 +8332,8 @@ static jsdk_status_t desc_fetch_from(jsdk_context_t *ctx, uint8_t node)
     deadline = cb_desc_timeout_ms(&ctx->cfg.desc);
     {
         uint32_t t0 = ctx->cfg.hal.now_ms(ctx->cfg.hal.user);
+        uint32_t req_at = t0;      /* 上一次发请求的时刻（用于重试判定） */
+        unsigned retries = 0u;     /* 已重发次数（见下面的递增间隔） */
 
         while (!cb_desc_fetch_is_done(&ctx->fetch)) {
             jsdk_can_frame_t f;
@@ -8024,18 +8354,64 @@ static jsdk_status_t desc_fetch_from(jsdk_context_t *ctx, uint8_t node)
             }
 
             ctx->now_ms = ctx->cfg.hal.now_ms(ctx->cfg.hal.user);
+
+            /*
+             * 请求重发（最多 3 次，共 4 次尝试）。
+             *
+             * ⚠ 真机实测：**刚打开适配器后的第一条请求可能丢**（`C`/`Y5`/`O`
+             *   之后适配器还要配置自己的 CAN 控制器），现场表现就是"第一次连不上、
+             *   再敲一次就好了"。丢失概率与延迟**不确定**，所以按递增间隔多试几次；
+             *   设备对 `0x24` 幂等（会从头重发），重试无副作用。
+             *
+             * ⚠⚠ 判据只能是"**本次传输还没开始**"（没收到元数据帧），**不能**是
+             *   "一帧都没收到"：RX 里常常有上一次被中断传输的**残留帧**，
+             *   真机实测过 680 帧残留、而我们的请求根本没到达设备 ——
+             *   用帧数当判据就永远不重发，然后超时（那次的报错正是
+             *   `(0/0 bytes, 680 frames received)`）。
+             */
+            if (retries < JSDK_DESC_REQUEST_RETRIES
+                && !cb_desc_fetch_started(&ctx->fetch)
+                && jsdk_elapsed(ctx->now_ms, req_at) >= jsdk_desc_retry_delay_ms(retries)) {
+                retries++;
+                req_at = ctx->now_ms;
+                if (jsdk_ctx_send(ctx, CB_PRI_CONFIG, CB_MSG_JSON_DESC_READ, node,
+                                  req, (uint8_t)req_len) == 0) {
+                    ctx->tx_seq = cb_seq_next(ctx->tx_seq);
+                }
+            }
+
             if (jsdk_elapsed(ctx->now_ms, t0) >= deadline) {
+                /* `rx` = 一共收到过多少帧：区分两种完全不同的故障
+                   （通道没开 → 0；请求丢了但心跳在流 → >0）。 */
                 jsdk_ctx_seterr(ctx, "descriptor download from node %u timed out "
-                                     "after %u ms (%u/%u bytes)",
+                                     "after %u ms (%u/%u bytes, %u frames received)",
                                 (unsigned)node, (unsigned)deadline,
                                 (unsigned)ctx->fetch.bytes_scanned,
-                                (unsigned)ctx->fetch.total_len);
+                                (unsigned)ctx->fetch.total_len,
+                                (unsigned)ctx->bus.rx_frames);
                 return JSDK_ERR_TIMEOUT;
             }
-            if (++spin >= spin_cap) {
-                jsdk_ctx_seterr(ctx, "descriptor download from node %u stalled "
-                                     "(no frames; frozen clock?)", (unsigned)node);
-                return JSDK_ERR_TIMEOUT;
+            /*
+             * "卡死"只认**时钟不动**这一种情况。
+             *
+             * ⚠ 旧实现看的是**迭代次数**（`spin >= spin_cap`，400 万次）。那条
+             *   判断在真机上是**误报**：空缓冲上的 `recv` 是**立即返回**的，
+             *   400 万次循环只需几十毫秒 —— 而真实设备从收到 `0x24` 到开口
+             *   可能要 100 ms 以上（slcan 上还要排队），于是第一次连接会随机
+             *   报 `stalled (no frames; frozen clock?)`（真机实测）。
+             *   它本来的用途只是"虚拟 HAL 没开 autotick、时钟冻结"时不要死循环，
+             *   那就直接看时钟有没有走：走了就交给上面的超时负责。
+             */
+            if (ctx->now_ms == spin_clock) {
+                if (++frozen >= 4000000u) {
+                    jsdk_ctx_seterr(ctx, "descriptor download from node %u stalled "
+                                         "(no frames and the clock is frozen?)",
+                                    (unsigned)node);
+                    return JSDK_ERR_TIMEOUT;
+                }
+            } else {
+                spin_clock = ctx->now_ms;
+                frozen     = 0u;
             }
         }
     }
@@ -8241,6 +8617,8 @@ jsdk_status_t jsdk_context_desc_poll(jsdk_context_t *ctx, uint64_t app_time_ns)
 
         req_len = cb_desc_build_request(req, sizeof req, 0u);
         if (req_len == 0u) return JSDK_ERR_INVALID_ARG;
+        /* 与阻塞路径同理：先等总线安静下来再请求 */
+        desc_drain_rx(ctx, 1024u, 50u);
         if (jsdk_ctx_send(ctx, CB_PRI_CONFIG, CB_MSG_JSON_DESC_READ, node,
                           req, (uint8_t)req_len) != 0) {
             ctx->fetch_active = 0;
@@ -10296,8 +10674,8 @@ jsdk_status_t jsdk_joint_set_node_id(jsdk_joint_t *j, uint8_t new_id, int persis
 
 jsdk_status_t jsdk_joint_set_watchdog_ms(jsdk_joint_t *j, uint32_t ms)
 {
-    uint8_t be[2];
-    int     warn_zero;
+    uint8_t le[2];
+    int     disable;
 
     if (!jsdk_joint_check(j)) return JSDK_ERR_INVALID_ARG;
     if (j->ep_break_timeout == 0u) {
@@ -10309,40 +10687,71 @@ jsdk_status_t jsdk_joint_set_watchdog_ms(jsdk_joint_t *j, uint32_t ms)
         jsdk_joint_seterr(j, "break_timeout max is 65535 ms (got %u)", (unsigned)ms);
         return JSDK_ERR_INVALID_ARG;
     }
-    warn_zero = (ms == 0u);
+    disable = (ms == 0u);
 
-    /* ⚠ 参数值是**大端**（与全协议一致）。直接传主机序 u16 会字节交换，
-       设备把 250 读成 64000 —— 本项目确实胉过这个坑。 */
-    cb_be_put_u16(be, (uint16_t)ms);
+    /* 每次调用重新判定“能不能读回校验”，所以先清掉上一次的结果位 */
+    jsdk_joint_clear_status_flags(j, (uint16_t)JSDK_JF_WATCHDOG_UNVERIFIED);
+
+    /* ⚠ 参数值在线上是**小端**（设备端 memcpy 主机序），见 cb_frame.h。
+       旧注释曾写"大端"并把 250→64000 归咎于"传主机序"——那是错的：
+       64000 恰恰是**按大端发包**的结果，真机上是小端。 */
+    cb_le_put_u16(le, (uint16_t)ms);
     if (jsdk_ctx_write_param(j->ctx, j->cfg.node_id, j->ep_break_timeout,
-                             be, 2u, 0u) != JSDK_OK) {
+                             le, 2u, 0u) != JSDK_OK) {
         jsdk_joint_seterr(j, "failed to write can.config.break_timeout");
         return JSDK_ERR_TRANSPORT;
     }
 
-    /* 读回校验（端点可读，没必要盲信写入） */
+    /* 读回校验（端点可读，没必要盲信写入）
+     *
+     * ⚠⚠ 真机实测（fw 1545）：**`can.config.break_timeout` 的读回恒为 0** ——
+     *    紧随写入之后立刻读、同一个进程，读回来的也是 0（`sdo.data` 证实我们
+     *    确实发出去了 `96 00` = 150 小端）。对照端点 `heartbeat_rate_ms` 的
+     *    写入→读回是正常的，所以这是**该端点的固件问题**（FIRMWARE_ISSUES F28），
+     *    不是请求打包问题。
+     *    后果很重：`break_timeout = 0` 在新固件里的含义是**禁用超时检测**，
+     *    所以“写 250 却读回 0”意味着**客户端无法证明自己武装了保护**。
+     *    处理原则：
+     *      - 读回 == 写入值      → 校验通过；
+     *      - 读回 0 且写入非 0   → **未能校验**：置 JSDK_JF_WATCHDOG_UNVERIFIED、
+     *                              保留写入值（安全方向：宁可多喂几帧），返回 OK；
+     *      - 其它不一致          → 真矛盾 → PROTOCOL（这条不能放松）。
+     */
     {
         uint8_t buf[8];
         uint8_t len = 0u;
+
         if (jsdk_ctx_read_param(j->ctx, j->cfg.node_id, j->ep_break_timeout,
                                 buf, &len, 0u) == JSDK_OK && len >= 2u) {
-            j->break_timeout_ms = cb_be_get_u16(buf);
-            if (j->break_timeout_ms != ms) {
+            uint32_t back = cb_le_get_u16(buf);
+            if (back == ms) {
+                j->break_timeout_ms = back;          /* 含 0 == 0：禁用也能量化确认 */
+            } else if (back == 0u && ms != 0u) {
+                jsdk_joint_set_flags(j, (uint16_t)JSDK_JF_WATCHDOG_UNVERIFIED);
+                j->break_timeout_ms = ms;            /* 保守：按“已武装”继续喂狗 */
+            } else {
+                j->break_timeout_ms = back;
                 jsdk_joint_seterr(j, "break_timeout read back as %u, expected %u",
-                                  (unsigned)j->break_timeout_ms, (unsigned)ms);
+                                  (unsigned)back, (unsigned)ms);
                 return JSDK_ERR_PROTOCOL;
             }
         } else {
-            j->break_timeout_ms = ms;   /* 读不回来就用写入值 */
+            jsdk_joint_set_flags(j, (uint16_t)JSDK_JF_WATCHDOG_UNVERIFIED);
+            j->break_timeout_ms = ms;                /* 读不回来就用写入值 */
         }
+
+        jsdk_ctx_seterr(j->ctx,
+            "break_timeout set to %u ms on node %u%s%s (not persisted; call "
+            "save_config())",
+            (unsigned)ms, (unsigned)j->cfg.node_id,
+            disable ? "; 0 = protocol timeout DISABLED on the device" : "",
+            (j->status_flags & (uint16_t)JSDK_JF_WATCHDOG_UNVERIFIED)
+                ? "; NOTE: could not verify by read-back (this firmware's "
+                  "can.config.break_timeout reads back 0 — see FIRMWARE_ISSUES "
+                  "F28): treat the watchdog as NOT confirmed"
+                : "");
     }
 
-    /* ⚠ 0 **不是**关闭：固件按 100 ms 处理。这条警告必须活到最后 ——
-       早先的写法是 write 前发警告、成功后又被成功串覆盖，客户就看不到了。 */
-    jsdk_ctx_seterr(j->ctx,
-        "break_timeout set to %u ms on node %u%s (not persisted; call save_config())",
-        (unsigned)ms, (unsigned)j->cfg.node_id,
-        warn_zero ? "; WARNING: 0 means 100 ms, NOT disabled" : "");
     return JSDK_OK;
 }
 
@@ -10369,9 +10778,13 @@ int jsdk_joint_get_can_state(const jsdk_joint_t *j)
  *    - Classic → 直接逐条单读，**不让客户看到 ERR**
  *  客户只调一次 `jsdk_joint_param_get_batch()`，由 SDK 决定走哪条路。
  *
- * @par 参数的字节序
- *  参数值是**大端**（与全协议一致，JSON 描述符是唯一例外）。读到调用方缓冲后
- *  由本文件负责按端点类型宽度解成主机序的 `jsdk_value_t`。
+ * @par 参数的字节序（⚙ 实测修正）
+ *  参数值是**小端**。协议文档曾写"与全协议一致（大端）"，但真机不是：
+ *  固件在 PARAM_READ/WRITE 里把端点值原样 `memcpy` 进/出载荷，线上就是
+ *  ARM 主机序（LE）。完整证据（固件源码锚点 + 真机实测三例）见
+ *  `src/proto_cyberbeast/cb_frame.h` 里的 `cb_le_*` 说明。
+ *  控制帧与查询响应（0x40/0x46/0x49）**仍然是大端**。
+ *  读到调用方缓冲后由本文件负责按端点类型宽度解成主机序的 `jsdk_value_t`。
  */
 
 
@@ -10401,10 +10814,14 @@ static jsdk_status_t resolve(jsdk_joint_t *j, const char *path,
 }
 
 /* ==========================================================================
- * 大端窄宽度 ↔ 主机序
+ * 参数值 ↔ 主机序：**小端**
+ *
+ * ⚠⚠ 参数值在线上是**小端**（设备端 `memcpy` 主机序），与控制/查询帧的大端
+ *   相反。完整理由（固件源码锚点 + 真机实测三例）见 `cb_frame.h` 的小端
+ *   存取器说明 —— 那里是这条约定的唯一权威注释。
  * ======================================================================== */
 
-static void be_to_value(jsdk_ep_type_t t, const uint8_t *b, jsdk_value_t *out)
+static void le_to_value(jsdk_ep_type_t t, const uint8_t *b, jsdk_value_t *out)
 {
     memset(out, 0, sizeof *out);
     out->type = t;
@@ -10413,17 +10830,17 @@ static void be_to_value(jsdk_ep_type_t t, const uint8_t *b, jsdk_value_t *out)
     case JSDK_EP_U8:  out->v.u8  = b[0]; break;
     case JSDK_EP_I8:  out->v.i8  = (int8_t)b[0]; break;
     case JSDK_EP_BOOL: out->v.boolean = (b[0] != 0u) ? 1 : 0; break;
-    case JSDK_EP_U16: out->v.u16 = cb_be_get_u16(b); break;
-    case JSDK_EP_I16: out->v.i16 = cb_be_get_i16(b); break;
-    case JSDK_EP_U32: out->v.u32 = cb_be_get_u32(b); break;
-    case JSDK_EP_I32: out->v.i32 = cb_be_get_i32(b); break;
-    case JSDK_EP_U64: out->v.u64 = cb_be_get_u64(b); break;
-    case JSDK_EP_I64: out->v.i64 = (int64_t)cb_be_get_u64(b); break;
-    case JSDK_EP_F32: out->v.f32 = cb_be_get_f32(b); break;
+    case JSDK_EP_U16: out->v.u16 = cb_le_get_u16(b); break;
+    case JSDK_EP_I16: out->v.i16 = cb_le_get_i16(b); break;
+    case JSDK_EP_U32: out->v.u32 = cb_le_get_u32(b); break;
+    case JSDK_EP_I32: out->v.i32 = cb_le_get_i32(b); break;
+    case JSDK_EP_U64: out->v.u64 = cb_le_get_u64(b); break;
+    case JSDK_EP_I64: out->v.i64 = (int64_t)cb_le_get_u64(b); break;
+    case JSDK_EP_F32: out->v.f32 = cb_le_get_f32(b); break;
     case JSDK_EP_F64: {
         /* 协议里没有 f64 线格式；按两个 u32 拼（保留位，仅用于透传） */
-        uint64_t hi = cb_be_get_u32(b);
-        uint64_t lo = cb_be_get_u32(b + 4);
+        uint64_t lo = cb_le_get_u32(b);
+        uint64_t hi = cb_le_get_u32(b + 4);
         uint64_t raw = (hi << 32) | lo;
         double d;
         memcpy(&d, &raw, sizeof d);      /* 位模式搬运，不做数值转换 */
@@ -10435,7 +10852,7 @@ static void be_to_value(jsdk_ep_type_t t, const uint8_t *b, jsdk_value_t *out)
     }
 }
 
-static int value_to_be(jsdk_ep_type_t t, const jsdk_value_t *in,
+static int value_to_le(jsdk_ep_type_t t, const jsdk_value_t *in,
                        uint8_t *b, uint8_t *out_len)
 {
     unsigned w = jsdk_ep_type_size(t);
@@ -10447,18 +10864,18 @@ static int value_to_be(jsdk_ep_type_t t, const jsdk_value_t *in,
     case JSDK_EP_U8:   b[0] = in->v.u8; break;
     case JSDK_EP_I8:   b[0] = (uint8_t)in->v.i8; break;
     case JSDK_EP_BOOL: b[0] = (uint8_t)(in->v.boolean ? 1 : 0); break;
-    case JSDK_EP_U16:  cb_be_put_u16(b, in->v.u16); break;
-    case JSDK_EP_I16:  cb_be_put_i16(b, in->v.i16); break;
-    case JSDK_EP_U32:  cb_be_put_u32(b, in->v.u32); break;
-    case JSDK_EP_I32:  cb_be_put_i32(b, in->v.i32); break;
-    case JSDK_EP_U64:  cb_be_put_u64(b, in->v.u64); break;
-    case JSDK_EP_I64:  cb_be_put_u64(b, (uint64_t)in->v.i64); break;
-    case JSDK_EP_F32:  cb_be_put_f32(b, in->v.f32); break;
+    case JSDK_EP_U16:  cb_le_put_u16(b, in->v.u16); break;
+    case JSDK_EP_I16:  cb_le_put_i16(b, in->v.i16); break;
+    case JSDK_EP_U32:  cb_le_put_u32(b, in->v.u32); break;
+    case JSDK_EP_I32:  cb_le_put_i32(b, in->v.i32); break;
+    case JSDK_EP_U64:  cb_le_put_u64(b, in->v.u64); break;
+    case JSDK_EP_I64:  cb_le_put_u64(b, (uint64_t)in->v.i64); break;
+    case JSDK_EP_F32:  cb_le_put_f32(b, in->v.f32); break;
     case JSDK_EP_F64: {
         uint64_t raw;
         memcpy(&raw, &in->v.f64, sizeof raw);
-        cb_be_put_u32(b, (uint32_t)(raw >> 32));
-        cb_be_put_u32(b + 4, (uint32_t)raw);
+        cb_le_put_u32(b, (uint32_t)raw);
+        cb_le_put_u32(b + 4, (uint32_t)(raw >> 32));
         break;
     }
     default:
@@ -10511,7 +10928,7 @@ jsdk_status_t jsdk_joint_param_get(jsdk_joint_t *j, const char *path,
         return JSDK_ERR_PROTOCOL;
     }
 
-    be_to_value(t, buf, out);
+    le_to_value(t, buf, out);
     return JSDK_OK;
 }
 
@@ -10539,7 +10956,7 @@ jsdk_status_t jsdk_joint_param_set(jsdk_joint_t *j, const char *path,
                           jsdk_ep_type_string(in->type));
         return JSDK_ERR_PROTOCOL;
     }
-    if (value_to_be(t, in, buf, &len) != 0) {
+    if (value_to_le(t, in, buf, &len) != 0) {
         return JSDK_ERR_UNSUPPORTED;
     }
 
@@ -10802,7 +11219,7 @@ jsdk_status_t jsdk_joint_param_get_batch(jsdk_joint_t *j, jsdk_param_req_t *reqs
                             continue;
                         }
                         if (off + w > rsp.values_len) { usable = 0; break; }
-                        be_to_value(types[base + k], rsp.values + off,
+                        le_to_value(types[base + k], rsp.values + off,
                                     &reqs[slot].value);
                         reqs[slot].status = JSDK_OK;
                         off += w;
@@ -11390,29 +11807,36 @@ void jsdk_joint_get_scale(const jsdk_joint_t *j, jsdk_unit_scale_t *scale)
  *    `do_command()` 开头**无条件** `axis.watchdog_feed()` —— 任何发往该设备的帧
  *    都喂它。所以"帧够不够多"不是问题，"有没有帧"才是。
  *
- * 2. **协议级 CAN 超时**（`can.config.break_timeout`，默认 100 ms）：
+ * 2. **协议级 CAN 超时**（`can.config.break_timeout`）：
  *    `last_cmd_time_` **只**由 `is_ctrl` 帧（MsgType ≤ 0x03 或 0x80..0x83）更新。
  *    → 纯 `CURRENT_CONTROL` 的客户端**永远不武装**这个保护（安全缺口 F19，
  *      见 `docs/FIRMWARE_ISSUES.zh-CN.md`）；
  *    → 已经发过 MIT 的客户端若只发 CURRENT，会被**误停**。
  *
- * 因此 `auto_keepalive` 的策略是：只要"距上次控制类帧"接近 `break_timeout`，
- * 就补发一帧 **MIT**（`is_ctrl`），既武装保护又不被误停，且不改变运动状态
- * （kp = kd = 0、tau = 0 → 电机泄力；比"保持位置"更安全）。
+ *    ⚠⚠ **`0` = 这个超时检测被禁用**（最新固件 `auto_stop_if_timeout()` 首句
+ *      `if (timeout_ms == 0) return;`，且配置项默认值就是 0）。
+ *      早期版本把 0 当成 100 ms，导致上位机把“没武装”读成“已武装 100 ms”。
+ *      因此：**只有 > 0 时才需要补喂**；0 时既不补喂也不报风险。
+ *
+ * 因此 `auto_keepalive` 的策略是：当设备侧超时 > 0，且“距上次控制类帧”接近
+ * `break_timeout` 时，补发一帧 **MIT**（`is_ctrl`）—— 既武装保护又不被误停，
+ * 且不改变运动状态（kp = kd = 0、tau = 0 → 电机泄力；比“保持位置”更安全）。
  */
 
 
 /* ==========================================================================
  * 设备侧超时值的获取
  * ------------------------------------------------------------------------
- * `break_timeout` 由 configure() 从端点读出（0 → 固件按 100 ms 处理）。
+ * `break_timeout` 由 configure() 从端点读出。
+ *
+ * ⚠ **0 = 设备侧超时检测被禁用**（最新固件语义；不是“默认 100 ms”）。
+ *   句柄无效时也返回 0（“无法判定”按“不巡喂”处理，永不会因为未知值乱发帧）。
  * ======================================================================== */
 
 uint32_t jsdk_watchdog_device_ms(const jsdk_joint_t *j)
 {
-    if (!jsdk_joint_check(j)) return JSDK_WD_DEFAULT_MS;
-    if (j->break_timeout_ms == 0u) return JSDK_WD_DEFAULT_MS;   /* ⚠ 0 ≠ 关闭 */
-    return j->break_timeout_ms;
+    if (!jsdk_joint_check(j)) return JSDK_WD_DISABLED_MS;
+    return j->break_timeout_ms;      /* 0 = 禁用；> 0 = 超时毫秒数 */
 }
 
 /**
@@ -11432,6 +11856,11 @@ static int keepalive_joint(jsdk_joint_t *j)
     if (!j->calibrated) return 0;
 
     wd = jsdk_watchdog_device_ms(j);
+
+    /* ⚠ **0 = 设备侧超时检测被禁用** → 无狗可喂：既不补帧也不置风险位。
+       补帧在这里毫无意义（没有门限要满足），只会自白增加总线流量 ——
+       而且会掩盖“你没在发控制帧”这个事实。 */
+    if (wd == JSDK_WD_DISABLED_MS) return 0;
 
     /* 首个控制帧之前不需要补喂：`last_cmd_time_ == 0` 时固件直接跳过检查，
        而且此时补喂反而会**武装**保护，让刚启动的客户莫名被停。 */

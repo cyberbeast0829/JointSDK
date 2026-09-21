@@ -25,8 +25,12 @@
  * @par 打开序列
  *  `C\r`（回到关闭态）→ [`Y<n>\r`]（仅 FD）→ `O\r`（打开通道）。
  *  `O` 不可省：Lawicel 语义下通道上电是关闭的，只发 `C` 而不发 `O`
- *  等于让适配器一直闭着（现场表现为"一条帧都收不到"）。
- *
+ *  等于让适配器一直闭着（现场表现为"一条帧都收不到"）。 *
+ *  ⚠ **每一步都等适配器的 ACK（`\r`），没 ACK 就重发**（见 `sl_cmd_sync`）。
+ *  CDC 串口刚打开时前几笔写会**直接丢掉**，而丢掉的是整个 `C`/`Y`/`O` 序列时，
+ *  通道就从未打开过：“打开后的第一个请求石沉大海、再跑一次却好了”
+ *  （真机实测约 1/10）。盲等一段固定时间无法区分“已经生效”与“整段丢掉”，
+ *  等 ACK 才能把这件事从概率变成**有界重试**。 *
  * @par 已知局限（写进文档，不隐藏）
  *  - `Y<n>` 的索引是**固件私有表**，这里只收录 CANable 2.0 公认的两个
  *    （`Y2`=2 Mbps、`Y5`=5 Mbps）；要别的速率请用厂家工具先配好再传 0；
@@ -488,6 +492,90 @@ static const struct {
 #define JSDK_SLCAN_FD_RATE_COUNT \
     (sizeof k_slcan_fd_rates / sizeof k_slcan_fd_rates[0])
 
+/**
+ * 把串口里**已经排好的**字节读掉（最多 20 次读，连续 3 次空读就停）。
+ *
+ * ⚠ 它**不是**"等一段时间"：本项目两个平台的 `sl_port_read` 在无数据时是
+ *   **立即返回**的，所以这个函数通常只花几微秒。"让适配器就绪"这件事
+ *   **不靠它** —— 靠 `sl_cmd_sync()` 等 ACK（发出去没被应答就重发）。
+ *   早期版本把它当"睡 150 ms"用，那是**误读自己的 I/O 语义**：
+ *   既不可靠（丢掉的是整个 `C`/`Y5`/`O` 序列，等再久也是白等），
+ *   也掩盖了真正的判据（适配器到底应答了没有）。
+ *
+ * 它现在的职责只剩一个：清掉端口打开前/复位后残留的启动垃圾与回声，
+ * 免得它们被上层当成 CAN 帧或命令 ACK 数进去。
+ */
+static void sl_settle(sl_handle_t *h)
+{
+    char     sink[JSDK_SLCAN_LINE_MAX + 4u];
+    unsigned i;
+    unsigned quiet = 0u;
+
+    for (i = 0u; i < 20u; ++i) {
+        if (sl_port_read(&h->port, (uint8_t *)sink, sizeof sink) > 0) {
+            quiet = 0u;                  /* 还有数据 → 继续收 */
+        } else if (++quiet >= 3u) {
+            break;                       /* 连续三次没数据 → 认为静了 */
+        }
+    }
+}
+
+/** 每条命令等 ACK 的最长时间 / 最多发几次。 */
+#define JSDK_SLCAN_ACK_WAIT_MS 250u
+#define JSDK_SLCAN_ACK_TRIES   3u
+
+/**
+ * 发一条 slcan 命令，**等适配器的 ACK**；没等到就重发。
+ *
+ * Lawicel/CANable 对 `C` / `Y<n>` / `O` 都回一个 `\r`。这里把“等 ACK”当成
+ * **打开是否真的生效**的判据：
+ *   - 等到 → 适配器已经把我们当主站在听了，可以发 CAN 帧；
+ *   - 等不到 → 重发（最多 `JSDK_SLCAN_ACK_TRIES` 次）—— 覆盖“端口刚打开、
+ *     前几笔写被丢”与“适配器还在启动”两种情况。
+ *
+ * ⚠ 不引入“固定睡眠”：盲等既慢又不可靠（快的时候白等，慢的时候不够）。
+ *
+ * ⚠ 这一条修的是本项目**最贵的一个现场症状**：CDC 串口刚打开时前几笔写会被丢，
+ *   如果丢掉的是整个 `C`/`Y5`/`O` 序列，通道就从未打开 —— 于是“打开后的第一个
+ *   请求石沉大海，再跑一次就好了”，且各命令的表现互相矛盾，极易误判：
+ *     - `info`（只发一个 0x46）每次都超时；
+ *     - `err` / `hb-dump`（不发请求、只收心跳）看起来“完全正常”；
+ *     - `scan` 能成功（第一帧之后就持续探测了）；
+ *     - 描述符下载偶尔成功（多帧传输把丢失的首帧掩盖了大半）。
+ *   实测丢帧率约 **1/10 次进程**；修后 `desc-info` 30/30、`health` 12/12。
+ *
+ * @return 1 = 收到 ACK；0 = 反复超时（适配器不 ACK 或未就绪）
+ */
+static int sl_cmd_sync(sl_handle_t *h, const char *cmd)
+{
+    unsigned try_i;
+
+    for (try_i = 0u; try_i < JSDK_SLCAN_ACK_TRIES; ++try_i) {
+        uint32_t t0;
+        unsigned ack = 0u;
+
+        if (sl_port_write_all(&h->port, cmd, strlen(cmd)) != 0) return 0;
+        t0 = sl_now_ms();
+
+        while (!ack) {
+            uint8_t buf[JSDK_SLCAN_LINE_MAX + 4u];
+            int     n = sl_port_read(&h->port, buf, sizeof buf);
+            unsigned i;
+
+            if (n < 0) return 0;
+            for (i = 0u; i < (unsigned)n; ++i) {
+                /* `\r` = 命令 ACK。同时也把启动横幅/回声当“适配器在说话”
+                   （那已经足够证明端口双向通了）。 */
+                if (buf[i] == '\r') { ack = 1u; }
+            }
+            if (ack) break;
+            if ((uint32_t)(sl_now_ms() - t0) >= JSDK_SLCAN_ACK_WAIT_MS) break;
+        }
+        if (ack) return 1;
+    }
+    return 0;
+}
+
 jsdk_status_t jsdk_hal_slcan_open(jsdk_can_hal_t *hal, jsdk_hal_handle_t **out,
                                   const char *port, uint32_t baud,
                                   uint32_t data_bitrate)
@@ -539,16 +627,22 @@ jsdk_status_t jsdk_hal_slcan_open(jsdk_can_hal_t *hal, jsdk_hal_handle_t **out,
      * 复位 + （可选）FD 速率 + 打开。这三条都是**尽力而为**：
      * 有些固件不认识 `Y` 或 `C`，照样能收发，所以失败不上升到错误
      * （但适配器配置没生效时会更早、更明显地表现为"收不到帧"）。
+     *
+     * ⚠ 每条命令都**等 ACK + 重发**（`sl_cmd_sync`）：串口刚打开时这几笔写会丢，
+     *   盲等无法区分“生效”与“整段丢掉”。真机实测：丢掉整个序列时通道从未打开，
+     *   于是“打开后的第一个请求”必丢 —— 这是本项目最贵的一个现场症状。
      */
-    (void)sl_port_write_all(&h->port, cmd_reset, sizeof cmd_reset - 1u);
+    sl_settle(h);
+    (void)sl_cmd_sync(h, cmd_reset);
     if (fd_cmd) {
         /* ⚠ 用 strlen 而不是写死 3：表里的命令今后可能变长，
-           写死长度会静默截断 —— 那种 bug 在真机上只表现为"适配器没反应"。 */
-        (void)sl_port_write_all(&h->port, fd_cmd, strlen(fd_cmd));
+           写死长度会静默截断 —— 那种 bug 在真机上只表现为“适配器没反应”。 */
+        (void)sl_cmd_sync(h, fd_cmd);
         h->fd_enabled       = 1u;
         h->fd_data_bitrate  = data_bitrate;
     }
-    (void)sl_port_write_all(&h->port, cmd_open, sizeof cmd_open - 1u);
+    (void)sl_cmd_sync(h, cmd_open);
+    sl_settle(h);
 
     h->base.kind    = JSDK_HAL_KIND_SLCAN;
     h->base.destroy = sl_destroy;

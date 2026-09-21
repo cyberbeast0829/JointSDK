@@ -554,8 +554,8 @@ static void test_system_cmds(void)
        所以 SDK 的"本上下文内冲突"检查看不到另一台设备 ——
        靠改号前的那次定向探测才拦得住（v0.19 修的，否则会静默造出两个同号设备）。
        ⚠ 多节点规格里 `timeout=` 是**逐节点**的（它是设备自己的 break_timeout）：
-       只写在一个节点上，另一个仍会用默认 100 ms → configure() 会正确地拒绝
-       "100 ms 的控制周期喂不了 100 ms 的看门狗"。这里两个都写。 */
+       这里两个节点都写 30000 —— 不写的话设备就是 `0` = **禁用超时**（新固件默认），
+       那也能跑，但就测不到“两个节点都真的配好”这件事了。 */
     RUN_CLI(&r, "--if", "virtual", "--channel",
             "0:id=1,timeout=30000,fd;1:id=2,timeout=30000,fd",
             "--node", "1", "--yes", "set-node-id", "2");
@@ -564,6 +564,56 @@ static void test_system_cmds(void)
 
     printf("      estop executes without --yes; reset/set-node-id gated;\n"
            "      set-node-id validation (1..254) + new-address verification\n");
+}
+
+/* ==========================================================================
+ * 9. mon 的 CSV 契约（两版 CLI 共用）
+ * ======================================================================== */
+
+/**
+ * ⚠ 这一组是从一次**真实事故**补出来的：`--csv` 以前是"要一个文件名"，于是
+ *   `mon --csv --duration 1` 把 `--duration` 当成了文件名，**静默写出一个叫
+ *   `--duration` 的 CSV**（在仓库根目录躺了几天才被发现）。
+ *   现在：`--csv` 是格式开关（→ stdout），`--csv-file F` 落盘，且取值以 `-`
+ *   开头时**当场拒绝**（返回用法错）。
+ */
+static void test_mon_csv(void)
+{
+    run_t r;
+    const char *hdr = "t_ms,node,pos_rad,vel_rad_s,current_A,torque_Nm,";
+
+    printf("[9] mon 的 CSV 契约（--csv 是开关，--csv-file 落盘）\n");
+
+    RUN_CLI(&r, VIF, "--node", "1", "--csv", "--duration", "1",
+            "--rate-hz", "20", "mon");
+    CHECK(r.rc == 0);
+    expect_has(&r, "out", hdr);
+    expect_has(&r, "out", "t_fet_C,vbus_V,ibus_A");   /* 17 列的完整契约 */
+
+    {
+        const char *path = "cli_mon_csv_test.csv";
+        FILE *f;
+        char  line[256];
+
+        remove(path);
+        RUN_CLI(&r, VIF, "--node", "1", "--csv-file", path, "--duration", "1",
+                "--rate-hz", "20", "mon");
+        CHECK(r.rc == 0);
+        f = fopen(path, "r");
+        CHECK(f != NULL);
+        if (f) {
+            CHECK(fgets(line, sizeof line, f) != NULL);
+            CHECK(strncmp(line, hdr, strlen(hdr)) == 0);
+            CHECK(fgets(line, sizeof line, f) != NULL);   /* 至少一行数据 */
+            fclose(f);
+        }
+        remove(path);
+    }
+
+    /* 拿到另一个选项 → 用法错（而不是静默写出怪文件名） */
+    RUN_CLI(&r, VIF, "--csv-file", "--duration", "1", "mon");
+    CHECK(r.rc == 2);
+    expect_has(&r, "err", "另一个选项");
 }
 
 /* ==========================================================================
@@ -589,6 +639,8 @@ int main(void)
     test_desc_cache();
     printf("\n");
     test_system_cmds();
+    printf("\n");
+    test_mon_csv();
 
     printf("\n=== %u checks, %u failures ===\n", g_checks, g_fail);
     return (g_fail == 0u) ? 0 : 1;

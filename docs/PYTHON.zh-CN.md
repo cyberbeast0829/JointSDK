@@ -12,7 +12,7 @@
 |---|---|
 | 做什么 | 参数配置、标定、状态采集、端点浏览、原型控制回路、离线仿真 |
 | 不做什么 | 硬实时控制（GIL + 调度抖动，实测 1 kHz 下落后 1~3 ms）、多线程并发访问同一 `Context` |
-| 依赖 | Python ≥ 3.9、`ctypes`。**没有** numpy 之类的硬依赖 |
+| 依赖 | Python ≥ 3.8、`ctypes`。**没有** numpy 之类的硬依赖 |
 | 后端 | 与 C 侧同一套：`virtual` / `socketcan` / `pcan` / `slcan` |
 
 **为什么用 ctypes 而不是 CFFI/扩展模块**：客户侧不需要编译器；而且共享库
@@ -139,8 +139,17 @@ vel/tau/kp/kd 取 0 —— 所以"使能瞬间"电机既不跳向残留目标也
 
 ## 6. 主站节拍与看门狗
 - `auto_keepalive=True`（默认）时，`cycle_end()` 会按 `period_ns` 自动补喂狗帧；
-- 设备的 `break_timeout` 由 `configure()` 按 `period_ns` 设定（`enable_watchdog_hint`）；
-- `j.set_watchdog_ms(0)` **不是关闭**：固件把 0 解释为 100 ms。要放宽就写大值；
+  ⚠ **只在设备侧超时 > 0 时**才补 —— `break_timeout = 0`（= 禁用）时一帧都不补；
+- 设备的 `break_timeout` 由 `configure()` 在**需要时**按 `period_ns` 设定
+  （`enable_watchdog_hint`：当前为 0 或比周期还短时才写，写完读回确认）；
+- `j.set_watchdog_ms(0)` = **关闭**设备侧协议级超时检测（最新固件语义：
+  `auto_stop_if_timeout()` 首句就是 `if (timeout_ms == 0) return;`）。
+  注意保护只在该设备**收到过控制帧后**才武装 —— 纯电流模式武装不了（固件 F19）；
+- **写后读回校验在真机上有个例外（F28）**：实机 `can.config.break_timeout` 的**读回恒为 0**
+  （写 250 立刻读也是 0，而 `0` = 禁用），所以 `set_watchdog_ms()` 把读回分成三类：
+  等于写入值（含写 0）→ 校验通过；**读回 0 而写入非 0 → 置 `StatusFlag.WATCHDOG_UNVERIFIED`、
+  保留写入值（继续喂狗是安全方向）、但返回成功**；其它值 → 报 `PROTOCOL`。
+  CLI 两版都会**独立再读一次设备**并输出 `device_reports_ms` + `verified`，不回显写入值；
 - 纯 CURRENT 模式的客户端**不会**武装设备的超时保护（固件问题 F19，见 `FIRMWARE_ISSUES.zh-CN.md`），别把它当安全兜底。
 
 ---
@@ -149,8 +158,8 @@ vel/tau/kp/kd 取 0 —— 所以"使能瞬间"电机既不跳向残留目标也
 
 | 平台 | 支持 | 加载器找的名字 | 实测 |
 |---|---|---|---|
-| Windows | ✅ | `jsdk_can.dll` / `libjsdk_can.dll` | 全套装 142 项通过 |
-| Linux | ✅ | `libjsdk_can.so` / `.so.0` / `jsdk_can.so`（另对包内 `lib/` glob 兜底） | **全套 142 项通过**（Ubuntu 20.04 / Python 3.8.10） |
+| Windows | ✅ | `jsdk_can.dll` / `libjsdk_can.dll` | **212 passed / 2 skipped**（Python 3.12） |
+| Linux | ✅ | `libjsdk_can.so` / `.so.0` / `jsdk_can.so`（另对包内 `lib/` glob 兜底） | **212 passed / 2 skipped**（Ubuntu 20.04 / Python 3.8.10） |
 | macOS | ✅（未实测） | `libjsdk_can.dylib` / `jsdk_can.dylib` | 本仓无 macOS 机器 |
 
 **Python 版本**：`>=3.8`（3.8 与 3.12 都跑通了全套装）。
@@ -174,6 +183,14 @@ vel/tau/kp/kd 取 0 —— 所以"使能瞬间"电机既不跳向残留目标也
 > 现在两道防线都在：CMake 拷成规范名 + 加载器 glob 兜底；
 > 回归用例 `tests/test_review_regressions.py::test_bundled_library_is_discoverable`。
 > 完整经过见 `BACKLOG.zh-CN.md` 的 **B9**。
+
+**输出编码（B10）**：`python -m jsdk_can` 在**控制台**上由 Python 自己按 UTF-16 写，
+中文一直是好的；但**重定向**（管道/文件）时 Python 用的是 locale 编码（中文 Windows 上
+是 cp936），与 C 版 `jsdk-cli`（重定向时写 UTF-8）**不一致**，而且输出里一旦出现
+CP936 表示不了的字符（如 `⚠`）会直接 `UnicodeEncodeError` 崩掉。
+现在 `__main__.py` 在**重定向时把 stdout/stderr 钉成 UTF-8**（控制台保持 Python 的处理）。
+回归用例：`tests/test_errors_and_cli.py::test_redirected_output_is_utf8`
+（它**故意不设** `PYTHONIOENCODING` —— 设了就把这个坑盖回去了）。
 
 ---
 
@@ -260,50 +277,104 @@ except JsdkStateError as e:          # 调用顺序不对、设备状态不允�
 
 ---
 
-## 9.1 **未暴露的 C API**（绑定不完整的地方，读之前先知道）
+## 9.1 与 C 公共 API 的对齐（**A13：已全覆盖，114/114**）
 
-Python 绑定覆盖了 112 个公共 C 函数里的 **89 个**，**23 个未绑定**。
-不列出来会让人以为"绑的跟 C 一样全"，然后在需要时白白查一圈。
+Python 绑定覆盖了公共 C API 的 **114/114 个函数，0 个未绑定**（`tools/_abi_gap.py` 可复核）：
 
-### 真实缺口（约 20 个，按需补）
+```console
+$ python tools/_abi_gap.py
+公共 API 总数        : 114
+已绑定函数总数        : 114
+未绑定（缺口）        : 0
+```
 
-| 类别 | 函数 | 现在怎么办 |
+> 上一版这份文档写的是“112 个里 89 个”（**23 个未绑定**）。那份清单已经**全部关掉**：
+> 7 个 SDO + 4 个单位/标度 + 5 个描述符缓存/回调 + 3 个 raw 逃生通道 + 1 个 slcan 统计
+> + 上下文创建/销毁 + 轮询。行为与数字都由 `bindings/python/tests/test_full_surface.py`
+> 的两个**双向**用例钉死：
+>
+> | 用例 | 做什么 | 为什么必须双向 |
+> |---|---|---|
+> | `test_all_public_functions_bound` | 扫头文件里的公共函数 → 逐个断言在 `_abi._FUNCS` 里 | 只扫源码文本会**漏掉已删除的签名**（实测：把参数删掉仍能过）—— 所以改为与 `_FUNCS` 对拍 |
+> | `test_bound_functions_are_all_public_api` | 反向：`_FUNCS` 里每个名字都必须在头文件里 | 防止绑定里留着“已经不在 C API 里”的僵尸封装 |
+
+### 新可用的能力（原来是缺口）
+
+| 能力 | Python 入口 | 说明 |
 |---|---|---|
-| **SDO 风格端点访问**（7） | `jsdk_joint_sdo_create` / `_by_name` / `_state` / `_data` / `_data_size` / `_read` / `_write` | 用 `Joint.param_get/param_set`（按路径，够用；拿不到句柄/状态机那套） |
-| **单位与标度**（4） | `jsdk_unit_scale_default` / `_calc`、`jsdk_joint_set_scale` / `get_scale` | **CAN 上基本不需要**：线上量已是物理量，`jsdk_unit_scale_default()` 是恒等映射（见 `BACKLOG.zh-CN.md` §1.2 / A12） |
-| **描述符缓存与回调**（5） | `jsdk_context_set_desc_raw_sink`、`jsdk_context_desc_import_raw`、`jsdk_context_set_desc_progress`、`jsdk_context_set_fault_callback`、`jsdk_context_desc_fetch` | `Context.configure()` 内部会取描述符（所以能跑）；但 **Python 侧用不了路线 B 原始缓存、也注册不了故障回调** —— 这两个是后续要补的重点 |
-| **raw 逃生通道**（3） | `jsdk_joint_set_target_position` / `_velocity` / `_torque` | 用物理量入口（`set_target_position_rad` 等）；raw 入口在 Python 里**故意不绑**（语义逐模式不同，容易误用） |
-| **诊断**（1） | `jsdk_hal_slcan_stats` | 用 `SlcanHal.fd_config()` / `fd_frames()`（统计接口未绑） |
+| **SDO 风格端点访问** | `Joint.sdo(path_or_ep, *, subindex, size)` → `Sdo` 对象：`.state/.data/.size/.start_read()/.start_write()/.read()/.write()/.read_value()/.write_value()` | 非阻塞启动 + 阻塞等（内部抽 `cycle_begin/end`）；`.data` 是**裸线上字节**，参数值**小端**（见 `PROTOCOL_NOTES` §3.1）；`.read_value()/.write_value()` 按 `size` 帮你解成 int/float。同一个端点会**复用**句柄（`sdo_slots_used` 可查） |
+| **单位与标度** | `units.UnitScale`、`unit_scale_default()`、`unit_scale_calc(enc, motor_rev, shaft_rev, rated)`、`Joint.set_scale()/get_scale()` | CAN 上一般不需要（线上量已是物理量，默认标度是恒等映射）——但工具类/换算场景现在不用自己手算 |
+| **描述符缓存与回调** | `Context.desc_fetch()` / `desc_poll()` / `desc_import_raw(json, crc=, fw_version=)` / `desc_raw_sink(cb)` / `desc_progress(cb)` / `on_fault(cb)` | 路线 B 全开：可拿**原始描述符字节**、可看进度、可注册故障回调（边缘触发，只变沿时回调）。回调异常会被吞掉并保留引用，不会因 GC 丢 |
+| **raw 逃生通道** | `Joint.set_position_raw()` / `set_velocity_raw()` / `set_torque_raw()` | 与物理量入口（`set_target_position_rad()` 等）并存；raw 是**逐模式语义不同**的那一层，文档里标注了风险 |
+| **诊断** | `SlcanHal.stats()` → `dict(tx, rx, malformed, acks, nacks)` | 真机掉帧/适配器问题排查用（仅 slcan 后端） |
+| **电流** | `Joint.set_current(A)` | ⚠ **不喂看门狗**（`CURRENT_CONTROL` 不在 `is_ctrl` 里，见 `FIRMWARE_ISSUES` F19）→ 需要自己周期性重发 |
 
-### 有意不暴露（符合设计，不需要补）
+### 仍然没有“必需保证”的少数（不是缺口，是构建开关）
+
+`_REQUIRED_FUNCS`（加载时**必须**找到的符号）**不含**这两类，因为它们依赖构建选项；
+绑定会按需探测，库里有就能用：
 
 | 函数 | 原因 |
 |---|---|
-| `jsdk_context_create` / `jsdk_context_free` | 堆模式（`-DJSDK_ENABLE_HEAP=ON`）；Python 自己管 `jsdk_context_storage_t` 那块内存 |
-| `jsdk_context_desc_poll` | 裸机/MCU 的轮询路径；Python 用阻塞式 `configure()` |
+| `jsdk_context_create` / `jsdk_context_free` | 堆模式（`-DJSDK_ENABLE_HEAP=ON`）；用 `Context()` 时 Python 自己管 `jsdk_context_storage_t` 那块内存 |
+| `jsdk_hal_slcan_*`（含 `stats`） | 需要编 slcan 后端；纯虚拟/socketcan 构建里没有 |
 
-> 完整清单与修法排序见 **`BACKLOG.zh-CN.md` §1.3（A13）**。
-> 本节的内容是"补文档"而不是"补功能" —— 但**不写出来就是缺陷**：
-> 读者会默认绑定是完整的。
+用途很明确：**“库比绑定旧”要在加载那一刻就报错**，而不是等用户调到某个函数才
+`AttributeError`（报错文本会直接告诉你重新 `-DJSDK_BUILD_SHARED=ON` 构建，
+或用 `JSDK_LIB_PATH` 指对文件）。
 
 ---
 
-## 10. 命令行入口（只读）
+## 10. 命令行入口（与 `jsdk-cli` 对齐，**24 个子命令**）
 
 ```bash
+# 只读类
 python -m jsdk_can scan --json
 python -m jsdk_can health
 python -m jsdk_can mon --duration 5 --json        # NDJSON
+python -m jsdk_can mon --csv > run1.csv           # CSV 到 stdout（与 C 版逐字节同列）
+python -m jsdk_can mon --csv-file run1.csv        # 额外落文件
 python -m jsdk_can read axis0.motor.config.gear_ratio --json
+python -m jsdk_can batch-read a b c --json
 python -m jsdk_can dump-config --json
 python -m jsdk_can desc-info --json
 python -m jsdk_can ep-list --filter mit_max_ --json
 python -m jsdk_can ep-lookup axis0.config.can.node_id --json
+python -m jsdk_can desc-export desc.bin
+
+# 写类：**需要 --yes**
+python -m jsdk_can write --yes axis0.config.can.heartbeat_rate_ms 100 --json
+python -m jsdk_can watchdog --yes 250 --json
+python -m jsdk_can save --yes
+python -m jsdk_can set-node-id --yes 2
+python -m jsdk_can reset --yes
+python -m jsdk_can set-zero --yes
+python -m jsdk_can calibrate --yes                  # 会动电机
+python -m jsdk_can home --yes                       # 会动电机
+
+# 驱动：--yes **且** --hold（秒，1~60）
+python -m jsdk_can mit --yes --hold 2 --pos 0.5 --kp 1 --kd 0.1 --tau 0
+
+# 急停：广播、**不需要** --yes（安全动作不能因为少个参数而失败）
+python -m jsdk_can estop
 ```
 
-**只读**：写类子命令（`write`/`mit`/`save`/`set-zero`/`calibrate`）**根本没注册** ——
-不是"有但被禁"，用 `--help` 也看不到。要让设备动作请用 `jsdk-cli`（C 实现，带
-`--yes`/`--hold` 安全闸）。全局选项写在子命令之前或之后都可以。
+### 与 C 版 `jsdk-cli` 的契约（同一份，不是“差不多”）
+
+| 项 | 规则 |
+|---|---|
+| 退出码 | `0` 成功 / `1` 运行时错误 / `2` 用法错误 / `3` 被安全闸拦住 |
+| 安全闸 | `write`/`watchdog`/`save`/`set-node-id`/`reset`/`set-zero`/`calibrate`/`home`/`mit` 需要 `--yes`；`mit` 还要 `--hold ∈ [1,60]`；**`estop` 不需要** |
+| 描述符档位 | 无描述符即可跑：`scan`/`info`/`err`/`hb-dump`/`estop`/`desc-import`；仅需描述符：`read`/`batch-read`/`write`/`save`/`set-node-id`/`reset`/`desc-info`/`desc-export`/`ep-list`/`ep-lookup`；需要完整配置（含标定才能解析的端点）：`health`/`dump-config`/`watchdog`/`mon`/`set-zero`/`calibrate`/`home`/`mit` |
+| `--json` 字段 | 与 C 版**逐字段对齐**（有测试：`test_cli_json_field_parity_with_c_cli`） |
+| 闸的顺序 | **先判闸、后开总线** —— 少了 `--yes` 的写命令在虚拟后端/没接硬件时也要得到 `3`，而不是“连不上” |
+
+两版入口都对**同一份** `_COMMAND_SMOKE`（24 条，每个子命令一条）跑虚拟后端冒烟：
+`test_every_subcommand_runs_on_virtual`（Python）与
+`test_every_subcommand_runs_on_virtual_c_cli`（C）。
+
+> 已知差异（都有测试注明）：① C 版 `mon` 在虚拟后端**不受墙钟约束**（虚拟时钟由循环驱动），所以 C 侧冒烟跳过 `mon`；
+> ② `hb-dump` 的“原始字节”输出只在虚拟后端有（真机后端拿不到原始帧）。
 
 ---
 
@@ -318,8 +389,11 @@ JSDK_LIB_PATH=/path/to/bsh python -m pytest bindings/python/tests -q
 | `test_abi.py` | ABI 自检、枚举数值与 C 侧逐项比对、库查找 |
 | `test_lifecycle.py` | 生命周期、`configure`、`activate`/`deactivate`、描述符 |
 | `test_joint.py` | 反馈解析、MIT 编码回读、参数类型、运维命令 |
-| `test_errors_and_cli.py` | 状态码↔异常、真实错误映射、`python -m jsdk_can` 子进程冒烟 |
+| `test_wide_params.py` | 8 字节参数读（分段）、线上原始字节按小端断言 |
+| `test_slcan_fd.py` | slcan 编码器（四个帧前缀、FD DLC 码）与真机后端构造 |
+| `test_errors_and_cli.py` | 状态码↔异常、真实错误映射、`python -m jsdk_can` 子进程冒烟与**安全闸** |
 | `test_review_regressions.py` | 自审发现的回归（`pace()` 指标、必需符号、加载异常家族） |
+| `test_full_surface.py` | **A13 覆盖面守卫**：114/114 绑定（双向核对 `_abi._FUNCS` ↔ 头文件）、SDO/单位标度/描述符回调/故障回调、**24 个子命令的虚拟后端冒烟**（Python 与 C 各一遍）、与 C 版的 JSON 字段对拍 |
 
 全部使用 `virtual` 后端，**不需要硬件**。`JSDK_BUILD_SHARED=ON` 且装了 pytest 时，
 CMake 会把它注册成 ctest 目标 `python_bindings`，于是 `ctest` 一条命令跑完 C + Python。

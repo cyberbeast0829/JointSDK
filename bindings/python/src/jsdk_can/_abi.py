@@ -337,11 +337,39 @@ class AbiType(ctypes.Structure):
     ]
 
 
+class DescHint(ctypes.Structure):
+    """``jsdk_desc_hint_t`` —— 原始 JSON 缓存（路线 B）的失效键。
+
+    ⚠ C 的 ``jsdk_abi_types()`` **不报**这个类型的尺寸，所以它不在 :data:`TYPE_MAP`
+    里；布局由测试显式断言（``sizeof == 8``：u16 + 2 字节填充 + u32）。
+    """
+
+    _fields_ = [
+        ("crc", c_uint16),
+        ("fw_version", c_uint32),
+    ]
+
+
 #: ``jsdk_endpoint_visit_fn``。**唯一**允许的 ctypes 回调：它只在配置阶段
 #: （`enumerate`）被逐条调用，不在控制回路上，因此 GIL 开销可接受。
 ENDPOINT_VISIT_FN = ctypes.CFUNCTYPE(
     c_int, c_void_p, c_char_p, c_uint16, c_int, c_uint8
 )
+
+#: ``jsdk_desc_raw_sink_fn``：下载时把**解析前**的原始 JSON 字节 tee 给应用。
+#: 只在配置阶段调用，**允许阻塞**（典型用法是写 Flash）；返回非 0 = 放弃 tee。
+#: 参数：``(ctx, data, len, offset, user)``。
+#: ⚠ ``data`` 只在回调期间有效 —— 必须立即复制，不能存地址。
+DESC_RAW_SINK_FN = ctypes.CFUNCTYPE(c_int, c_void_p, c_void_p, c_size_t,
+                                    c_uint32, c_void_p)
+
+#: ``jsdk_desc_progress_fn``：下载进度；配置阶段调用。
+DESC_PROGRESS_FN = ctypes.CFUNCTYPE(None, c_void_p, c_uint32, c_uint32, c_void_p)
+
+#: ``jsdk_fault_callback_t``：故障**边沿**回调（0→1 只报一次）。
+#: ⚠ 它在 ``poll()`` / ``cycle_end()``（控制路径）里被调用：回调里不要做重活，
+#:   且**不得**重入 SDK。硬实时场景请改用轮询 ``is_fault()`` / ``fault_info()``。
+FAULT_CALLBACK_FN = ctypes.CFUNCTYPE(None, c_void_p, POINTER(FaultInfo), c_void_p)
 
 
 # 名称 → ctypes 类型的映射，用于自检
@@ -445,6 +473,22 @@ def library_search_path() -> list[str]:
     return uniq
 
 
+_CACHED_LIB: ctypes.CDLL | None = None
+
+
+def lib() -> ctypes.CDLL:
+    """进程内**缓存**的库句柄。
+
+    给不需要上下文的纯函数用（例如 :func:`jsdk_can.units.unit_scale_calc`）——
+    ``load_library()`` 本身不缓存，每次都 dlopen 一遍；在热路径上调用它的
+    包装函数会白白重复加载。
+    """
+    global _CACHED_LIB
+    if _CACHED_LIB is None:
+        _CACHED_LIB = load_library()
+    return _CACHED_LIB
+
+
 def load_library(path: str | None = None) -> ctypes.CDLL:
     """加载共享库。``path`` 为 None 时按 :func:`library_search_path` 依次尝试。"""
     from .errors import LibraryNotFoundError
@@ -498,10 +542,15 @@ _FUNCS: dict[str, tuple[list, object]] = {
                                   POINTER(c_uint32)], None),
     "jsdk_hal_slcan_fd_frames": ([c_void_p, POINTER(c_uint32),
                                   POINTER(c_uint32)], None),
+    "jsdk_hal_slcan_stats": ([c_void_p, POINTER(c_uint32), POINTER(c_uint32),
+                              POINTER(c_uint32), POINTER(c_uint32),
+                              POINTER(c_uint32)], None),
     "jsdk_hal_close": ([c_void_p], c_int),
     # --- 生命周期 ---
     "jsdk_context_config_default": ([POINTER(ContextConfig)], None),
     "jsdk_context_init": ([c_void_p, POINTER(ContextConfig)], c_int),
+    "jsdk_context_create": ([POINTER(ContextConfig)], c_void_p),   # 堆模式（需库开了 heap）
+    "jsdk_context_free": ([c_void_p], None),
     "jsdk_context_add_joint": ([c_void_p, POINTER(JointConfig),
                                 POINTER(c_void_p)], c_int),
     "jsdk_context_configure": ([c_void_p], c_int),
@@ -537,9 +586,19 @@ _FUNCS: dict[str, tuple[list, object]] = {
     "jsdk_joint_set_mit_stiffness": ([c_void_p, c_double, c_double,
                                       c_double, c_double, c_double], None),
     "jsdk_joint_set_limits": ([c_void_p, c_double, c_double], None),
+    "jsdk_joint_set_current_A": ([c_void_p, c_double], None),
+    "jsdk_joint_set_target_position": ([c_void_p, c_int32], None),
+    "jsdk_joint_set_target_velocity": ([c_void_p, c_int32], None),
+    "jsdk_joint_set_target_torque": ([c_void_p, c_int16], None),
+    "jsdk_joint_set_scale": ([c_void_p, POINTER(UnitScale)], None),
+    "jsdk_joint_get_scale": ([c_void_p, POINTER(UnitScale)], None),
+    "jsdk_unit_scale_default": ([POINTER(UnitScale), c_uint32], None),
+    "jsdk_unit_scale_calc": ([POINTER(UnitScale), c_uint32, c_uint32, c_uint32,
+                              c_uint32], None),
     "jsdk_joint_hold_position": ([c_void_p], None),
     "jsdk_joint_hold_position_pd": ([c_void_p, c_double, c_double], None),
     # --- 运维 ---
+    "jsdk_context_set_fault_callback": ([c_void_p, c_void_p, c_void_p], None),
     "jsdk_joint_set_zero_here": ([c_void_p], c_int),
     "jsdk_joint_calibrate": ([c_void_p], c_int),
     "jsdk_joint_home": ([c_void_p], c_int),
@@ -570,12 +629,31 @@ _FUNCS: dict[str, tuple[list, object]] = {
     "jsdk_joint_param_set_u32": ([c_void_p, c_char_p, c_uint32], c_int),
     "jsdk_joint_param_get_i32": ([c_void_p, c_char_p, POINTER(c_int32)], c_int),
     "jsdk_joint_param_get_bool": ([c_void_p, c_char_p, POINTER(c_int)], c_int),
+    # --- 参数：SDO 风格槽位（可拿裸字节 + 轮询状态机）---
+    "jsdk_joint_sdo_create": ([c_void_p, c_uint16, c_uint8, c_size_t], c_int),
+    "jsdk_joint_sdo_create_by_name": ([c_void_p, c_char_p], c_int),
+    "jsdk_joint_sdo_state": ([c_void_p, c_int], c_int),
+    "jsdk_joint_sdo_data": ([c_void_p, c_int], c_void_p),
+    "jsdk_joint_sdo_data_size": ([c_void_p, c_int], c_size_t),
+    "jsdk_joint_sdo_read": ([c_void_p, c_int], c_int),
+    "jsdk_joint_sdo_write": ([c_void_p, c_int], c_int),
     # --- 分组 ---
     "jsdk_group_set_mit": ([c_void_p, POINTER(GroupTarget), c_int], c_int),
     "jsdk_group_enable": ([c_void_p, POINTER(c_uint8), c_int], c_int),
     "jsdk_group_disable": ([c_void_p, POINTER(c_uint8), c_int], c_int),
     # --- 描述符 ---
     "jsdk_context_get_desc_info": ([c_void_p, POINTER(DescInfo)], c_int),
+    "jsdk_context_desc_fetch": ([c_void_p], c_int),
+    "jsdk_context_desc_poll": ([c_void_p, c_uint64], c_int),
+    "jsdk_context_desc_import_raw": ([c_void_p, c_void_p, c_size_t,
+                                       POINTER(DescHint)], c_int),
+    # ⚠ 回调参数声明成 `c_void_p`（而不是 CFUNCTYPE 类）：C API 允许传 NULL 取消注册，
+    #   而 ctypes 对 CFUNCTYPE 类声明的参数**不接受 None**（ArgumentError:
+    #   expected CFunctionType instance instead of NoneType）。调用方用
+    #   `ctypes.cast(fn, c_void_p)` 传真实回调 —— 类型检查少一点，但“能取消”
+    #   对这几个 setter 是硬需求。
+    "jsdk_context_set_desc_raw_sink": ([c_void_p, c_void_p, c_void_p], None),
+    "jsdk_context_set_desc_progress": ([c_void_p, c_void_p, c_void_p], None),
     "jsdk_endpoint_lookup": ([c_void_p, c_char_p, POINTER(c_uint16),
                               POINTER(c_int), POINTER(c_uint8)], c_int),
     "jsdk_endpoint_enumerate": ([c_void_p, ENDPOINT_VISIT_FN, c_void_p], c_int),
@@ -604,6 +682,28 @@ _REQUIRED_FUNCS = (
     "jsdk_context_cycle_end",
     "jsdk_context_add_joint",
     "jsdk_context_configure",
+    # --- A13：以下符号也是 0.1.0 公开 ABI 的一部分（无条件编译进共享库），
+    #     所以“库比绑定旧”必须当场报出来，而不是等用户调到才 AttributeError。
+    #     ⚠ **不包含**需要特殊构建开关的少数：`jsdk_context_create/free`
+    #     （JSDK_ENABLE_HEAP）与 `jsdk_hal_slcan_*`（要编 slcan 后端）——
+    #     它们在各自的封装里按需探测。
+    "jsdk_context_desc_fetch",
+    "jsdk_context_desc_poll",
+    "jsdk_context_desc_import_raw",
+    "jsdk_context_set_desc_raw_sink",
+    "jsdk_context_set_desc_progress",
+    "jsdk_context_set_fault_callback",
+    "jsdk_joint_sdo_create",
+    "jsdk_joint_sdo_create_by_name",
+    "jsdk_joint_sdo_state",
+    "jsdk_joint_sdo_data",
+    "jsdk_joint_sdo_data_size",
+    "jsdk_joint_sdo_read",
+    "jsdk_joint_sdo_write",
+    "jsdk_unit_scale_default",
+    "jsdk_unit_scale_calc",
+    "jsdk_joint_set_scale",
+    "jsdk_joint_get_scale",
 )
 
 

@@ -273,3 +273,20 @@ class SlcanHal(Hal):
         self._lib.jsdk_hal_slcan_fd_frames(self.handle, ctypes.byref(tx),
                                           ctypes.byref(rx))
         return int(tx.value), int(rx.value)
+
+    def stats(self) -> dict:
+        """线级计数：``tx`` / ``rx`` / ``malformed`` / ``acks`` / ``nacks``。
+
+        排障顺序（真机经验）：``acks == 0`` 说明**适配器连命令都没应答**
+        （打开序列没生效 —— 那会让"打开后第一个请求"永远丢，见 `BACKLOG` L7）；
+        ``malformed`` 持续增长说明串口上有非 slcan 行（波特率不对/别的工具在抢）；
+        ``nacks`` 说明适配器拒绝了某条命令（例如它不认识 ``Y``）。
+        """
+        out = {"tx": 0, "rx": 0, "malformed": 0, "acks": 0, "nacks": 0}
+        if not hasattr(self._lib, "jsdk_hal_slcan_stats"):
+            return out                # 旧库/未编 slcan 后端：不该因此挂掉
+        vals = [ctypes.c_uint32(0) for _ in range(5)]
+        self._lib.jsdk_hal_slcan_stats(self.handle, *[ctypes.byref(v) for v in vals])
+        for k, v in zip(out, vals):
+            out[k] = int(v.value)
+        return out

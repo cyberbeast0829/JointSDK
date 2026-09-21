@@ -155,6 +155,65 @@ void cb_be_put_f32(uint8_t *b, float v)
     cb_be_put_u32(b, w);
 }
 
+/* --------------------------------------------------------------------------
+ * 小端存取器：**只用于参数值** —— 理由见 cb_frame.h（固件 memcpy 主机序）。
+ * ------------------------------------------------------------------------ */
+
+uint16_t cb_le_get_u16(const uint8_t *b);   /* 定义在文件后面（原有实现） */
+
+int16_t cb_le_get_i16(const uint8_t *b)
+{
+    return (int16_t)cb_le_get_u16(b);
+}
+
+uint32_t cb_le_get_u32(const uint8_t *b);   /* 定义在文件后面（原有实现） */
+
+int32_t cb_le_get_i32(const uint8_t *b)
+{
+    return (int32_t)cb_le_get_u32(b);
+}
+
+uint64_t cb_le_get_u64(const uint8_t *b)
+{
+    return (uint64_t)cb_le_get_u32(b)
+         | ((uint64_t)cb_le_get_u32(b + 4) << 32);
+}
+
+float cb_le_get_f32(const uint8_t *b)
+{
+    uint32_t w = cb_le_get_u32(b);
+    float    f;
+    memcpy(&f, &w, sizeof f);      /* 位模式搬移，避免对齐/别名问题 */
+    return f;
+}
+
+void cb_le_put_u16(uint8_t *b, uint16_t v);  /* 定义在文件后面（原有实现） */
+
+void cb_le_put_i16(uint8_t *b, int16_t v)
+{
+    cb_le_put_u16(b, (uint16_t)v);
+}
+
+void cb_le_put_u32(uint8_t *b, uint32_t v);  /* 定义在文件后面（原有实现） */
+
+void cb_le_put_i32(uint8_t *b, int32_t v)
+{
+    cb_le_put_u32(b, (uint32_t)v);
+}
+
+void cb_le_put_u64(uint8_t *b, uint64_t v)
+{
+    cb_le_put_u32(b, (uint32_t)(v));
+    cb_le_put_u32(b + 4, (uint32_t)(v >> 32));
+}
+
+void cb_le_put_f32(uint8_t *b, float v)
+{
+    uint32_t w;
+    memcpy(&w, &v, sizeof w);
+    cb_le_put_u32(b, w);
+}
+
 uint16_t cb_le_get_u16(const uint8_t *b)
 {
     return (uint16_t)(((uint16_t)b[1] << 8) | (uint16_t)b[0]);

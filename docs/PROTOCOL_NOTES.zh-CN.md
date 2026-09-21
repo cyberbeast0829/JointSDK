@@ -129,8 +129,9 @@ isClassic = (odrv.can_.config_.baud_rate <= 1000000);
 
 | 约定 | 说明 |
 |---|---|
-| 字节序 | **Big-Endian**（Motorola）。`f32` 也是 BE（IEEE-754 原样 4 字节反序放置） |
-| 唯一例外 | JSON 描述符相关的 `offset / totalLen / crc / chunkOffset` 全为 **Little-Endian** |
+| 帧字段字节序 | **Big-Endian**（Motorola）。CAN ID 位域、`ep_id`、`offset`、`ReqLen`、查询/状态响应（`0x40`/`0x46`/`0x49`）、控制帧的定点与浮点全是 BE。`f32` 也是 BE（IEEE-754 原样 4 字节反序放置） |
+| ⚠ 参数值字节序 | **Little-Endian**（第二个例外，**实测修正**）—— `PARAM_READ(0x20)` / `PARAM_WRITE(0x21)` 的**值字节**（单读响应、批量值流、写请求载荷）是小端。证据与实测见 **§3.1** |
+| JSON 描述符 | 相关的 `offset / totalLen / crc / chunkOffset` 全为 **Little-Endian**（第三个例外） |
 | `f32` 编解码 | `float → memcpy → be_bytes[0..3] = (w>>24, >>16, >>8, &0xFF)`；解码反向 |
 | MIT 定点 | 见 §4.1，注意 `kp/kd` 是**无符号**范围 `[0, MAX]` |
 | 温度 | `u8`，实际 °C = `值 − 50`，固件钳位到 0..255（即 −50..205 °C） |
@@ -153,6 +154,62 @@ static void cb_f32_to_be(float v, uint8_t *b)
     b[2] = (uint8_t)(w >>  8); b[3] = (uint8_t)(w);
 }
 ```
+
+---
+
+### 3.1 ⚠ 参数值的字节序：小端（实测修正，2026-09-20）
+
+**结论**：`0x20` / `0x21` 的**值字节是小端**，不是大端。上面表格里的
+“Big-Endian”只对**帧字段**成立。本节是**修订说明**：协议文档（含上游
+`ODrive/docs/cyberbeast-protocol.md:45` 的 P7 与 `:326`–`:328` 的“约定”）
+写的“全协议 Big-Endian”与真机不符。
+
+**固件证据**（`ODrive` @ `4ff46135`，`Firmware/communication/can/can_cyberbeast.cpp`）：
+
+| 位置 | 代码 | 含义 |
+|---|---|---|
+| `cmd_param_read()` `:613`–`:615`、`:631` | `cbufptr_t input_buffer{value_buf, 0}` → `endpoint_handler(...)` → `std::memcpy(&txmsg.buf[4], &value_buf[offset], actual_data_len)` | 端点内存**原样**进载荷 |
+| `cmd_param_read_batch()` `:689`–`:693` | 同上（逐端点 `endpoint_handler` 后紧密拼接） | 批量值流同样是小端 |
+| `cmd_param_write()` `:765`–`:768` | `cbufptr_t input_buffer{&msg.buf[4], size_t(data_len)}` → `endpoint_handler(...)` | 载荷**原样**写回端点内存 |
+| `cmd_param_write_segmented()` `:790` | 分段写复用同一条路径 | 分块拼接后同样是小端 |
+
+`endpoint_handler()` 是**内存序列化**，不做字节序归一；目标是 ARM Cortex-M（小端），
+所以线上就是小端。控制帧/查询响应里的“大端”是固件**手写拆字节**的结果
+（`float_to_uint`、`float_to_big_endian_bytes` 等）—— 与参数通路是**两套代码**，
+所以这个不一致是真实的、且稳定的。
+
+**真机实测**（slcan + CANable，node 1，`fw_version = 1544`）：
+
+| 端点 | 线上原始字节 | 按大端解 | 按**小端**解 | 真值 |
+|---|---|---|---|---|
+| `axis0.config.can.node_id`（180, u32） | `01 00 00 00` | 16777216 | **1** | 1 |
+| `axis0.config.can.heartbeat_rate_ms`（182, u32） | `64 00 00 00` | 1677721600 | **100** | 100 |
+| `axis0.motor.config.gear_ratio`（242, f32） | `00 00 F8 40` | 8.90553e-41 | **7.75** | 7.75 |
+| `0x46` 查询响应的 `fw_version` | `00 00 06 08` | **1544** | 134610944 | 1544 |
+
+最后一行是**反证**：同一台设备上，查询响应必须按大端解才合理 —— 所以不是“整个协议
+都反了”，而是“**参数通路与帧字段是两套字节序**”。
+
+前两行还与**修复前的症状**数值吻合，可以直接当交叉验证用：
+改前 `read` 打印的 `8.90553e-41` **正是** `00 00 F8 40` 按大端解的结果（浮点位模式精确对应，
+误差 0.0000%），而它按小端解就是改后读到的 `7.75` —— 即“修复后的值”与“修复前的垃圾值”
+互为字节反序，不是“调到好看了”。
+
+> ⚠ 顺便纠正一个**夹具引起的错觉**：项目夹具里 `gear_ratio` 一直是 **16.5**，
+> 文档里也拿 16.5 当参照（本表初稿就写错过）。真机的值是 **7.75**。
+> 凡是“物理量换算/刚度/限幅”类结论，最终必须以**真机读回的标定值**为准。
+
+**影响面**：`read` / `batch-read` / `dump-config` / `configure()` 的标定读取
+（`gear_ratio`、`cpr`、`pole_pairs`、`torque_constant`、`mit_max_*`）/ SDO 缓冲区 /
+Python `param_get`。读错字节序**不报错**，只会得到“看着像数值”的垃圾
+（如 `gear_ratio = 8.9e-41`），而标定检查会把它当成“参数超范围”，
+把矛头指向标定解析（本项目就踩过：一度以为真机固件与描述符对不上）。
+
+**处理方式（本 SDK，不改固件）**：值编解码统一走 `cb_le_get_*()` / `cb_le_put_*()`
+（`src/proto_cyberbeast/cb_frame.c`，说明与证据注释在 `cb_frame.h`），
+帧字段继续用 `cb_be_*()`。回归用例把线上**原始字节**钉死在 `tests/test_hal_virtual.c`
+的 `[7] param access`（`node_id` 读到 `01 00 00 00`、批量值流 `64 00` / `00 20 00 00`、
+分段写分块字节）。固件侧已登记为 **F27**（`FIRMWARE_ISSUES.zh-CN.md`）。
 
 ---
 
@@ -451,7 +508,7 @@ motor.config.torque_lim = cur_limit_A × torque_constant   ← ⚠ 持久改写
 > ❌ **两个曾经写错的结论，已按源码逐行核实：**
 >
 > **(a) 不是“不喂看门狗”。** 固件 `do_command()` 开头就**无条件**调
-> `axis.watchdog_feed()`，**任何**发往该设备的帧都喂 ODrive 自身的看门狗。
+> `axis.watchdog_feed()`，**任何**发往该设备的帧都喂驱动器自身的看门狗。
 > 那是**另一套**机制（`axis.config_.watchdog_timeout`），与下面这个协议级
 > 超时（`can.config.break_timeout`）互不相干。
 >
@@ -519,7 +576,7 @@ motor.config.torque_lim = cur_limit_A × torque_constant   ← ⚠ 持久改写
 [0]     flags      bit7 = 0x80 → 还有后续段
 [1..2]  ep_id      u16 BE
 [3]     data_len   u8，本段返回字节数
-[4..]   value      本段数据
+[4..]   value      本段数据（**值字节 = 小端**，见 §3.1）
 ```
 
 主站循环：`offset += data_len`，直到响应 `flags.bit7 == 0`。
@@ -544,7 +601,8 @@ motor.config.torque_lim = cur_limit_A × torque_constant   ← ⚠ 持久改写
 [1]     count
 [2..]   valid_bitmap：⌈N/8⌉ 字节，bit=0 表示该端点无效
 [..]    value 流：按请求顺序紧密排列，**无回显**；
-       无效端点不贡献任何字节（保持流对齐）
+        每个值的字节序 = **小端**（同 §3.1）；
+        无效端点不贡献任何字节（保持流对齐）
 ```
 
 **错误语义**：
@@ -567,7 +625,7 @@ motor.config.torque_lim = cur_limit_A × torque_constant   ← ⚠ 持久改写
 [0]     flags      (Classic 分段时 bit7 = More)
 [1..2]  ep_id      u16 BE
 [3]     len        u8，本段值字节数
-[4..]   value      本段值（BE）
+[4..]   value      本段值（**小端**，见 §3.1）
 ```
 
 **ACK**（8 B）：
@@ -736,13 +794,20 @@ motor.config.torque_lim = cur_limit_A × torque_constant   ← ⚠ 持久改写
 /* can_cyberbeast.cpp: auto_stop_if_timeout() —— 由 service_stack() 每 1 ms 调用 */
 if (last_cmd_time_[i] == 0) return;             /* 从未收到过控制帧 → 不检查 */
 uint32_t timeout_ms = odrv.can_.config_.break_timeout;
-if (timeout_ms == 0) timeout_ms = 100;          /* ⚠ 0 不是"关闭"，是 100 ms */
+if (timeout_ms == 0) return;                    /* ⚠ 0 = **超时检测被禁用** */
 if (now - last_cmd_time_[i] > timeout_ms) {
     axis.error_ |= Axis::ERROR_CAN_BUS_FAILED;
     axis.motor_.disarm();
     last_cmd_time_[i] = 0;                      /* 防止重复触发 */
 }
 ```
+
+> ⚠⚠ **`0` = 禁用（本项曾在项目早期写反）**。最新固件就是上面这四行：`timeout_ms == 0`
+> **直接 return**，而且 `ODriveCAN::Config_t::break_timeout` 的**默认值就是 0**
+> （`odrive_can.hpp`）⇒ 设备出厂状态是“**没有协议级超时保护**”。
+> 早期固件确实把 0 当 100 ms，当时 SDK 也跟着把 0 归一成 100 ms，
+> 结果把“未武装”显示成了“已武装 100 ms”（已修正，见 SDK 侧影响一节）。
+> 另注：`odrive_can.cpp` 的 Simple/Canopen 路径也是 `if (config_.break_timeout > 0)`。
 
 **哪些帧喂狗**（`is_ctrl`）：
 
@@ -777,9 +842,23 @@ if (has_ctrl_frame_this_cycle) {
 ```
 
 **配置阶段检查**（`configure()`）：
-- 若 `period_ns` 已知且 `period_ms >= watchdog_ms` → 返回 `JSDK_ERR_BAD_STATE`
+- 若 `period_ns` 已知 **且设备侧超时 > 0**（`wd != JSDK_WD_DISABLED_MS`）且
+  `period_ms >= watchdog_ms` → 返回 `JSDK_ERR_BAD_STATE`
   （控制回路本身就不可能喂住狗，必须让客户先放大 `break_timeout` 或缩短周期）。
-- `enable_watchdog_hint = 1` 时由 SDK 写 `break_timeout = 2 × period_ms`（不落 Flash）。
+  ⚠ `wd == 0`（禁用）时**必须跳过这条** —— 拿 0 去比会恒真，把每个循环命令都拒掉。
+- `enable_watchdog_hint = 1` 且**需要时**（当前为 0 = 禁用，或现有超时比周期还短）
+  由 SDK 写 `break_timeout = 2 × period_ms`（不落 Flash），写完**读回确认**；
+  设备本来设得很宽松时**不碰**它（把 30000 ms 改成 2×周期只会让设备更容易被误停）。
+
+**SDK 侧影响（v0.25 修正）**：
+
+| 位置 | 旧行为（错） | 新行为 |
+|---|---|---|
+| `jsdk_watchdog_device_ms()` | `0 → 100` | **原样返回 0**（调用方把 0 当“没有门限”） |
+| `auto_keepalive` | 总在补帧 | `wd == 0` 时**一帧不补**（无狗可喂，也不置 RISK 位） |
+| `configure()` 的周期校验 | `period >= 100` 会被拒 | `wd == 0` ⇒ **跳过校验** |
+| `set_watchdog_ms(0)` | 警告“0 不等于关闭” | **真的关闭**（并读回确认） |
+| `dump-config` 的 `break_timeout_ms` | 显示 100（与 `read` 显示 0 矛盾） | 显示 **0 = 禁用**，与 `read` 一致 |
 
 ---
 
@@ -1071,7 +1150,7 @@ sequenceDiagram
 | # | 检查项 | 为什么 |
 |---|---|---|
 | 1 | 只用 29-bit 扩展帧；丢弃 RTR | 固件 `handle_can_message` 直接 return |
-| 2 | 所有多字节量按 **Big-Endian**；**JSON 描述符例外用小端** | 唯一容易搞反的地方 |
+| 2 | 帧字段按 **Big-Endian**；**参数值（0x20/0x21）是小端**；JSON 描述符字段也是小端 | 两处字节序例外，最容易搞反的地方（见 §3.1） |
 | 3 | `is_fd` 与设备 `baud_rate` 必须匹配，且**无法协商** | 不匹配 = 静默无响应 |
 | 4 | 回复按 `(Source, Priority, MsgType)` 分派，容忍"未请求的 MIT 响应" | `0x00/0x01/0x02/0x03/0x40/0x49` 回复全是 `0x00` |
 | 5 | 不依赖 `Seq` 做丢包检测 | 字段存在但无人校验 |
@@ -1080,7 +1159,7 @@ sequenceDiagram
 | 8 | 心跳与 `0x41` 是**电机端 turns**，需 `× 2π / gear_ratio` | 与 MIT 响应坐标系不同 |
 | 9 | 广播帧长度 ≥ `(max_node_id + 1) × 8` | 否则设备丢弃整帧 |
 | 10 | node_id ≥ 8 不做位掩码广播 / MIT 广播 | 固件直接 return |
-| 11 | 看门狗：只有 `≤0x03` 与 `0x80..0x83` 喂狗；`0` 不等于关闭 | 默认 100 ms 生效 |
+| 11 | 看门狗：只有 `≤0x03` 与 `0x80..0x83` 喂狗；**`0` = 禁用**（不是 100 ms） | 设备默认就是 0 ⇒ 出厂无保护，要主站武装 |
 | 12 | `configure()` 前先发握手帧，否则收不到心跳 | 设备不知道 master_id |
 | 13 | `master_id` 不得为 0 | 设备完全不回复 |
 | 14 | Classic 参数写 >4 B 必须分段，且装配期间不插入其他写 | 设备会中止装配 |
@@ -1150,7 +1229,7 @@ PY
 |---|---|
 | 完全没有任何响应 | `master_id = 0`；`is_fd` 与设备 `baud_rate` 不匹配；`node_id` 设成了 0；CAN 链路未 up；终端电阻 |
 | 收不到心跳但单播查询正常 | 设备还没从本机收到过帧（master_id 未学习）；或 `heartbeat_rate_ms = 0` |
-| 使能后 ~100 ms 就报错停机 | `break_timeout` 默认值生效，控制帧没喂上；或用了 `CURRENT_CONTROL` 以为在喂狗 |
+| 使能后 ~100 ms 就报错停机 | 设备侧 `break_timeout` **已武装**（非 0），而控制帧没喂上；或用了 `CURRENT_CONTROL` 以为在喂狗。注意**默认是 0 = 禁用**，所以“会停机”说明有人（或 `enable_watchdog_hint`）把它打开了 |
 | 力矩明显比预期大 2~3 倍 | `kp/kd` 量纲问题（§4.1 / 坑 1） |
 | 电流读数始终为 ±40 附近跳动 | 未读 `torque_constant`，用了回退量程 |
 | 多关节广播有的关节不动 | 帧长不足 `(max_node_id+1)×8`；或 node_id ≥ 8；或 `Dest` 位图漏了该位 |

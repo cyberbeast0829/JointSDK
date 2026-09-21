@@ -18,7 +18,8 @@ import jsdk_can
 
 #: 虚拟设备里 serial_number 是固定常量
 SERIAL = 0x1122334455667788
-SERIAL_BYTES = SERIAL.to_bytes(8, "big")
+#: 参数值在线上是**小端**（设备端 memcpy 主机序；见 cb_frame.h 的 cb_le_* 说明）
+SERIAL_BYTES = SERIAL.to_bytes(8, "little")
 
 #: MsgType 在 CAN ID 里的位置（见 PROTOCOL_NOTES §1）
 _MSGTYPE_SHIFT = 18
@@ -116,7 +117,7 @@ def test_classic_wide_value_is_not_truncated(ctx_joint_classic):
     """
     ctx, j = ctx_joint_classic
     raw = j.param_get("serial_number")
-    assert raw != int.from_bytes(SERIAL_BYTES[:4] * 2, "big")
+    assert raw != int.from_bytes(SERIAL_BYTES[:4] * 2, "little")
     assert raw == SERIAL
 
 

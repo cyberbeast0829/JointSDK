@@ -812,8 +812,8 @@ static void test_multi_context(void)
         CHECK_EQ(ep_a, 193u);
         CHECK_EQ(ep_b, 193u);
 
-        cb_be_put_u64(v_a, 0x1111222233334444ull);
-        cb_be_put_u64(v_b, 0xAAAABBBBCCCCDDDDull);
+        cb_le_put_u64(v_a, 0x1111222233334444ull);      /* 参数值 = 小端 */
+        cb_le_put_u64(v_b, 0xAAAABBBBCCCCDDDDull);
 
         /* 交错发块：A 的半块 → B 的半块 → A 的整块 → B 的整块。
            若装配器是共享的，两边都会拿到对方的字节。 */
@@ -854,9 +854,10 @@ static void test_multi_context(void)
             (void)req;
             CHECK_EQ(jsdk_ctx_read_param(a.ctx, 1u, ep_a, buf, &len, 0u), JSDK_OK);
             CHECK_EQ(len, 4u);          /* Classic 单读只回 4 B */
-            CHECK_EQ(cb_be_get_u32(buf), 0x11112222u);
+            /* 偏移 0 = 低 4 字节（小端） */
+            CHECK_EQ(cb_le_get_u32(buf), 0x33334444u);
             CHECK_EQ(jsdk_ctx_read_param(b.ctx, 1u, ep_b, buf, &len, 0u), JSDK_OK);
-            CHECK_EQ(cb_be_get_u32(buf), 0xAAAABBBBu);
+            CHECK_EQ(cb_le_get_u32(buf), 0xCCCCDDDDu);
         }
         printf("      interleaved segmented writes: assemblers are per-bus "
                "(no cross-talk)\n");

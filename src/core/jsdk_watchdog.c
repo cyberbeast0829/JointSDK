@@ -8,15 +8,20 @@
  *    `do_command()` 开头**无条件** `axis.watchdog_feed()` —— 任何发往该设备的帧
  *    都喂它。所以"帧够不够多"不是问题，"有没有帧"才是。
  *
- * 2. **协议级 CAN 超时**（`can.config.break_timeout`，默认 100 ms）：
+ * 2. **协议级 CAN 超时**（`can.config.break_timeout`）：
  *    `last_cmd_time_` **只**由 `is_ctrl` 帧（MsgType ≤ 0x03 或 0x80..0x83）更新。
  *    → 纯 `CURRENT_CONTROL` 的客户端**永远不武装**这个保护（安全缺口 F19，
  *      见 `docs/FIRMWARE_ISSUES.zh-CN.md`）；
  *    → 已经发过 MIT 的客户端若只发 CURRENT，会被**误停**。
  *
- * 因此 `auto_keepalive` 的策略是：只要"距上次控制类帧"接近 `break_timeout`，
- * 就补发一帧 **MIT**（`is_ctrl`），既武装保护又不被误停，且不改变运动状态
- * （kp = kd = 0、tau = 0 → 电机泄力；比"保持位置"更安全）。
+ *    ⚠⚠ **`0` = 这个超时检测被禁用**（最新固件 `auto_stop_if_timeout()` 首句
+ *      `if (timeout_ms == 0) return;`，且配置项默认值就是 0）。
+ *      早期版本把 0 当成 100 ms，导致上位机把“没武装”读成“已武装 100 ms”。
+ *      因此：**只有 > 0 时才需要补喂**；0 时既不补喂也不报风险。
+ *
+ * 因此 `auto_keepalive` 的策略是：当设备侧超时 > 0，且“距上次控制类帧”接近
+ * `break_timeout` 时，补发一帧 **MIT**（`is_ctrl`）—— 既武装保护又不被误停，
+ * 且不改变运动状态（kp = kd = 0、tau = 0 → 电机泄力；比“保持位置”更安全）。
  */
 
 #include "jsdk_core_internal.h"
@@ -24,14 +29,16 @@
 /* ==========================================================================
  * 设备侧超时值的获取
  * ------------------------------------------------------------------------
- * `break_timeout` 由 configure() 从端点读出（0 → 固件按 100 ms 处理）。
+ * `break_timeout` 由 configure() 从端点读出。
+ *
+ * ⚠ **0 = 设备侧超时检测被禁用**（最新固件语义；不是“默认 100 ms”）。
+ *   句柄无效时也返回 0（“无法判定”按“不巡喂”处理，永不会因为未知值乱发帧）。
  * ======================================================================== */
 
 uint32_t jsdk_watchdog_device_ms(const jsdk_joint_t *j)
 {
-    if (!jsdk_joint_check(j)) return JSDK_WD_DEFAULT_MS;
-    if (j->break_timeout_ms == 0u) return JSDK_WD_DEFAULT_MS;   /* ⚠ 0 ≠ 关闭 */
-    return j->break_timeout_ms;
+    if (!jsdk_joint_check(j)) return JSDK_WD_DISABLED_MS;
+    return j->break_timeout_ms;      /* 0 = 禁用；> 0 = 超时毫秒数 */
 }
 
 /**
@@ -51,6 +58,11 @@ static int keepalive_joint(jsdk_joint_t *j)
     if (!j->calibrated) return 0;
 
     wd = jsdk_watchdog_device_ms(j);
+
+    /* ⚠ **0 = 设备侧超时检测被禁用** → 无狗可喂：既不补帧也不置风险位。
+       补帧在这里毫无意义（没有门限要满足），只会自白增加总线流量 ——
+       而且会掩盖“你没在发控制帧”这个事实。 */
+    if (wd == JSDK_WD_DISABLED_MS) return 0;
 
     /* 首个控制帧之前不需要补喂：`last_cmd_time_ == 0` 时固件直接跳过检查，
        而且此时补喂反而会**武装**保护，让刚启动的客户莫名被停。 */

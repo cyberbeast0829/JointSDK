@@ -67,6 +67,7 @@
 | **F24** | 低 | `can_cyberbeast.hpp` 成员 `active_report_enabled_`；`init()` `:191` | 该成员**只被赋过一次 `false`，从不读取** | 头注释写着"广播后是否主动上报响应"，即**曾计划的功能未实现**（与 F8 相关） | 实现或删除该成员，别留死代码误导 | 不依赖"广播后主动上报" |
 | **F25** | 低 | `cmd_current_control()` `:530`–`:538` | 该函数**不发任何响应帧**（`0x01`/`0x02`/`0x03` 都会 `send_mit_response`） | 纯电流模式下主站拿不到设备应答（无法确认已生效），也让 CURRENT 路径更难诊断 | 与其他控制帧一致地回一帧；或文档写明"0x04 无响应" | 文档写明 0x04 无响应；客户端不等应答 |
 | **F20** | 低 | `auto_stop_if_timeout()` `:1420` | `last_cmd_time_ == 0` 同时表示"从未收到控制帧"和"开机第 0 ms 收到" | 开机瞬间的控制帧无法武装超时保护（窗口极窄，但语义有歧义） | 用独立 `bool armed`，或哨兵取 `UINT32_MAX` | 仿真设备时钟从 1 ms 起（规避同款歧义） |
+| **F28** | 高 | `cmd_param_write()` 写 `can.config.break_timeout`（端点 73, u16）；`auto_stop_if_timeout()` `:1422` 读它 | 该端点**读回恒为 0**：写 250 之后**同进程立刻读**也是 0（`sdo.data` 证实发出的就是 `FA 00`）；对照端点 `heartbeat_rate_ms` 的写→读完全正常 | 配合 **F9 的新语义**（0 = 禁用）后果很重：客户端**无法通过端点武装协议超时保护**，也无法区分“我写了但没生效”与“设备本来就是 0” | 让该端点的写入真正落到 `odrv.can_.config_.break_timeout`；或新增只读端点 `can.config.break_timeout_effective_ms` 供主站核对 | `jsdk_joint_set_watchdog_ms()`：读回 0 且写入非 0 → 置 `JSDK_JF_WATCHDOG_UNVERIFIED`、保留写入值（安全方向）、`last_error` 里明说“未校验”；两个 CLI 都输出 `device_reports_ms`（**独立再读一次设备**）+ `verified`，不再回显写入值 |
 | **F17** | 低 | `cmd_param_read()` | 批量请求在 Classic 上正确回 `ERR`，但**单读的重试/回退没有节流** | 主站实现不当时可能形成重试风暴（设备侧无错，风险在主站） | 文档写明"主站应限速重试"即可 | 按类型拆分重发 + 单次读失败即报错，不做无界重试 |
 
 ### 1.2 文档问题（固件方拥有的协议文档）
@@ -77,8 +78,7 @@
 | **F1** | 中 | `docs/cyberbeast-protocol.md:353/366` | `KP (刚度) … N·m/rad`；`mit_max_kp = 500 N·m/rad` | 写明 kp 的作用点：固件把 kp **原样**交给 MIT 控制器，而 `input_pos` 是**电机端 turns**（`mit_control_cmd()` `:356`–`:359`）→ **输出端等效刚度 = kp × gear_ratio / (2π)**（gear=16.5 时 ≈ 2.63×）。或新增 `mit_kp_unit` 能力标志 | 客户按文档理解 kp 会**系统性调小 2.63 倍增益**（串级回路下可能振荡） |
 | **F21** | 中 | `Firmware/docs/cyberbeast-json-descriptor-protocol.md` | 0x24/0x25 是**全量流式**传输（`0x24` 只带 `Offset`，`Firmware/.../can_cyberbeast.cpp:879`–`:893`），文档**没有说明这一点** | 明确写出：设备端**永远全量发送**、无服务端 filter、无"传输完成"信号；客户端若按自己的 filter"凑够就提前停"，必须自行保证不会丢同族路径（前缀/通配 filter 会被**首个**匹配项误判为已满足） | 客户端自行提前终止时会**静默丢字段**，且丢哪些取决于 JSON 字段顺序 → 不同固件版本得到不同的残缺端点表，极难复现 |
 | **F6** | 中 | `docs/cyberbeast-protocol.md`（QUERY_CURRENT 一节） | 第 2 项写作 Id **测量值** | 改为"Id **设定值**"（代码是 `Idq_setpoint_`，见 F6） | 同 F6 |
-| **F23** | 中 | `docs/cyberbeast-protocol.md:156`–`164`、`:982` | 声称接收侧做 Seq 连续性检测、对比表标"丢包检测 ✅" | 与 F23 的实现决定保持一致（实现 or 降级为"保留字段"） | 客户以为有丢包检测，实际没有 |
-
+| **F23** | 中 | `docs/cyberbeast-protocol.md:156`–`164`、`:982` | 声称接收侧做 Seq 连续性检测、对比表标"丢包检测 ✅" | 与 F23 的实现决定保持一致（实现 or 降级为"保留字段"） | 客户以为有丢包检测，实际没有 || **F27** | 高 | `docs/cyberbeast-protocol.md:45`（P7）、`:326`–`:328`（§4 “约定”） | 文档写“**所有多字节量 Big-Endian**”，而 `PARAM_READ(0x20)`/`PARAM_WRITE(0x21)` 的**值字节实际是小端**（固件把端点内存原样 `memcpy`） | 把字节序约定改成**两张表**：① 帧字段（ID 位域/`ep_id`/`offset`/查询与状态响应/控制帧）**BE**；② **参数值 LE**。或（可选，需改固件）在 `0x20`/`0x21` 里做 `htonl`/`ntohl` 归一 | 任何按文档实现的主站读参数会得到**静默错值**（`node_id: 1 → 16777216`、`gear_ratio: 16.5 → 8.9e-41`），而症状看着像“描述符与固件版本对不上”或“标定值超范围”，极难定位 |
 > **说明**：F21 原先被记为"文档与工具把提前终止当成无条件优化"，本次**回源复核后修正**——
 > 固件仓库（含 `tools/can/cyberbeast_tool.py`）**没有任何"提前终止"的实现或描述**，
 > 该优化是**客户端（我们 SDK）自己的设计选择**。所以这条的性质是"文档**缺**一条警告"，
@@ -92,7 +92,7 @@
 | **F2** | 低 | 增加 `protocol_version`（如 `can.config.protocol_version`）或 `capabilities u32` 端点 | 能力发现不再依赖"猜端点 ID + 比版本号"（端点 ID 跨版本漂移率实测 **86%**） | 全动态 JSON 描述符（不依赖任何静态端点表） |
 | **F7** | 中 | 位掩码寻址与 MIT 槽位扩展到 `node_id ≥ 8` | `MAX_BROADCAST_DEVICES = 8`（`can_cyberbeast.hpp:47`）→ 12 自由度机器人**无法一帧广播同步** | `node_id ≥ 8` 时自动降级单播 + `configure()` 提前告警 |
 | **F8** | 中 | 广播帧支持"回复聚合"，或提供一个**广播类型**的状态请求（可分时回复） | 目前广播后完全无反馈；而 `MSG_STATUS_FEEDBACK = 0x49` 是**点对点类型**，无法组播（`is_message_for_me` 对非广播类型要求 `Dest == node_id`） | 广播后不期待反馈；需要反馈时逐个单播 `0x49` |
-| **F9** | 中 | `break_timeout = 0` 语义明确为"关闭"（或新增 `enable_break_timeout`） | 目前 0 被强制当作 100 ms（`auto_stop_if_timeout()` `:1423`–`:1426`），**无法关闭**该保护 | 文档写明"0 = 100 ms，不是关闭"；客户端显式设非零值 |
+| **F9** | ✅ **已满足** | `auto_stop_if_timeout()` `:1422`–`:1425` | 需求已实现：`if (timeout_ms == 0) return;` —— **0 = 禁用**；`Config_t::break_timeout` 默认值也就是 0 | 不再需要它：客户端可以真正关掉该保护，也不会再把“未武装”误读成“100 ms” | ——（无需再改） | **SDK 已跟进（v0.25）**：删掉 `0→100 ms` 归一化；禁用时不补 keepalive、不拿 0 比周期；`set_watchdog_ms(0)` = 关闭；`dump-config` 与 `read` 不再矛盾 |
 
 ---
 
@@ -100,7 +100,7 @@
 
 ### 2.1 F19 — 纯 `CURRENT_CONTROL` 客户端的超时保护永不武装（致命）
 
-**现象**：`do_command()` 第一条语句是 `axis.watchdog_feed()`（**无条件**，任何帧都喂 ODrive 轴看门狗），
+**现象**：`do_command()` 第一条语句是 `axis.watchdog_feed()`（**无条件**，任何帧都喂驱动器看门狗），
 但决定 CAN **auto-stop** 的 `is_ctrl` 是：
 
 ```cpp
@@ -126,8 +126,11 @@ if (last_cmd_time_[axis_idx] == 0) return;              // 从未武装 → 直�
 1. **安全阀失效**：`last_cmd_time_` 永远是 0 → `auto_stop_if_timeout()` 立即返回 →
    **CAN 线拔掉/主站崩溃后设备不会 auto-stop**，会一直按最后一个电流指令驱动（`disarm()` 不会被调用）。
 2. **误停**：若客户端**先**发过任意 `0x00~0x03`/`0x80~0x83` 帧（例如使能序列用了 MIT 或 `0x63 STOP_MOTOR`），
-   之后只发 `0x04` → `last_cmd_time_` 不再刷新 → **100 ms 后被判 `ERROR_CAN_BUS_FAILED` + `disarm()`**，
+   之后只发 `0x04` → `last_cmd_time_` 不再刷新 → **超过设备侧 `break_timeout` 后被判 `ERROR_CAN_BUS_FAILED` + `disarm()`**，
    正常控制流被自己打断。
+   ⚠ 这一半只在设备侧超时**非 0**（已武装）时才会发生 —— 新固件的默认值是 `0` = 禁用
+   （见 F9/F28），所以“会误停”意味着有人（或 `enable_watchdog_hint`）把它打开了。
+   反过来说：**一旦打开，纯 CURRENT 的客户端必然被误停**，两半都躲不过。
 
 **建议**：把 `0x04` 纳入 `is_ctrl`（一行），并把"未武装"与"已过期"用不同哨兵表示（见 F20）。
 
@@ -325,14 +328,98 @@ fibre::cbufptr_t input_buffer{param_write_asm_.buf, size_t(total_len)};
 **建议**：独立 `bool armed`，或哨兵改用 `UINT32_MAX`。
 
 ---
+### 3.8 F27 — 参数值字节序：文档说大端，实际小端（文档错，但影响代码）
 
+**证据**（`ODrive` @ `4ff46135`，`Firmware/communication/can/can_cyberbeast.cpp`）：
+
+- `cmd_param_read()` `:613`–`:615` 用 `fibre::cbufptr_t input_buffer{value_buf, 0}` 调
+  `endpoint_handler(...)`，然后 `:631` `std::memcpy(&txmsg.buf[4], &value_buf[offset], actual_data_len)`
+  —— 端点内存**原样**进载荷。
+- `cmd_param_write()` `:765`–`:768` 反方向：`cbufptr_t input_buffer{&msg.buf[4], size_t(data_len)}`。
+- 批量读 `cmd_param_read_batch()` `:689`–`:693`、分段写 `cmd_param_write_segmented()` `:790` 同一条路径。
+
+`endpoint_handler()` 是**内存序列化**（不做字节序归一），目标平台是 ARM Cortex-M（小端）
+→ 线上就是小端。而控制帧/查询响应里的“大端”是固件**手写拆字节**的结果
+（`float_to_uint` / `float_to_big_endian_bytes`）—— 两套代码、两种字节序。
+
+**为什么算“高”而不是“低”**：它不报错。客户（包括本项目）读回来的值“看着像数”（
+`8.9e-41`、`16777216`、`1600`），于是问题被归因到别处：描述符版本、标定值范围、
+端点 ID 漂移。本项目为此写错过三次结论（见 `BACKLOG.zh-CN.md` §2.4 的 C6）。
+
+**真机实测**（slcan + CANable，node 1）：`node_id` 线上 `01 00 00 00`；
+`heartbeat_rate_ms` 线上 `64 00 00 00`；`gear_ratio` 线上 `00 00 84 41`；
+而同一台设备的 `0x46` 响应 `fw_version` 线上 `00 00 06 08` **必须按大端解**（=1544）
+—— 同机反证，因此不是“协议整体反了”。
+
+**建议**：① 文档按上表拆成两套约定（成本最低，能先止血）；② 可选：让
+`0x20`/`0x21` 的载荷显式归一为大端，以与 §4 的约定一致（破坏性变更，需与客户端同步切换）。
+
+**SDK 侧应对**：**不改固件**，改为适配真实行为 —— 值编解码统一走
+`cb_le_get_*()` / `cb_le_put_*()`（`src/proto_cyberbeast/cb_frame.c`），
+帧字段继续 `cb_be_*()`；线上原始字节被 `tests/test_hal_virtual.c` 的 `[7] param access` 钉死。
+
+### 3.9 F28 — 写 `can.config.break_timeout` 后**读回恒为 0**（等价于“武装不了超时保护”）
+
+> ⚠ **本条在 v0.25 重写过事实层**。最早我们以为“写入生效、只是新进程读不到”，
+> 并在 SDK 里把 `0` 归一成 100 ms —— 那是**双重错误**（既误解了 0 的语义，也高估了写入）。\
+> 下面全部是真机上重新测出来的，命令与输出可复现。
+
+**现象（真机实测）**：slcan + CANable，node 1，`fw_version = 1545`。
+
+```console
+$ jsdk-cli --if slcan --channel COM3 --node 1 --json read can.config.break_timeout
+{"path":"can.config.break_timeout","type":"uint16","value":0,"value_text":"0"}
+
+# 写完立刻读（同一进程、同一个句柄）
+$ python -c "... j.sdo('can.config.break_timeout').write_value(150); print(j.param_get(...))"
+1) 设备读          : 0
+2) sdo.data        : 96 00        ← 发出去的确实是 150（小端）
+3) 写后同进程设备读 : 0            ← 读回还是 0
+4) hb_rate 读回     : 100          ← 对照端点：写→读完全正常
+```
+
+所以**不是**打包/字节序问题，也**不是**“跨进程不保留”—— 这个端点的值**根本没进设备状态**。
+
+**为什么严重度从“中”升到“高”**：结合 **F9 的新语义**（`0` = **禁用**超时，且它是
+`Config_t::break_timeout` 的默认值），后果是：
+
+1. 客户端**无法通过端点武装协议级超时保护**（写了也读不出、无法证实）；
+2. 也无法区分“我写了但没生效”与“设备本来就是 0” —— 两者在协议层长得一模一样；
+3. 现场那台设备因此一直是“无协议超时保护”的状态（`error_axis` 里
+   `CAN_BUS_FAILED` 永远不会由这条路径产生）。
+
+**SDK 侧应对**（v0.25，`src/core/jsdk_ops.c`）：
+
+| 读回 | 判定 | 行为 |
+|---|---|---|
+| == 写入值（含 `0 == 0`） | 校验通过 | 清 `JSDK_JF_WATCHDOG_UNVERIFIED`，记日志，返回 OK |
+| **0（而写入非 0）** | **未能校验**（本条） | 置 `JSDK_JF_WATCHDOG_UNVERIFIED`、**保留写入值**（继续喂狗是安全方向）、`last_error` 明说“未校验”，返回 **OK** |
+| 其它值 | 真矛盾 | `JSDK_ERR_PROTOCOL`（不得放松） |
+
+CLI 两版（`jsdk-cli watchdog` / `python -m jsdk_can watchdog`）都会**再独立读一次设备**并把
+真实值单独输出，不回显写入值：
+
+```console
+$ jsdk-cli --if slcan --channel COM3 --node 1 --json --yes watchdog 250
+{"ms":250,"device_reports_ms":0,"verified":false,"disabled":false}
+```
+
+**回归与变异**：`tests/test_ops.c` 的 `[9]`（读回 0 / 读回 999 / 写 0 = 关闭 三种情形）、
+`[9b]`（禁用时不拒循环、不补 keepalive）、`tests/test_hal_virtual.c`（`timeout=0` 时
+武装后停发 5 s 也不停机）；四个变异（keepalive 照补、`0` 当门限比、模型 0→100、`device_ms`
+归一）**全部被检出**。
+
+**建议**：① 让该端点的写入真正落到 `odrv.can_.config_.break_timeout`；
+② 或新增只读端点 `can.config.break_timeout_effective_ms`，让主站能核对“到底生效值是多少”。
+
+---
 ## 4. 建议的修复顺序
 
 | 优先级 | 条目 | 理由 |
 |---|---|---|
 | **P0** | **F19**、**F22（文档部分）** | 安全相关，且改动小：F19 是编码 `is_ctrl` 的一行；F22 先把"0 = 字段最小值""接收端按位图校验"写进文档，成本几乎为零 |
 | **P1** | **F5**、**F16**、**F14** | 多轴安全阀、越界飞车、单位差一个齿比 —— 都是"正常使用下会出错且难定位" |
-| **P2** | F11、F12、F13、F15、F6、F23/F18、F26、F1(文档侧)、F21 | 静默错误与文档误导；多数可以只改文档 |
+| **P2** | F11、F12、F13、F15、F6、F23/F18、F26、F1(文档侧)、F21、**F27(文档侧)**、**F28(文档侧)** | 静默错误与文档误导；多数可以只改文档。**F27 优先做**：只需改协议文档的两张字节序表，就能让所有客户端不再读出静默错值。**F28 紧随其后**：把“`0` = 禁用”与“该端点读不回写入值”写进文档，主站就不会再把“读回 0”误判为「写失败」或「已武装 100 ms」 |
 | **P3** | F17、F20、F24、F25、F2、F7、F8、F9 | 一致性、体验、能力扩展 |
 
 > **改动成本提示**：P0/P1 里真正要改代码的只有 **F19（1 行）、F5（1 个循环）、F16（1 行钳位）**；
@@ -380,6 +467,9 @@ fibre::cbufptr_t input_buffer{param_write_asm_.buf, size_t(total_len)};
 | F2 / F3 | 全动态 JSON 描述符解析（`src/proto_cyberbeast/cb_jsondesc_parse.c`） |
 | F9 | 文档写明"0 = 100 ms，不是关闭" |
 | F23 | 客户端不依赖 `Seq` 判丢包（按反馈新鲜度/超时判） |
+| **F27** | 值编解码走小端：`cb_le_get_*()` / `cb_le_put_*()`（`src/proto_cyberbeast/cb_frame.c`，证据注释在 `cb_frame.h`）；帧字段继续 `cb_be_*()`。回归：`tests/test_hal_virtual.c` 的 `[7] param access` 断言线上**原始字节**（`01 00 00 00` / `64 00` / 分段写分块字节），`bindings/python/tests/test_wide_params.py` 的 `SERIAL_BYTES` 也按小端构造 |
+| **F28** | `src/core/jsdk_ops.c`（`jsdk_joint_set_watchdog_ms()`：写入→读回→三类判定，置 `JSDK_JF_WATCHDOG_UNVERIFIED`）、`src/core/jsdk_watchdog.c`（`jsdk_watchdog_device_ms()` **原样返回 0**）、`src/core/jsdk_config.c`（hint 写入后**读回确认**）；回归 `tests/test_ops.c:[9]/[9b]` |
+| **F9** | （已满足）SDK 侧同步去掉归一化：`src/jsdk_core_internal.h` 的 `JSDK_WD_DISABLED_MS = 0`；禁用时不补 keepalive、`configure()` 不再拿 0 比周期；`dump-config` 与 `read` 不再矛盾 |
 
 ### 6.3 复核锚点
 
@@ -398,4 +488,7 @@ fibre::cbufptr_t input_buffer{param_write_asm_.buf, size_t(total_len)};
 
 | 版本 | 日期 | 说明 |
 |---|---|---|
+| v1.3 | 2026-09-21 | **F9 关闭（已满足）+ F28 重写（严重度中→高）**。用户指出最新固件里 `can.config.break_timeout == 0` 是**禁用**而不是 100 ms；回源复核 `can_cyberbeast.cpp` 确实已改为 `if (timeout_ms == 0) return;`，且 `Config_t::break_timeout` 默认就是 0 ⇒ **设备出厂即无协议超时保护**。据此：① F9 从“能力需求”改为 **✅ 已满足**，SDK 侧同步删掉 `0→100 ms` 归一化；② F28 重写——真机上该端点**写 250 后同进程立刻读仍是 0**（`sdo.data` 证实发出的是 `FA 00`，对照端点 `heartbeat_rate_ms` 正常），即“**武装不了**”，而非之前写的“写入生效但新进程读不到”；③ 新增 `JSDK_JF_WATCHDOG_UNVERIFIED` 位、CLI 的 `device_reports_ms`/`verified` 字段（**独立再读一次设备**，不回显写入值） |
+| v1.2 | 2026-09-20 | 新增 **F28**（`can.config.break_timeout` 读回恒为 0：写入被接受但不保留，导致“写后读回校验”永远失败；`dump-config` 显示 100 而 `read` 显示 0）+ §3.9 详述与真机证据（fw 1545 / COM3）；修复顺序 P2 加入 F28（文档侧优先），§6.2 补 SDK 侧实现与回归用例。同时把 §3.8 的 `fw_version` 参照值从 1544 更新为**当前真机 1545**（字节序结论不变，该字段仍按大端解）。来源：`hw_verify.sh --write-probe` 真机写路径验证 |
+| v1.1 | 2026-09-20 | 新增 **F27**（参数值字节序：文档写“所有多字节量 Big-Endian”，实际 `0x20`/`0x21` 的**值字节是小端**）+ §3.8 详述与真机实测；修复顺序 P2 加入 F27（文档侧优先）。F27 的来源是**真机联调**：`read`/`batch-read` 在 slcan + CANable 上读回错值，回源固件后确认 `endpoint_handler` + `memcpy` 走的是主机序。**固件本身无需修改**（读写自洽），只改文档与客户端适配 |
 | v1.0 | 2026-09-20 | 首次汇总。合并 `DESIGN.zh-CN.md` §10（原 F1~F10 需求）与 `PROTOCOL_NOTES.zh-CN.md` §14（原 F11~F22 缺陷），**统一编号并回源复核全部条目**；新增 F23（`rx_seq_` 未实现丢包检测）、F24（`active_report_enabled_` 死成员）、F25（0x04 无响应）、F26（`Dest` 文档语义）；修正 F21 的证据；F3/F10 作废、F4 并入 F19；补严重度、SDK 侧应对与修复顺序 |

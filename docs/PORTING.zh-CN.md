@@ -878,6 +878,95 @@ sudo ./tools/live_can_smoke.sh  # 真链路：modprobe + vcan0(MTU72)/vcan1(MTU1
 
 ⚠ 第 10 项特别容易误判：`vcan` 上永远拿不到 `CAN_ERR_BUSOFF` / `CAN_ERR_CRTL_RX_PASSIVE`，
 所以"错误帧路径在软件里测过了"是**不成立**的结论 —— 那部分只能靠第 9~11 项人工验。
+**推荐一次性跑完上面这些（可重复、可量化）**：
+
+```bash
+./tools/hw_verify.sh --channel COM3 --node 1 --runs 5        # 10 层 × 5 轮，逐层给结论
+./tools/hw_verify.sh --if virtual --runs 1                   # 没硬件时先自检脚本本身
+```
+
+它把"真机验证"拆成 **10 层**（发现 / 设备信息 / 描述符 / 心跳 / 单读 / 批量读 / 真值断言 /
+健康 / **写路径** / **写探针**），**每层单独起进程**，因此能定位到具体哪一层坏；
+`read` 与 `batch-read` 的同一参数会**互相对拍**（两条解析路径不一致会当场报出来）。
+
+**写路径**（上表第 11 项里"能自动化的那部分"）现在是脚本化的：`--write-probe` 会
+`读原值 → 写原值+Δ → 校验 → 恢复原值 → 校验`，**任何一步失败都先尝试恢复**；
+只碰 `--write-path` 指定的那一个参数（默认 `axis0.config.can.heartbeat_rate_ms`，u32、
+非安全关键、不落 Flash）。真机实测 `100 → 150 → 恢复 100` ✓ —— 这同时验证了
+**写方向的字节序**（若按大端写，设备会把 150 存成 `0x96000000`）。
+⚠ 它**不会**去动 `set-node-id` / `reset` / `save` 这类**不可幂等重放**的命令 ——
+那些仍然只能人工、且要有明确目的。
+
+为什么不能"跑一次看到成功就宣布通过"：slcan 适配器打开端口后的头几帧会丢
+（实测约 1/10 次进程），而且**字节序错时 `read` 依然成功返回、只是数值荒谬**
+—— 详见 `CLI.zh-CN.md` §8。
+### 7.5.4 ⚠ 客户程序打印中文时的显示问题（Windows，与硬件无关但一定会遇到）
+
+SDK 自己**从不打印**任何东西 —— 它只是把中文（UTF-8）放进
+`jsdk_context_last_error()`、`jsdk_status_string()`、`jsdk_mode_name()` 等返回值里，
+由你决定怎么输出。于是这个坑落在调用方：Windows 控制台默认代码页是 **CP936**，
+把 UTF-8 字节直接 `printf` 出去，屏幕上就是 `鍙戠幇 0 涓�鑺傜偣` 这种乱码
+（`jsdk-cli` 早期就是这样，见 `CLI.zh-CN.md` §1）。
+
+**规则一句话**：输出的字节要符合**接收端**的约定 —— 目标是控制台就按
+`GetConsoleOutputCP()` 转码；目标是管道/文件就原样 UTF-8。
+
+最小可用骨架（约 20 行，可直接抄）：
+
+```c
+/* 需要 <stdio.h> <string.h>；以下只看关键部分 */
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+
+static int is_console(FILE *f)
+{
+    DWORD mode;
+    int fd = _fileno(f);
+    intptr_t h;
+    if (fd < 0 || _isatty(fd) == 0) return 0;          /* 管道/文件 → 不转 */
+    h = _get_osfhandle(fd);
+    return (h != (intptr_t)-1) && GetConsoleMode((HANDLE)h, &mode) != 0;
+}
+
+/* 把一段 UTF-8 文本写到 f。是控制台就转成控制台代码页，否则原样。 */
+static void say(FILE *f, const char *utf8)
+{
+    wchar_t w[1024];
+    char    out[2048];
+    int     wlen, m;
+
+    if (!is_console(f) || (strlen(utf8) > 1000u)) { fputs(utf8, f); return; }
+    wlen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8, -1, w, 1024);
+    if (wlen <= 0) { fputs(utf8, f); return; }
+    m = WideCharToMultiByte(GetConsoleOutputCP(), WC_NO_BEST_FIT_CHARS,
+                            w, wlen - 1, out, (int)sizeof out, "?", NULL);
+    if (m <= 0) { fputs(utf8, f); return; }
+    fwrite(out, 1u, (size_t)m, f);
+}
+#else
+#define is_console(f) 0                                  /* Linux/macOS 终端就是 UTF-8 */
+#define say(f, s)     fputs((s), (f))
+#endif
+
+say(stdout, jsdk_context_last_error(ctx));               /* 替代 printf("%s", ...) */
+```
+
+三个要点：
+
+1. **按完整 UTF-8 码点发**。上面这个"一次调用一个串"的写法天然安全；若要自己
+   切缓冲（例如逐字节写、或写超过 1 KB 的文本），**绝不能把 3 字节汉字从中间切开**
+   （切开的那一段单独转码会失败/变成 `?`）。参考实现见
+   `tools/jsdk_cli/cli_text.h` 的 `cli_utf8_complete_prefix()` 与
+   `cli_text.c` 的分片状态机（含跨调用残留处理、纯 ASCII 快路径）。
+2. **别用 `chcp 65001` 了事**：那改的是**共享的控制台状态**，程序被 kill 就回不去，
+   同控制台的其它进程跟着遭殃，而且要求控制台字体有 CJK 字形。
+3. **不要在输出里用 `⚠`（U+26A0）、`✓`（U+2713）** 这类字符：CP936 表示不了，
+   转码后只能变成 `?`（本工程把这条写成了静态检查 `tools/check_cli_text.py`）。
+
+> 什么时候可以不管：目标是 Linux/macOS 终端，或者你的程序只在 UTF-8 终端里跑
+> （MinTTY、Windows Terminal 里显式 `chcp 65001`、CI 日志）。只有"Windows 原生控制台 +
+> 中文"这一种组合需要上面这段。
 
 ---
 

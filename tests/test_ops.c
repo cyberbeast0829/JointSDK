@@ -111,18 +111,89 @@ typedef struct {
     jsdk_joint_config_t      jc[JSDK_MAX_JOINTS];
     jsdk_joint_t            *j;
     jsdk_context_config_t    cfg;
+
+    /* 注入故障：丢掉主站发出的前 N 帧（模拟“适配器刚打开、前几帧写丢”） */
+    unsigned                 drop_tx_head;
+    unsigned                 dropped;
+    unsigned                 desc_reqs_on_bus;   /* 真正上总线的 0x24 请求数 */
+
+    /* 注入故障 2：按 MsgType 丢（用于单独验证“握手帧丢了会怎样”） */
+    uint8_t                  drop_msgtype;
+    unsigned                 drop_msgtype_n;
+    unsigned                 dropped_msgtype;
+
+    /* 注入故障 3：RX 里先塞入 N 个“上一次传输的残留帧”（非元数据） */
+    unsigned                 inject_stale;
+    unsigned                 injected;
+    unsigned                 desc_stream_seen;    /* 设备已开始发本次 0x25 流 */
+
+    /* 注入故障 4：把某个端点的**读响应值**改成指定值
+       （模拟真机 F28：`can.config.break_timeout` 读回恒为 0） */
+    uint16_t                 patch_read_ep;
+    uint16_t                 patch_read_value;
 } fix_t;
 
 static int w_send(void *u, const jsdk_can_frame_t *f)
 {
     fix_t *fx = (fix_t *)u;
+
+    if (fx->dropped < fx->drop_tx_head) {
+        fx->dropped++;
+        return 0;                 /* “发出去了”但从总线上消失（真机就是这个语义） */
+    }
+    if (fx->drop_msgtype != 0u && cb_id_msgtype(f->id) == fx->drop_msgtype
+        && fx->dropped_msgtype < fx->drop_msgtype_n) {
+        fx->dropped_msgtype++;
+        return 0;
+    }
+    if (cb_id_msgtype(f->id) == CB_MSG_JSON_DESC_READ) fx->desc_reqs_on_bus++;
     return fx->inner.send(fx->inner.user, f);
 }
 
 static int w_recv(void *u, jsdk_can_frame_t *f)
 {
     fix_t *fx = (fix_t *)u;
-    return fx->inner.recv(fx->inner.user, f);
+    int     n = fx->inner.recv(fx->inner.user, f);
+
+    if (n == 1 && cb_id_msgtype(f->id) == 0x25u) fx->desc_stream_seen++;
+
+    /* ⚠ 残留帧必须在**请求发出之后、设备开口之前**才开始注入：
+       - 请求之前：`desc_drain_rx()` 会先排干净，复现不了真机现场；
+       - 设备开口之后：残留帧会插进本次流里，那不是真机情形（真机上设备一开始
+         应答，残留就已被 drain 排掉或落在 skip 阶段）。
+       ⚠ 帧长必须是合法的 0x25 载荷（8 或 64 B）—— 长度不对会被当场判
+         `frame length must be 8 (Classic) or 64 (FD)`，那样测的就不是判据了。 */
+    if (n == 0
+        && (fx->dropped_msgtype > 0u || fx->desc_reqs_on_bus > 0u)
+        && fx->desc_stream_seen == 0u
+        && fx->injected < fx->inject_stale) {
+        static uint8_t stale[64];
+
+        if (fx->injected == 0u) {
+            /* 前两字节非 00 00 → 不是元数据帧；其余当 JSON 文本的尾巴 */
+            memset(stale, 0, sizeof stale);
+            stale[0] = 0x10u; stale[1] = 0x00u;
+            stale[2] = '{'; stale[3] = '"'; stale[4] = 'x'; stale[5] = '"';
+            stale[6] = ':'; stale[7] = '1'; stale[8] = '}';
+        }
+        memset(f, 0, sizeof *f);
+        /* dest = 主站（夹具用 master_id = 1），src = 设备 node 1 */
+        f->id    = cb_make_id(CB_PRI_CONFIG, 0x25u, 1u, 1u, 0u);
+        f->len   = (uint8_t)sizeof stale;
+        f->flags = JSDK_FRAME_EXT | JSDK_FRAME_FD;
+        memcpy(f->data, stale, sizeof stale);
+        fx->injected++;
+        return 1;
+    }
+    /* 注入故障 4：把某个端点的**读响应值**改成指定值（模拟真机 F28 的“读回恒 0”） */
+    if (n == 1 && fx->patch_read_ep != 0u
+        && cb_id_msgtype(f->id) == CB_MSG_PARAM_READ && f->len >= 6u
+        && cb_be_get_u16(f->data + 1) == fx->patch_read_ep) {
+        /* 参数读响应：[flags][ep_id u16 BE][data_len][value…]；**值字节是小端** */
+        cb_le_put_u16(f->data + 4, fx->patch_read_value);
+        if (f->len >= 8u) cb_le_put_u16(f->data + 6, 0u);
+    }
+    return n;
 }
 
 /**
@@ -587,18 +658,19 @@ static void test_sdo(void)
     CHECK_EQ(jsdk_joint_sdo_state(fx.j, h), JSDK_SDO_IDLE);
     CHECK(jsdk_joint_sdo_data(fx.j, h) != NULL);
 
+    /* SDO 缓冲区里的字节就是**线上字节（小端）** */
     CHECK_EQ(jsdk_joint_sdo_read(fx.j, h), JSDK_OK);
     CHECK_EQ(jsdk_joint_sdo_state(fx.j, h), JSDK_SDO_SUCCESS);
-    CHECK_EQ(cb_be_get_f32(jsdk_joint_sdo_data(fx.j, h)), 16.0f);
+    CHECK_EQ(cb_le_get_f32(jsdk_joint_sdo_data(fx.j, h)), 16.0f);
 
     /* 写回同一个值（幂等），再读回 */
     {
         uint8_t *d = jsdk_joint_sdo_data(fx.j, h);
-        cb_be_put_f32(d, 20.0f);
+        cb_le_put_f32(d, 20.0f);
         CHECK_EQ(jsdk_joint_sdo_write(fx.j, h), JSDK_OK);
         CHECK_EQ(jsdk_joint_sdo_state(fx.j, h), JSDK_SDO_SUCCESS);
         CHECK_EQ(jsdk_joint_sdo_read(fx.j, h), JSDK_OK);
-        CHECK_NEAR(cb_be_get_f32(jsdk_joint_sdo_data(fx.j, h)), 20.0f, 1e-5);
+        CHECK_NEAR(cb_le_get_f32(jsdk_joint_sdo_data(fx.j, h)), 20.0f, 1e-5);
     }
 
     /* 只读端点写：必须报 UNSUPPORTED */
@@ -759,12 +831,19 @@ static void test_ops(void)
     CHECK_EQ(jsdk_joint_set_watchdog_ms(fx.j, 250u), JSDK_OK);
     CHECK_EQ(fx.j->break_timeout_ms, 250u);
     CHECK_EQ(fx.sim->nodes[0].break_timeout, 250u);
+    CHECK((fx.j->status_flags & JSDK_JF_WATCHDOG_UNVERIFIED) == 0u);
     printf("      set_watchdog_ms(250) verified by read-back\n");
 
-    /* 0 ms 不是"关闭"：必须给出警告而不是静默接受 */
+    /* 0 ms = **关闭**设备侧超时检测（新固件语义；旧固件把 0 当 100 ms 且无法关闭）。
+       这里必须“真的关掉且校验通过”，而不是发个“0 不等于关闭”的警告。 */
     CHECK_EQ(jsdk_joint_set_watchdog_ms(fx.j, 0u), JSDK_OK);
-    CHECK(strstr(jsdk_context_last_error(fx.ctx), "NOT disabled") != NULL);
-    printf("      set_watchdog_ms(0) warns: %s\n", jsdk_context_last_error(fx.ctx));
+    CHECK_EQ(fx.j->break_timeout_ms, 0u);                  /* 读回一致 = 确认已关闭 */
+    CHECK_EQ(fx.sim->nodes[0].break_timeout, 0u);
+    CHECK((fx.j->status_flags & JSDK_JF_WATCHDOG_UNVERIFIED) == 0u);
+    CHECK(strstr(jsdk_context_last_error(fx.ctx), "DISABLED on the device") != NULL);
+    printf("      set_watchdog_ms(0) -> 关闭并读回确认: %s\n",
+           jsdk_context_last_error(fx.ctx));
+    CHECK_EQ(jsdk_joint_set_watchdog_ms(fx.j, 250u), JSDK_OK);   /* 复原 */
 
     /* 超出 u16 必须拒绝（静默截断会让客户以为设成了更大的值） */
     CHECK_EQ(jsdk_joint_set_watchdog_ms(fx.j, 70000u), JSDK_ERR_INVALID_ARG);
@@ -1165,13 +1244,293 @@ static void test_wide_param_read(void)
     }
 }
 
+/**
+ * “打开后的前几帧丢了”必须能自愈 —— 真机（slcan）约 1/10 的进程会命中。
+ *
+ * 现场症状：`configure()` 报 `timeout`、细节是 `descriptor download ... (0/0 bytes)`，
+ * 再敲一次就好了。根因不在固件也不在参数解析：**适配器刚打开时主站的头几帧
+ * 会被丢掉**，于是描述符请求（= 会话的第一帧）从未到达设备。
+ *
+ * 这里在 HAL 层注入“丢掉主站前 N 帧”，断言：
+ *   - N=1、N=3 → `configure()` 必须**靠重发自愈**成功（且设备侧只收到一个请求）；
+ *   - 全丢 → 必须是 1 + 3 = **4 次**尝试后 TIMEOUT，且错误串要能区分
+ *     “一帧都没收到”（通道/适配器）与“收到了帧但请求丢”（重发不够 / 设备不应答）。
+ *
+ * ⚠ 只断言“没报错”是不够的：重发如果错误地**重启设备侧的流**，会出现
+ *   “看着成功、其实是第二次传输的数据”这种问题，所以还要数清总线上真正
+ *   出现的 0x24 请求个数。
+ */
+static void test_lost_first_request(void)
+{
+    unsigned n;
+
+    printf("[7] lost first frame(s) after opening the port -> self-healing\n");
+
+    /* --- 丢 1 / 丢 3 帧：递增间隔的重发（250/600/1200 ms）该救回来 --- */
+    for (n = 1u; n <= 3u; n += 2u) {
+        fix_t fx;
+
+        if (fx_open(&fx, "0:id=1,gear=16.0,tconst=0.0385,pmax=12.5,vmax=65,tmax=50,"
+                         "kpmax=500,kdmax=5,hb=10,timeout=30000,fd", 1u) != 0) {
+            printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+        }
+        fx.drop_tx_head = n;
+        CHECK_EQ(fx_configure(&fx), 0);
+        CHECK_EQ(fx.dropped, n);                       /* 确实丢了这么多 */
+        CHECK_EQ(fx.desc_reqs_on_bus, 1u);              /* 只有 1 个请求真正到达设备 */
+        CHECK_EQ(fx.j->calibrated, 1);
+        CHECK_NEAR(fx.j->gear_ratio, 16.0f, 1e-4f);
+        printf("      dropped %u frame(s): configure() recovered "
+               "(1 request reached the device)\n", n);
+        fx_close(&fx);
+    }
+
+    /* --- 全丢：必须重发 3 次后超时，且给出“收到了 N 帧”这种可判定的信息 --- */
+    {
+        fix_t fx;
+
+        if (fx_open(&fx, "0:id=1,gear=16.0,tconst=0.0385,pmax=12.5,vmax=65,tmax=50,"
+                         "kpmax=500,kdmax=5,hb=10,timeout=30000,fd", 1u) != 0) {
+            printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+        }
+        fx.drop_tx_head = 1000u;
+        CHECK_EQ(fx_configure(&fx), -1);
+        CHECK_EQ(fx.dropped, 4u);                      /* 1 次 + 3 次重发 */
+        CHECK_EQ(fx.desc_reqs_on_bus, 0u);
+        CHECK(strstr(jsdk_context_last_error(fx.ctx),
+                     "descriptor download from node 1 timed out") != NULL);
+        CHECK(strstr(jsdk_context_last_error(fx.ctx), "frames received") != NULL);
+        printf("      all 4 attempts dropped -> %s\n",
+               jsdk_context_last_error(fx.ctx));
+        fx_close(&fx);
+    }
+
+    /* --- ⚠ RX 里有“上一次传输的残留帧” + 我们的请求丢了 ---
+          判据必须是“本次传输还没开始”，不能是“一帧都没收到”：
+          后者会被残留帧骗过 → 从不重发 → 超时（真机 1/20 次就是这样）。 */
+    {
+        fix_t fx;
+
+        if (fx_open(&fx, "0:id=1,gear=16.0,tconst=0.0385,pmax=12.5,vmax=65,tmax=50,"
+                         "kpmax=500,kdmax=5,hb=10,timeout=30000,fd", 1u) != 0) {
+            printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+        }
+        fx.drop_msgtype   = (uint8_t)CB_MSG_JSON_DESC_READ;
+        fx.drop_msgtype_n = 1u;          /* 第一个 0x24 丢 */
+        fx.inject_stale   = 40u;         /* 同时有残留帧在流 */
+        CHECK_EQ(fx_configure(&fx), 0);
+        CHECK_EQ(fx.dropped_msgtype, 1u);
+        CHECK(fx.injected >= 1u);        /* 残留帧真的出现过 */
+        CHECK_EQ(fx.desc_reqs_on_bus, 1u);   /* 重发的那次才到达设备 */
+        CHECK_EQ(fx.j->calibrated, 1);
+        printf("      stale frames + lost request -> retried anyway "
+               "(%u stale frame(s) seen)\n", fx.injected);
+        fx_close(&fx);
+    }
+
+    /* --- 残留帧 + 请求全丢：超时信息必须反映“收到过帧”（区别于 0 帧） --- */
+    {
+        fix_t fx;
+
+        if (fx_open(&fx, "0:id=1,gear=16.0,tconst=0.0385,pmax=12.5,vmax=65,tmax=50,"
+                         "kpmax=500,kdmax=5,hb=10,timeout=30000,fd", 1u) != 0) {
+            printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+        }
+        fx.drop_msgtype   = (uint8_t)CB_MSG_JSON_DESC_READ;
+        fx.drop_msgtype_n = 1000u;
+        fx.inject_stale   = 40u;
+        CHECK_EQ(fx_configure(&fx), -1);
+        CHECK_EQ(fx.dropped_msgtype, 4u);          /* 1 + 3 次重发 */
+        CHECK(strstr(jsdk_context_last_error(fx.ctx), "frames received") != NULL);
+        CHECK(strstr(jsdk_context_last_error(fx.ctx), "0 frames received") == NULL);
+        printf("      stale-but-no-metadata case reports: %s\n",
+               jsdk_context_last_error(fx.ctx));
+        fx_close(&fx);
+    }
+
+    /* --- 全丢 + 设备不发心跳：这才真的是“一帧都没收到” --- */
+    {
+        fix_t fx;
+
+        if (fx_open(&fx, "0:id=1,gear=16.0,tconst=0.0385,pmax=12.5,vmax=65,tmax=50,"
+                         "kpmax=500,kdmax=5,hb=0,timeout=30000,fd", 1u) != 0) {
+            printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+        }
+        fx.drop_tx_head = 1000u;
+        CHECK_EQ(fx_configure(&fx), -1);
+        CHECK(strstr(jsdk_context_last_error(fx.ctx), "0 frames received") != NULL);
+        printf("      0-frame case is distinguishable: %s\n",
+               jsdk_context_last_error(fx.ctx));
+        fx_close(&fx);
+    }
+}
+
+/**
+ * 握手必须**被证实**：设备的 master_id 从收到的帧里学，丢了握手帧 = 整个会话哑掉。
+ * 这里按 MsgType 丢掉 `QUERY_STATUS`（握手用的就是它），断言：
+ *   - 丢 3 帧 → `configure()` 靠重发自愈；
+ *   - 全丢 → TIMEOUT，且**恰好尝试 6 次**（钉住重试次数），错误串说明原因。
+ */
+static void test_handshake_retry(void)
+{
+    printf("[8] handshake is verified + retried (lost handshake frames)\n");
+
+    /* --- 丢 3 次握手：必须自愈 --- */
+    {
+        fix_t fx;
+
+        if (fx_open(&fx, "0:id=1,gear=16.0,tconst=0.0385,pmax=12.5,vmax=65,tmax=50,"
+                         "kpmax=500,kdmax=5,hb=10,timeout=30000,fd", 1u) != 0) {
+            printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+        }
+        fx.drop_msgtype   = (uint8_t)CB_MSG_QUERY_STATUS;
+        fx.drop_msgtype_n = 3u;
+        CHECK_EQ(fx_configure(&fx), 0);
+        CHECK_EQ(fx.dropped_msgtype, 3u);
+        CHECK_EQ(fx.j->calibrated, 1);
+        CHECK_EQ(fx.j->state_known, 1u);          /* 握手应答被当成首次反馈吃掉了 */
+        printf("      3 handshake frames dropped -> configure() recovered\n");
+        fx_close(&fx);
+    }
+
+    /* --- 握手全丢：必须超时，且尝试次数是固定的 6 次 --- */
+    {
+        fix_t fx;
+
+        if (fx_open(&fx, "0:id=1,gear=16.0,tconst=0.0385,pmax=12.5,vmax=65,tmax=50,"
+                         "kpmax=500,kdmax=5,hb=10,timeout=30000,fd", 1u) != 0) {
+            printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+        }
+        fx.drop_msgtype   = (uint8_t)CB_MSG_QUERY_STATUS;
+        fx.drop_msgtype_n = 1000u;
+        CHECK_EQ(fx_configure(&fx), -1);
+        CHECK_EQ(fx.dropped_msgtype, 6u);
+        CHECK(strstr(jsdk_context_last_error(fx.ctx),
+                     "no response to handshake after 6 attempts") != NULL);
+        printf("      all handshakes dropped -> %s\n",
+               jsdk_context_last_error(fx.ctx));
+        fx_close(&fx);
+    }
+}
+
+/**
+ * 看门狗的“读回无法校验”分支（真机 F28）。
+ *
+ * 真机实测（fw 1545）：`can.config.break_timeout` 的**读回恒为 0** —— 写 250 之后
+ * 立刻读（同一进程、`sdo.data` 确认发出去的就是 `FA 00`）读回来的仍是 0；
+ * 对照端点 `heartbeat_rate_ms` 的写→读是正常的，所以是该端点的固件问题。
+ * 因为 `0` 在固件里的含义是**禁用超时检测**，所以“写 250 读回 0”意味着
+ * **客户端无法证明自己武装了保护**。
+ *
+ * 正确行为：
+ *   - 写入非 0 而读回 0 → 保留写入值（安全方向）+ 置 UNVERIFIED 位 + 明确说明（OK）；
+ *   - **读回一个不同的非 0 值**属于真矛盾 → 仍必须 PROTOCOL（这条不能放松）；
+ *   - 写 0 而读回 0 → **是真的关闭了**，校验通过、不得置位。
+ */
+static void test_watchdog_readback(void)
+{
+    fix_t fx;
+    jsdk_joint_config_snapshot_t snap;
+
+    printf("[9] watchdog read-back: F28（读回恒 0 不可校）vs 真不一致 vs 0=关闭\n");
+
+    if (fx_open(&fx, "0:id=1,gear=16.0,tconst=0.0385,pmax=12.5,vmax=65,tmax=50,"
+                     "kpmax=500,kdmax=5,hb=10,timeout=30000,fd", 1u) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+    if (fx_configure(&fx) != 0) { g_fail++; g_checks++; fx_close(&fx); return; }
+    CHECK(fx.j->ep_break_timeout != 0u);
+
+    /* --- 读回恒 0：写入被接受，但不假装校验通过 --- */
+    fx.patch_read_ep    = fx.j->ep_break_timeout;
+    fx.patch_read_value = 0u;
+    CHECK_EQ(jsdk_joint_set_watchdog_ms(fx.j, 250u), JSDK_OK);
+    CHECK(strstr(jsdk_context_last_error(fx.ctx), "could not verify") != NULL);
+    CHECK((fx.j->status_flags & JSDK_JF_WATCHDOG_UNVERIFIED) != 0u);
+    CHECK_EQ(jsdk_joint_read_config_snapshot(fx.j, &snap), JSDK_OK);
+    CHECK_EQ(snap.break_timeout_ms, 250u);      /* 保留写入值，不假装 0 */
+    CHECK(strstr(jsdk_context_last_error(fx.ctx), "read back as 0") == NULL);
+    printf("      read-back 0（F28）→ OK + “未校验”提示 + UNVERIFIED 位\n");
+
+    /* --- 写 0 = 关闭，读回 0 = 真的关上了 → 校验通过（不得置 UNVERIFIED）--- */
+    CHECK_EQ(jsdk_joint_set_watchdog_ms(fx.j, 0u), JSDK_OK);
+    CHECK((fx.j->status_flags & JSDK_JF_WATCHDOG_UNVERIFIED) == 0u);
+    CHECK_EQ(fx.j->break_timeout_ms, 0u);
+    CHECK_EQ(jsdk_watchdog_device_ms(fx.j), JSDK_WD_DISABLED_MS);
+    printf("      写 0（= 禁用）→ 校验通过，无 UNVERIFIED\n");
+
+    /* --- 读回一个不同的非 0 值：真不一致，必须报 --- */
+    fx.patch_read_value = 999u;
+    CHECK_EQ(jsdk_joint_set_watchdog_ms(fx.j, 250u), JSDK_ERR_PROTOCOL);
+    CHECK(strstr(jsdk_context_last_error(fx.ctx), "read back as 999") != NULL);
+    printf("      read-back 999 → PROTOCOL（不一致仍不放过）\n");
+
+    fx_close(&fx);
+}
+
+/**
+ * `break_timeout == 0`（= 禁用）时的两条硬规则：
+ *
+ * 1. **不得把“没有门限”当成“门限为 0”**：`period_ms >= wd` 在 wd=0 时**恒真**，
+ *    若不用 `JSDK_WD_DISABLED_MS` 显式跳过，任何跑循环的命令都会被 configure() 拒掉；
+ * 2. **无狗可喂**：禁用时不补 keepalive 帧（否则只会白白增加总线流量，
+ *    还会掩盖“你没在发控制帧”这个事实）。
+ *
+ * 旧实现在这两点上都错（它把 0 归一成 100 ms 掩盖了第 1 条，第 2 条则是多余的喂狗）。
+ */
+static void test_watchdog_disabled(void)
+{
+    fix_t fx;
+    unsigned i;
+    jsdk_joint_feedback_t fb;
+
+    printf("[9b] break_timeout = 0（禁用）：不拒循环、不补喂\n");
+
+    /* 显式 `timeout=0`：模拟新固件的默认状态（超时检测关着） */
+    if (fx_open(&fx, "0:id=1,gear=16.0,tconst=0.0385,pmax=12.5,vmax=65,tmax=50,"
+                     "kpmax=500,kdmax=5,hb=10,timeout=0,fd", 1u) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+
+    /* 控制周期设成 100 ms，远大于“如果 0 被当成 100 ms”那个值 —— 仍然必须能配置 */
+    fx.ctx->cfg.period_ns = 100000000u;
+    CHECK_EQ(fx_configure(&fx), 0);
+    CHECK_EQ(jsdk_watchdog_device_ms(fx.j), JSDK_WD_DISABLED_MS);
+    CHECK_EQ(fx.j->break_timeout_ms, 0u);
+    printf("      周期 100 ms + timeout=0 → configure() 通过（不再拿 0 当门限）\n");
+
+    /* 使能并跑一阵：设备侧没有门限，所以**不应**产生 CAN_BUS_FAILED */
+    jsdk_joint_request_enable(fx.j, JSDK_MODE_MIT);
+    for (i = 0u; i < 30u && !jsdk_joint_is_enabled(fx.j); ++i) fx_cycle(&fx);
+    CHECK_EQ(jsdk_joint_is_enabled(fx.j), 1);
+
+    for (i = 0u; i < 40u; ++i) fx_cycle(&fx);
+    CHECK_EQ(fx.sim->nodes[0].error_axis & SIM_ERR_CAN_BUS_FAILED, 0u);
+    printf("      跑 40 个 100 ms 周期：设备未被停（error_axis=0x%X）\n",
+           (unsigned)fx.sim->nodes[0].error_axis);
+
+    /* 切到 CURRENT（不是 is_ctrl）：禁用状态下**不得**补 MIT keepalive */
+    jsdk_joint_set_mode(fx.j, JSDK_MODE_CURRENT);
+    jsdk_joint_set_current_A(fx.j, 0.0);
+    for (i = 0u; i < 10u; ++i) fx_cycle(&fx);
+    {
+        uint32_t before = fx.j->keepalive_sent;
+        for (i = 0u; i < 20u; ++i) fx_cycle(&fx);
+        CHECK_EQ(fx.j->keepalive_sent, before);            /* 一帧都不补 */
+        CHECK_EQ(jsdk_joint_get_feedback(fx.j, &fb), JSDK_OK);
+        CHECK_EQ((fb.status_flags & JSDK_JF_WATCHDOG_RISK), 0u);
+    }
+    printf("      超时禁用 ⇒ 0 帧 keepalive、不置 WATCHDOG_RISK\n");
+
+    fx_close(&fx);
+}
+
 static void test_robustness(void)
 {
     fix_t fx;
     unsigned i;
 
-    printf("[6] robustness: feedback freshness / link health / fault edge\n");
-
+    printf("[10] robustness: feedback freshness / link health / fault edge\n");
     if (fx_open(&fx, "0:id=1,gear=16.0,tconst=0.0385,pmax=12.5,vmax=65,tmax=50,"
                      "kpmax=500,kdmax=5,hb=10,timeout=30000,fd", 1u) != 0) {
         printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
@@ -1309,6 +1668,10 @@ int main(void)
     test_ops();          printf("\n");
     test_activate();     printf("\n");
     test_wide_param_read(); printf("\n");
+    test_lost_first_request(); printf("\n");
+    test_handshake_retry(); printf("\n");
+    test_watchdog_readback(); printf("\n");
+    test_watchdog_disabled(); printf("\n");
     test_robustness();   printf("\n");
 
     free(g_json);

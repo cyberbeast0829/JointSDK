@@ -19,6 +19,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include "cli_text.h"
 
 /* ==========================================================================
  * 小工具
@@ -29,11 +30,11 @@ static void out_kv(cli_app_t *a, const char *k, const char *fmt, ...)
     va_list ap;
 
     if (a->o.json) return;
-    fprintf(a->out, "  %-22s ", k);
+    cli_fprintf(a->out, "  %-22s ", k);
     va_start(ap, fmt);
     vfprintf(a->out, fmt, ap);
     va_end(ap);
-    fputc('\n', a->out);
+    cli_fputc('\n', a->out);
 }
 
 /** 退出码：安全闸拒绝用 3，用法错误 2，运行失败 1。 */
@@ -72,7 +73,7 @@ static int require_yes(cli_app_t *a, const char *what)
         cli_json_obj_end(&j);
         cli_json_finish(&j);
     }
-    fprintf(a->err,
+    cli_fprintf(a->err,
             "jsdk-cli: 拒绝执行 %s —— 会写设备/驱动电机，必须显式加 --yes\n"
             "          （先用只读子命令确认节点、量程与限值）\n", what);
     return CLI_EXIT_REFUSED;
@@ -195,20 +196,20 @@ static int cmd_scan(cli_app_t *a)
         cli_json_i64(&j, "count", (long long)found);
         cli_json_finish(&j);
     } else {
-        fprintf(a->out, "发现 %u 个节点（被动 200 ms + 主动探测 1..%u）:\n",
+        cli_fprintf(a->out, "发现 %u 个节点（被动 200 ms + 主动探测 1..%u）:\n",
                 found, a->o.max_probe);
         for (i = 0u; i < found; ++i) {
-            fprintf(a->out, "  node %u\n", (unsigned)ids[i]);
+            cli_fprintf(a->out, "  node %u\n", (unsigned)ids[i]);
         }
         if (found == 0u) {
-            fprintf(a->out, "  （无）—— 逐条检查：\n"
+            cli_fprintf(a->out, "  （无）—— 逐条检查：\n"
                             "    1. 总线是否 up；波特率 / FD / BRS 是否与设备 "
                             "can.config.baud_rate 一致（协议无运行时协商）\n"
                             "    2. 是否有 120Ω 终端电阻、CAN_H/L 是否接反\n"
                             "    3. 设备**必须先收到过一帧**才学到主站地址（地址为 0 时"
                             "设备完全不回复）\n");
             if (a->o.max_probe == 0u) {
-                fprintf(a->out, "    4. 本次是 `--probe 0`（仅被动听心跳）：首次连接"
+                cli_fprintf(a->out, "    4. 本次是 `--probe 0`（仅被动听心跳）：首次连接"
                                 "请用 `--probe 16` 主动探测\n");
             }
         }
@@ -240,7 +241,7 @@ static int cmd_info(cli_app_t *a)
         cli_json_i64(&js, "node", (long long)a->o.node);
         cli_json_finish(&js);
     } else {
-        fprintf(a->out, "节点 %u:\n", (unsigned)a->o.node);
+        cli_fprintf(a->out, "节点 %u:\n", (unsigned)a->o.node);
         out_kv(a, "hw_version", "%lu", (unsigned long)info.hw_version);
         out_kv(a, "fw_version", "%lu", (unsigned long)info.fw_version);
         out_kv(a, "serial", "%llu", (unsigned long long)info.serial);
@@ -320,7 +321,7 @@ static int health_common(cli_app_t *a, int with_json_wrapper)
         return CLI_EXIT_OK;
     }
 
-    fprintf(a->out, "节点 %u 健康快照:\n", (unsigned)a->o.node);
+    cli_fprintf(a->out, "节点 %u 健康快照:\n", (unsigned)a->o.node);
     out_kv(a, "online", "%s", fb.online ? "yes" : "no");
     out_kv(a, "enabled", "%s", jsdk_joint_is_enabled(j) ? "yes" : "no");
     out_kv(a, "fault", "%s", jsdk_joint_is_fault(j) ? "yes" : "no");
@@ -351,7 +352,7 @@ static int health_common(cli_app_t *a, int with_json_wrapper)
         }
     }
 
-    fprintf(a->out, "总线:\n");
+    cli_fprintf(a->out, "总线:\n");
     out_kv(a, "link_up", "%s", bs.link_up ? "yes" : "no");
     out_kv(a, "nodes_online", "%u", (unsigned)bs.nodes_online);
     out_kv(a, "tx/rx", "%lu / %lu", (unsigned long)bs.tx_frames,
@@ -371,6 +372,35 @@ static int cmd_health(cli_app_t *a) { return health_common(a, 0); }
  * 只读：mon
  * ======================================================================== */
 
+/* --------------------------------------------------------------------------
+ * CSV 列定义（`mon`）
+ * ------------------------------------------------------------------------
+ * 列：时间 → 物理量 → 状态 → 诊断计数。取的是 cyberbeast_tool.py 采集脚本里
+ * 共有的量，方便两边对着看。
+ *
+ * ⚠ 这份表头**两版 CLI 共用一份契约**：`jsdk-cli mon --csv` 写到 stdout 的
+ *   第一行、`--csv-file` 文件的第一行、以及 `python -m jsdk_can mon --csv`
+ *   输出的第一行，必须是**逐字节相同**的（有跨版本对拍用例钉住）。
+ */
+#define CLI_MON_CSV_HEADER \
+    "t_ms,node,pos_rad,vel_rad_s,current_A,torque_Nm," \
+    "t_motor_C,t_fet_C,vbus_V,ibus_A,axis_state,mode,err_code," \
+    "hb_error,age_ms,tx_frames,tx_rejected\n"
+
+/** 写一行 CSV（stdout 与文件用同一个实现，避免两边列数漂移）。 */
+static void mon_csv_row(FILE *f, const jsdk_joint_feedback_t *fb,
+                        uint32_t elapsed_ms, unsigned node)
+{
+    cli_fprintf(f, "%lu,%u,%.6f,%.6f,%.6f,%.6f,%.2f,%.2f,%.3f,%.3f,%s,%s,%u,%u,%lu,%lu,%lu\n",
+            (unsigned long)elapsed_ms, node,
+            fb->pos, fb->vel, fb->current_A, fb->torque_Nm,
+            fb->t_motor_C, fb->t_fet_C, fb->vbus_V, fb->ibus_A,
+            jsdk_axis_state_string(fb->axis_state), cli_mode_name(fb->mode),
+            (unsigned)fb->err_code, (unsigned)fb->hb_error,
+            (unsigned long)fb->age_ms, (unsigned long)fb->tx_frames,
+            (unsigned long)fb->tx_rejected);
+}
+
 static int cmd_mon(cli_app_t *a)
 {
     uint32_t elapsed = 0u;
@@ -378,18 +408,17 @@ static int cmd_mon(cli_app_t *a)
     FILE *csv = NULL;
     int first = 1;
 
-    if (a->o.csv) {
-        csv = fopen(a->o.csv, "w");
+    /* `--csv` = 格式开关（写到 stdout）；`--csv-file` = 额外落盘（可选）。
+       ⚠ 旧版 `--csv` 是要文件名的，改名的理由见 cli_app.c（会静默写错文件名）。 */
+    if (a->o.csv_file) {
+        csv = fopen(a->o.csv_file, "w");
         if (!csv) {
-            fprintf(a->err, "jsdk-cli: 打不开 --csv 文件 %s\n", a->o.csv);
+            cli_fprintf(a->err, "jsdk-cli: 打不开 --csv-file 文件 %s\n", a->o.csv_file);
             return CLI_EXIT_FAIL;
         }
-        /* 列：时间 → 物理量 → 状态 → 诊断计数。取的是 cyberbeast_tool.py
-           采集脚本里共有的量，方便两边对着看（列顺序不保证逐列相同）。 */
-        fprintf(csv, "t_ms,node,pos_rad,vel_rad_s,current_A,torque_Nm,"
-                     "t_motor_C,t_fet_C,vbus_V,ibus_A,axis_state,mode,err_code,"
-                     "hb_error,age_ms,tx_frames,tx_rejected\n");
+        cli_fprintf(csv, CLI_MON_CSV_HEADER);
     }
+    if (a->o.csv) cli_fprintf(a->out, CLI_MON_CSV_HEADER);
 
     /* JSON 模式下 mon 输出 NDJSON（每行一个对象），便于流式管道消费。 */
 
@@ -401,7 +430,9 @@ static int cmd_mon(cli_app_t *a)
 
         st = jsdk_joint_get_feedback(a->joint, &fb);
         if (st == JSDK_OK) {
-            if (a->o.json) {
+            if (a->o.csv) {
+                mon_csv_row(a->out, &fb, elapsed, (unsigned)a->o.node);
+            } else if (a->o.json) {
                 cli_json_t j;
                 cli_json_init(&j, a->out, 0);
                 cli_json_i64(&j, "t_ms", (long long)elapsed);
@@ -419,24 +450,17 @@ static int cmd_mon(cli_app_t *a)
                 cli_json_finish(&j);
             } else {
                 if (first) {
-                    fprintf(a->out, "%9s %7s %9s %9s %7s %7s %7s  %-12s %s\n",
+                    cli_fprintf(a->out, "%9s %7s %9s %9s %7s %7s %7s  %-12s %s\n",
                             "t_ms", "pos_rad", "vel_rad/s", "tau_Nm", "tMot", "vbus",
                             "age_ms", "state", "err");
                 }
-                fprintf(a->out, "%9lu %7.3f %9.3f %9.3f %7.1f %7.1f %7lu  %-12s %u\n",
+                cli_fprintf(a->out, "%9lu %7.3f %9.3f %9.3f %7.1f %7.1f %7lu  %-12s %u\n",
                         (unsigned long)elapsed, fb.pos, fb.vel, fb.torque_Nm,
                         fb.t_motor_C, fb.vbus_V, (unsigned long)fb.age_ms,
                         jsdk_axis_state_string(fb.axis_state), (unsigned)fb.err_code);
             }
             if (csv) {
-                fprintf(csv, "%lu,%u,%.6f,%.6f,%.6f,%.6f,%.2f,%.2f,%.3f,%.3f,%s,%s,%u,%u,%lu,%lu,%lu\n",
-                        (unsigned long)elapsed, (unsigned)a->o.node,
-                        fb.pos, fb.vel, fb.current_A, fb.torque_Nm,
-                        fb.t_motor_C, fb.t_fet_C, fb.vbus_V, fb.ibus_A,
-                        jsdk_axis_state_string(fb.axis_state), cli_mode_name(fb.mode),
-                        (unsigned)fb.err_code, (unsigned)fb.hb_error,
-                        (unsigned long)fb.age_ms, (unsigned long)fb.tx_frames,
-                        (unsigned long)fb.tx_rejected);
+                mon_csv_row(csv, &fb, elapsed, (unsigned)a->o.node);
                 fflush(csv);
             }
         }
@@ -447,7 +471,7 @@ static int cmd_mon(cli_app_t *a)
     }
 
     if (csv) fclose(csv);
-    if (!a->o.json && !a->o.quiet) fprintf(a->out, "（mon 结束）\n");
+    if (!a->o.json && !a->o.quiet) cli_fprintf(a->out, "（mon 结束）\n");
     return CLI_EXIT_OK;
 }
 
@@ -462,7 +486,7 @@ static int cmd_read(cli_app_t *a)
     char text[64];
     const char *path = (a->o.nargs > 0u) ? a->o.args[0] : NULL;
 
-    if (!path) { fprintf(a->err, "jsdk-cli: read 需要 <path>\n"); return CLI_EXIT_USAGE; }
+    if (!path) { cli_fprintf(a->err, "jsdk-cli: read 需要 <path>\n"); return CLI_EXIT_USAGE; }
 
     st = jsdk_joint_param_get(a->joint, path, &v);
     if (st != JSDK_OK) { cli_error(a, path, st); return CLI_EXIT_FAIL; }
@@ -477,7 +501,7 @@ static int cmd_read(cli_app_t *a)
         cli_json_str(&j, "value_text", text);
         cli_json_finish(&j);
     } else {
-        fprintf(a->out, "%s = %s (%s)\n", path, text, jsdk_ep_type_string(v.type));
+        cli_fprintf(a->out, "%s = %s (%s)\n", path, text, jsdk_ep_type_string(v.type));
     }
     return CLI_EXIT_OK;
 }
@@ -489,8 +513,8 @@ static int cmd_batch_read(cli_app_t *a)
     jsdk_status_t st;
     char text[64];
 
-    if (a->o.nargs == 0u) { fprintf(a->err, "jsdk-cli: batch-read 需要 <path>...\n"); return CLI_EXIT_USAGE; }
-    if (a->o.nargs > 8u)   { fprintf(a->err, "jsdk-cli: 一次最多 8 条（超了请分批）\n"); return CLI_EXIT_USAGE; }
+    if (a->o.nargs == 0u) { cli_fprintf(a->err, "jsdk-cli: batch-read 需要 <path>...\n"); return CLI_EXIT_USAGE; }
+    if (a->o.nargs > 8u)   { cli_fprintf(a->err, "jsdk-cli: 一次最多 8 条（超了请分批）\n"); return CLI_EXIT_USAGE; }
 
     n = a->o.nargs;
     memset(reqs, 0, sizeof reqs);
@@ -521,9 +545,9 @@ static int cmd_batch_read(cli_app_t *a)
         for (i = 0u; i < n; ++i) {
             if (reqs[i].status == JSDK_OK) {
                 value_to_text(&reqs[i].value, text, sizeof text);
-                fprintf(a->out, "  %-52s = %s\n", reqs[i].path, text);
+                cli_fprintf(a->out, "  %-52s = %s\n", reqs[i].path, text);
             } else {
-                fprintf(a->out, "  %-52s ! %s\n", reqs[i].path,
+                cli_fprintf(a->out, "  %-52s ! %s\n", reqs[i].path,
                         jsdk_status_string(reqs[i].status));
             }
         }
@@ -558,7 +582,7 @@ static int cmd_dump_config(cli_app_t *a)
         cli_json_i64(&j, "break_timeout_ms", (long long)s.break_timeout_ms);
         cli_json_finish(&j);
     } else {
-        fprintf(a->out, "节点 %u 配置快照 (valid=%d):\n", (unsigned)a->o.node, s.valid);
+        cli_fprintf(a->out, "节点 %u 配置快照 (valid=%d):\n", (unsigned)a->o.node, s.valid);
         out_kv(a, "gear_ratio", "%.6g", (double)s.gear_ratio);
         out_kv(a, "mit_max_pos", "%.6g rad", (double)s.mit_max_pos);
         out_kv(a, "mit_max_vel", "%.6g rad/s", (double)s.mit_max_vel);
@@ -569,7 +593,8 @@ static int cmd_dump_config(cli_app_t *a)
         out_kv(a, "node_id", "%lu", (unsigned long)s.node_id);
         out_kv(a, "heartbeat_rate_ms", "%lu", (unsigned long)s.heartbeat_rate_ms);
         out_kv(a, "break_timeout_ms", "%lu%s", (unsigned long)s.break_timeout_ms,
-               (s.break_timeout_ms == 0u) ? "  ← 固件按 100 ms 处理，0 不等于关闭" : "");
+               (s.break_timeout_ms == 0u)
+                   ? "  ← 0 = 设备侧协议超时已禁用（不是 100 ms）" : "");
     }
     return CLI_EXIT_OK;
 }
@@ -606,17 +631,17 @@ static int cmd_err(cli_app_t *a)
                                    f.system_error, f.axis_error };
         unsigned i;
 
-        fprintf(a->out, "节点 %u 错误明细:\n", (unsigned)a->o.node);
+        cli_fprintf(a->out, "节点 %u 错误明细:\n", (unsigned)a->o.node);
         out_kv(a, "mit_err", "%u (%s)", (unsigned)f.mit_err,
                jsdk_joint_error_string(f.mit_err));
         out_kv(a, "hb_flags", "0x%02X", (unsigned)f.hb_flags);
         for (i = 0u; i < 6u; ++i) {
             unsigned bit = 0u;
             const char *first = jsdk_axis_error_first(vals[i], &bit);
-            fprintf(a->out, "  %-22s 0x%08lX  %s\n", names[i],
+            cli_fprintf(a->out, "  %-22s 0x%08lX  %s\n", names[i],
                     (unsigned long)vals[i],
                     first ? first : "无错误");
-            if (first) fprintf(a->out, "  %-22s           bit %u\n", "", bit);
+            if (first) cli_fprintf(a->out, "  %-22s           bit %u\n", "", bit);
         }
     }
     return CLI_EXIT_OK;
@@ -703,11 +728,11 @@ static int cmd_hb_dump(cli_app_t *a)
             cli_json_i64(&j, "control_mode", (long long)(f->len > 1u ? f->data[1] & 0x0Fu : 0u));
             cli_json_obj_end(&j);
         } else {
-            fprintf(a->out, "src=%u len=%u  bytes: %s\n", src, (unsigned)f->len, hex);
+            cli_fprintf(a->out, "src=%u len=%u  bytes: %s\n", src, (unsigned)f->len, hex);
             if (f->len >= 2u) {
                 unsigned b0 = f->data[0];
                 unsigned b1 = f->data[1];
-                fprintf(a->out, "    b0 life=%u%u%u%u err=0x%X   b1 state=%u%u%u%u ctrl=%u\n",
+                cli_fprintf(a->out, "    b0 life=%u%u%u%u err=0x%X   b1 state=%u%u%u%u ctrl=%u\n",
                         (b0 >> 4) & 1u, (b0 >> 5) & 1u, (b0 >> 6) & 1u, (b0 >> 7) & 1u,
                         b0 & 0xFu,
                         (b1 >> 4) & 1u, (b1 >> 5) & 1u, (b1 >> 6) & 1u, (b1 >> 7) & 1u,
@@ -723,7 +748,7 @@ static int cmd_hb_dump(cli_app_t *a)
         cli_json_i64(&j, "waited_ms", (long long)waited);
         cli_json_finish(&j);
     } else if (shown == 0u) {
-        fprintf(a->out,
+        cli_fprintf(a->out,
                 "等了 %lu ms 没等到节点 %u 的心跳（本次共收到 %u 帧）。\n"
                 "逐条检查：\n"
                 "  1. 节点地址是否正确（--node）\n"
@@ -764,7 +789,7 @@ static int cmd_desc_info(cli_app_t *a)
         cli_json_bool(&j, "raw_sink_failed", di.raw_sink_failed);
         cli_json_finish(&j);
     } else {
-        fprintf(a->out, "描述符:\n");
+        cli_fprintf(a->out, "描述符:\n");
         out_kv(a, "total_len", "%lu 字节", (unsigned long)di.total_len);
         out_kv(a, "crc", "0x%04X", (unsigned)di.crc);
         out_kv(a, "fw_version", "%lu", (unsigned long)di.fw_version);
@@ -825,7 +850,7 @@ static int ep_list_visit(void *user, const char *path, uint16_t ep_id,
         cli_json_str(c->j, "access", acc);
         cli_json_obj_end(c->j);
     } else {
-        fprintf(c->a->out, "  %5u  %-3s  %-14s %s\n", (unsigned)ep_id, acc,
+        cli_fprintf(c->a->out, "  %5u  %-3s  %-14s %s\n", (unsigned)ep_id, acc,
                 jsdk_ep_type_string(type), path);
     }
     c->n++;
@@ -855,9 +880,9 @@ static int cmd_ep_list(cli_app_t *a)
         cli_json_str(&j, "status", jsdk_status_string(st));
         cli_json_finish(&j);
     } else {
-        fprintf(a->out, "%5s  %-3s  %-14s %s\n", "id", "acc", "type", "path");
+        cli_fprintf(a->out, "%5s  %-3s  %-14s %s\n", "id", "acc", "type", "path");
         st = jsdk_endpoint_enumerate(a->ctx, ep_list_visit, &c);
-        fprintf(a->out, "共 %u 个端点%s%s\n", c.n,
+        cli_fprintf(a->out, "共 %u 个端点%s%s\n", c.n,
                 a->o.filter ? "（filter=" : "", a->o.filter ? a->o.filter : "");
     }
 
@@ -872,7 +897,7 @@ static int cmd_ep_lookup(cli_app_t *a)
     jsdk_status_t st;
     const char *path = (a->o.nargs > 0u) ? a->o.args[0] : NULL;
 
-    if (!path) { fprintf(a->err, "jsdk-cli: ep-lookup 需要 <path>\n"); return CLI_EXIT_USAGE; }
+    if (!path) { cli_fprintf(a->err, "jsdk-cli: ep-lookup 需要 <path>\n"); return CLI_EXIT_USAGE; }
 
     st = jsdk_endpoint_lookup(a->ctx, path, &ep_id, &type, &access);
     if (st != JSDK_OK) { cli_error(a, path, st); return CLI_EXIT_FAIL; }
@@ -887,7 +912,7 @@ static int cmd_ep_lookup(cli_app_t *a)
         cli_json_bool(&j, "writable", (access & JSDK_EP_ACCESS_W) ? 1 : 0);
         cli_json_finish(&j);
     } else {
-        fprintf(a->out, "%s\n  id=%u type=%s access=%c%c\n", path, (unsigned)ep_id,
+        cli_fprintf(a->out, "%s\n  id=%u type=%s access=%c%c\n", path, (unsigned)ep_id,
                 jsdk_ep_type_string(type),
                 (access & JSDK_EP_ACCESS_R) ? 'r' : '-',
                 (access & JSDK_EP_ACCESS_W) ? 'w' : '-');
@@ -903,11 +928,11 @@ static int cmd_desc_export(cli_app_t *a)
     FILE  *f;
     const char *path = (a->o.nargs > 0u) ? a->o.args[0] : NULL;
 
-    if (!path) { fprintf(a->err, "jsdk-cli: desc-export 需要 <file>\n"); return CLI_EXIT_USAGE; }
+    if (!path) { cli_fprintf(a->err, "jsdk-cli: desc-export 需要 <file>\n"); return CLI_EXIT_USAGE; }
 
     cap = jsdk_desc_export_max_size(a->ctx);
     buf = calloc(1u, cap ? cap : 1u);
-    if (!buf) { fprintf(a->err, "jsdk-cli: 内存不足（%u 字节）\n", (unsigned)cap); return CLI_EXIT_FAIL; }
+    if (!buf) { cli_fprintf(a->err, "jsdk-cli: 内存不足（%u 字节）\n", (unsigned)cap); return CLI_EXIT_FAIL; }
 
     st = jsdk_context_desc_export(a->ctx, buf, cap, &len);
     if (st != JSDK_OK) { free(buf); cli_error(a, "desc-export", st); return CLI_EXIT_FAIL; }
@@ -915,12 +940,12 @@ static int cmd_desc_export(cli_app_t *a)
     f = fopen(path, "wb");
     if (!f) {
         free(buf);
-        fprintf(a->err, "jsdk-cli: 写不了 %s\n", path);
+        cli_fprintf(a->err, "jsdk-cli: 写不了 %s\n", path);
         return CLI_EXIT_FAIL;
     }
     if (fwrite(buf, 1u, len, f) != len) {
         fclose(f); free(buf);
-        fprintf(a->err, "jsdk-cli: 写 %s 不完整\n", path);
+        cli_fprintf(a->err, "jsdk-cli: 写 %s 不完整\n", path);
         return CLI_EXIT_FAIL;
     }
     fclose(f);
@@ -933,8 +958,8 @@ static int cmd_desc_export(cli_app_t *a)
         cli_json_i64(&j, "bytes", (long long)len);
         cli_json_finish(&j);
     } else {
-        fprintf(a->out, "已导出 %lu 字节 → %s\n", (unsigned long)len, path);
-        fprintf(a->out, "提示：缓存与 retain/filter_paths/SDK 格式版本绑定，"
+        cli_fprintf(a->out, "已导出 %lu 字节 → %s\n", (unsigned long)len, path);
+        cli_fprintf(a->out, "提示：缓存与 retain/filter_paths/SDK 格式版本绑定，"
                         "改其中任一项都要重新下载。\n");
     }
     return CLI_EXIT_OK;
@@ -950,21 +975,21 @@ static int cmd_desc_import(cli_app_t *a)
     size_t got;
     jsdk_status_t st;
 
-    if (!path) { fprintf(a->err, "jsdk-cli: desc-import 需要 <file>\n"); return CLI_EXIT_USAGE; }
+    if (!path) { cli_fprintf(a->err, "jsdk-cli: desc-import 需要 <file>\n"); return CLI_EXIT_USAGE; }
 
     f = fopen(path, "rb");
-    if (!f) { fprintf(a->err, "jsdk-cli: 读不了 %s\n", path); return CLI_EXIT_FAIL; }
+    if (!f) { cli_fprintf(a->err, "jsdk-cli: 读不了 %s\n", path); return CLI_EXIT_FAIL; }
     if (fseek(f, 0L, SEEK_END) != 0) { fclose(f); return CLI_EXIT_FAIL; }
     sz = ftell(f);
-    if (sz <= 0) { fclose(f); fprintf(a->err, "jsdk-cli: %s 是空文件\n", path); return CLI_EXIT_FAIL; }
+    if (sz <= 0) { fclose(f); cli_fprintf(a->err, "jsdk-cli: %s 是空文件\n", path); return CLI_EXIT_FAIL; }
     rewind(f);
     buf = calloc(1u, (size_t)sz);
-    if (!buf) { fclose(f); fprintf(a->err, "jsdk-cli: 内存不足\n"); return CLI_EXIT_FAIL; }
+    if (!buf) { fclose(f); cli_fprintf(a->err, "jsdk-cli: 内存不足\n"); return CLI_EXIT_FAIL; }
     got = fread(buf, 1u, (size_t)sz, f);
     fclose(f);
     if (got != (size_t)sz) {
         free(buf);
-        fprintf(a->err, "jsdk-cli: 读 %s 不完整\n", path);
+        cli_fprintf(a->err, "jsdk-cli: 读 %s 不完整\n", path);
         return CLI_EXIT_FAIL;
     }
 
@@ -993,9 +1018,9 @@ static int cmd_desc_import(cli_app_t *a)
                 cli_json_bool(&j, "downloaded", 0);
                 cli_json_finish(&j);
             } else {
-                fprintf(a->out, "已从 %s 导入 %lu 字节，端点表 %u 条（未下载）\n",
+                cli_fprintf(a->out, "已从 %s 导入 %lu 字节，端点表 %u 条（未下载）\n",
                         path, (unsigned long)got, count);
-                fprintf(a->out, "提示：正式用法是在启动时先 desc-import，"
+                cli_fprintf(a->out, "提示：正式用法是在启动时先 desc-import，"
                                 "成功就不再下载；失败再走 configure()。\n");
             }
         }
@@ -1026,7 +1051,7 @@ static int cmd_write(cli_app_t *a)
 
     if (rc != 0) return rc;
     if (a->o.nargs < 2u) {
-        fprintf(a->err, "jsdk-cli: write 需要 <path> <value>\n");
+        cli_fprintf(a->err, "jsdk-cli: write 需要 <path> <value>\n");
         return CLI_EXIT_USAGE;
     }
 
@@ -1034,12 +1059,12 @@ static int cmd_write(cli_app_t *a)
     st = jsdk_endpoint_lookup(a->ctx, a->o.args[0], &ep_id, &type, &access);
     if (st != JSDK_OK) { cli_error(a, a->o.args[0], st); return CLI_EXIT_FAIL; }
     if (!(access & JSDK_EP_ACCESS_W)) {
-        fprintf(a->err, "jsdk-cli: %s 不可写（access=%c%c）\n", a->o.args[0],
+        cli_fprintf(a->err, "jsdk-cli: %s 不可写（access=%c%c）\n", a->o.args[0],
                 (access & JSDK_EP_ACCESS_R) ? 'r' : '-', 'w');
         return CLI_EXIT_FAIL;
     }
     if (text_to_value(a->o.args[1], type, &val) != 0) {
-        fprintf(a->err, "jsdk-cli: 值 \"%s\" 不是合法的 %s（超范围也算非法，"
+        cli_fprintf(a->err, "jsdk-cli: 值 \"%s\" 不是合法的 %s（超范围也算非法，"
                         "不静默截断）\n", a->o.args[1], jsdk_ep_type_string(type));
         return CLI_EXIT_FAIL;
     }
@@ -1058,9 +1083,9 @@ static int cmd_write(cli_app_t *a)
         cli_json_str(&j, "persisted", "no (use save to persist)");
         cli_json_finish(&j);
     } else {
-        fprintf(a->out, "已写入 %s = %s（%s，ep %u）\n", a->o.args[0], a->o.args[1],
+        cli_fprintf(a->out, "已写入 %s = %s（%s，ep %u）\n", a->o.args[0], a->o.args[1],
                 jsdk_ep_type_string(type), (unsigned)ep_id);
-        fprintf(a->out, "注意：未落 Flash；需要持久化请再跑 `save`。\n");
+        cli_fprintf(a->out, "注意：未落 Flash；需要持久化请再跑 `save`。\n");
     }
     return CLI_EXIT_OK;
 }
@@ -1080,7 +1105,7 @@ static int cmd_save(cli_app_t *a)
         cli_json_bool(&j, "saved", 1);
         cli_json_finish(&j);
     } else {
-        fprintf(a->out, "配置已保存到 Flash（并已读回校验）\n");
+        cli_fprintf(a->out, "配置已保存到 Flash（并已读回校验）\n");
     }
     return CLI_EXIT_OK;
 }
@@ -1092,9 +1117,9 @@ static int cmd_set_node_id(cli_app_t *a)
     int rc = require_yes(a, "set-node-id");
 
     if (rc != 0) return rc;
-    if (a->o.nargs < 1u) { fprintf(a->err, "jsdk-cli: set-node-id 需要 <N>\n"); return CLI_EXIT_USAGE; }
+    if (a->o.nargs < 1u) { cli_fprintf(a->err, "jsdk-cli: set-node-id 需要 <N>\n"); return CLI_EXIT_USAGE; }
     if (parse_u32_arg(a->o.args[0], &id) != 0 || id == 0u || id > 254u) {
-        fprintf(a->err, "jsdk-cli: 节点 ID 非法（1..254）：%s\n", a->o.args[0]);
+        cli_fprintf(a->err, "jsdk-cli: 节点 ID 非法（1..254）：%s\n", a->o.args[0]);
         return CLI_EXIT_USAGE;
     }
 
@@ -1109,8 +1134,8 @@ static int cmd_set_node_id(cli_app_t *a)
         cli_json_bool(&j, "persisted", 1);
         cli_json_finish(&j);
     } else {
-        fprintf(a->out, "节点 ID %u → %u（已落 Flash）\n", (unsigned)a->o.node, (unsigned)id);
-        fprintf(a->out, "后续命令请用 --node %u\n", (unsigned)id);
+        cli_fprintf(a->out, "节点 ID %u → %u（已落 Flash）\n", (unsigned)a->o.node, (unsigned)id);
+        cli_fprintf(a->out, "后续命令请用 --node %u\n", (unsigned)id);
     }
     return CLI_EXIT_OK;
 }
@@ -1118,31 +1143,78 @@ static int cmd_set_node_id(cli_app_t *a)
 static int cmd_watchdog(cli_app_t *a)
 {
     uint32_t ms;
+    uint32_t raw = 0u;
+    int raw_ok;
     jsdk_status_t st;
+    jsdk_joint_config_snapshot_t s;
+    int verified;
     int rc = require_yes(a, "watchdog");
 
     if (rc != 0) return rc;
-    if (a->o.nargs < 1u) { fprintf(a->err, "jsdk-cli: watchdog 需要 <MS>\n"); return CLI_EXIT_USAGE; }
+    if (a->o.nargs < 1u) { cli_fprintf(a->err, "jsdk-cli: watchdog 需要 <MS>\n"); return CLI_EXIT_USAGE; }
     if (parse_u32_arg(a->o.args[0], &ms) != 0) {
-        fprintf(a->err, "jsdk-cli: 毫秒数非法：%s\n", a->o.args[0]);
+        cli_fprintf(a->err, "jsdk-cli: 毫秒数非法：%s\n", a->o.args[0]);
         return CLI_EXIT_USAGE;
     }
 
     st = jsdk_joint_set_watchdog_ms(a->joint, ms);
     if (st != JSDK_OK) { cli_error(a, "watchdog", st); return CLI_EXIT_FAIL; }
 
+    /* 校验结论只认标志位：真机上该端点读回恒为 0（F28），
+       所以“写成功”不能当作“已武装”。
+       ⚠ 这里**再独立读一次设备**，而不是回显 SDK 内部记住的写入值 ——
+         否则 JSON 会在“写 250、设备读回 0”时说 “device_reports_ms: 250”，
+         那就又变成“说得比知道的多了”。 */
+    {
+        jsdk_joint_feedback_t fb;
+        jsdk_value_t v;
+        memset(&fb, 0, sizeof fb);
+        (void)jsdk_joint_get_feedback(a->joint, &fb);
+        verified = ((fb.status_flags & JSDK_JF_WATCHDOG_UNVERIFIED) == 0u);
+
+        raw_ok = 0;
+        if (jsdk_joint_param_get(a->joint, "can.config.break_timeout", &v) == JSDK_OK) {
+            switch (v.type) {
+            case JSDK_EP_U8:  raw = v.v.u8;  raw_ok = 1; break;
+            case JSDK_EP_U16: raw = v.v.u16; raw_ok = 1; break;
+            case JSDK_EP_U32: raw = v.v.u32; raw_ok = 1; break;
+            default: break;
+            }
+        }
+    }
+    if (jsdk_joint_read_config_snapshot(a->joint, &s) != JSDK_OK) {
+        s.break_timeout_ms = ms;
+        s.valid = 0;
+    }
+
     if (a->o.json) {
         cli_json_t j;
         cli_json_init(&j, a->out, 0);
-        cli_json_i64(&j, "break_timeout_ms", (long long)ms);
-        cli_json_bool(&j, "persisted", 0);
+        cli_json_i64(&j, "ms", (long long)ms);
+        if (raw_ok) cli_json_i64(&j, "device_reports_ms", (long long)raw);
+        else       cli_json_null(&j, "device_reports_ms");
+        cli_json_bool(&j, "verified", verified);
+        cli_json_bool(&j, "disabled", ms == 0u);
         cli_json_finish(&j);
     } else {
-        fprintf(a->out, "break_timeout = %lu ms\n", (unsigned long)ms);
+        cli_fprintf(a->out, "写入 break_timeout = %lu ms\n", (unsigned long)ms);
+        if (raw_ok)
+            cli_fprintf(a->out, "  设备独立读回：%lu ms\n", (unsigned long)raw);
         if (ms == 0u) {
-            fprintf(a->out, "⚠ 固件把 0 解释为 **100 ms**（0 不等于关闭）。"
-                            "要真正放宽请写一个大值（如 65535）。\n");
+            cli_fprintf(a->out, "  0 = **关闭**设备侧协议级超时检测"
+                                "（最新固件语义，不等于 100 ms）\n");
+        } else if (!verified) {
+            /* 不用 U+26A0：CP936 表示不了它，中文控制台上会变成 '?'
+               （“输出文本必须在 CP936 里可表示”是 cli_text_lint 的静态检查）。 */
+            cli_fprintf(a->out, "  写入已接受，但**读回校验未成功**："
+                                "无法确认保护已武装\n");
+            cli_fprintf(a->out, "  原因：本固件该端点读回恒为 0（= 禁用）→ "
+                                "FIRMWARE_ISSUES F28\n");
+        } else {
+            cli_fprintf(a->out, "  已读回确认\n");
         }
+        cli_fprintf(a->out, "保护只在设备收到过控制类帧后武装；"
+                            "纯 CURRENT(0x04) 客户端武装不了（F19）\n");
     }
     return CLI_EXIT_OK;
 }
@@ -1162,7 +1234,7 @@ static int cmd_set_zero(cli_app_t *a)
         cli_json_bool(&j, "zeroed", 1);
         cli_json_finish(&j);
     } else {
-        fprintf(a->out, "当前位置已设为零点（未落 Flash，需 save 持久化）\n");
+        cli_fprintf(a->out, "当前位置已设为零点（未落 Flash，需 save 持久化）\n");
     }
     return CLI_EXIT_OK;
 }
@@ -1182,7 +1254,7 @@ static int cmd_reset(cli_app_t *a)
         cli_json_bool(&j, "reset", 1);
         cli_json_finish(&j);
     } else {
-        fprintf(a->out, "设备已软复位（之后需要重新握手 / configure）\n");
+        cli_fprintf(a->out, "设备已软复位（之后需要重新握手 / configure）\n");
     }
     return CLI_EXIT_OK;
 }
@@ -1204,13 +1276,13 @@ static int cmd_calibrate(cli_app_t *a)
         cli_json_str(&j, "warning", "motor moves during full calibration");
         cli_json_finish(&j);
     } else {
-        fprintf(a->out, "开始全标定（电机会动，耗时可能数秒）…\n");
+        cli_fprintf(a->out, "开始全标定（电机会动，耗时可能数秒）…\n");
     }
 
     st = jsdk_joint_calibrate(a->joint);
     if (st != JSDK_OK) { cli_error(a, "calibrate", st); return CLI_EXIT_FAIL; }
 
-    if (!a->o.json) fprintf(a->out, "标定完成（状态已离开瞬时态）\n");
+    if (!a->o.json) cli_fprintf(a->out, "标定完成（状态已离开瞬时态）\n");
     return CLI_EXIT_OK;
 }
 
@@ -1220,7 +1292,7 @@ static int cmd_home(cli_app_t *a)
     int rc = require_yes(a, "home");
     if (rc != 0) return rc;
 
-    if (!a->o.json) fprintf(a->out, "开始回零…\n");
+    if (!a->o.json) cli_fprintf(a->out, "开始回零…\n");
 
     st = jsdk_joint_home(a->joint);
     if (st != JSDK_OK) { cli_error(a, "home", st); return CLI_EXIT_FAIL; }
@@ -1231,7 +1303,7 @@ static int cmd_home(cli_app_t *a)
         cli_json_bool(&j, "homed", 1);
         cli_json_finish(&j);
     } else {
-        fprintf(a->out, "回零完成\n");
+        cli_fprintf(a->out, "回零完成\n");
     }
     return CLI_EXIT_OK;
 }
@@ -1246,7 +1318,7 @@ static int cmd_estop(cli_app_t *a)
         cli_json_bool(&j, "estop_sent", 1);
         cli_json_finish(&j);
     } else {
-        fprintf(a->out, "已广播 ESTOP(0xC0)——最高仲裁优先级，总线上的设备应进入"
+        cli_fprintf(a->out, "已广播 ESTOP(0xC0)——最高仲裁优先级，总线上的设备应进入"
                         "安全状态\n");
     }
     /* ESTOP 是安全动作，不需要 --yes：拒绝执行反而更危险 */
@@ -1274,24 +1346,24 @@ static int cmd_mit(cli_app_t *a)
 
     /* --- 第二道闸：--hold 必需且有上限 --- */
     if (a->o.hold_s < 0) {
-        fprintf(a->err,
+        cli_fprintf(a->err,
                 "jsdk-cli: mit 必须同时给 --hold <秒>（1..60）。\n"
                 "          它是唯一会驱动电机的命令，--hold 到期会自动 hold + disable。\n");
         return CLI_EXIT_REFUSED;
     }
     if (a->o.hold_s == 0 || a->o.hold_s > 60) {
-        fprintf(a->err, "jsdk-cli: --hold 必须在 1..60 秒之间（给的是 %d）\n", a->o.hold_s);
+        cli_fprintf(a->err, "jsdk-cli: --hold 必须在 1..60 秒之间（给的是 %d）\n", a->o.hold_s);
         return CLI_EXIT_USAGE;
     }
 
     if (jsdk_joint_read_config_snapshot(a->joint, &snap) != JSDK_OK || !snap.valid) {
-        fprintf(a->err, "jsdk-cli: 量程无效，拒绝驱动电机"
+        cli_fprintf(a->err, "jsdk-cli: 量程无效，拒绝驱动电机"
                         "（绝不能拿一个猜的量程去发 MIT 帧）\n");
         return CLI_EXIT_FAIL;
     }
 
     /* --- 第三道闸：把边界写出来 --- */
-    fprintf(a->err,
+    cli_fprintf(a->err,
             "jsdk-cli: MIT 将发送 pos=%.4f vel=%.4f kp=%.4f kd=%.4f tau=%.4f，"
             "持续 %d s\n"
             "          量程: pos=±%.4f vel=±%.4f tau=±%.4f kp=%.4f kd=%.4f "
@@ -1306,7 +1378,7 @@ static int cmd_mit(cli_app_t *a)
             (double)snap.mit_max_torque, (double)snap.mit_max_kp,
             (double)snap.mit_max_kd, (double)snap.gear_ratio);
     if (a->o.have_stiff) {
-        fprintf(a->err, "          --stiffness %.4f N·m/rad 将换算为线上 kp=%.4f\n",
+        cli_fprintf(a->err, "          --stiffness %.4f N·m/rad 将换算为线上 kp=%.4f\n",
                 a->o.kp_stiff, a->o.kp_stiff * 2.0 * 3.14159265358979323846
                               / (double)snap.gear_ratio);
     }
@@ -1321,7 +1393,7 @@ static int cmd_mit(cli_app_t *a)
         }
     }
     if (!jsdk_joint_is_enabled(a->joint)) {
-        fprintf(a->err, "jsdk-cli: 使能失败 —— %s\n", jsdk_context_last_error(a->ctx));
+        cli_fprintf(a->err, "jsdk-cli: 使能失败 —— %s\n", jsdk_context_last_error(a->ctx));
         return CLI_EXIT_FAIL;
     }
 
@@ -1344,7 +1416,7 @@ static int cmd_mit(cli_app_t *a)
 
     while (elapsed < (uint32_t)a->o.hold_s * 1000u) {
         if (jsdk_cli_stop_requested()) {
-            fprintf(a->err, "jsdk-cli: 收到停止请求 —— 先 hold 再 disable\n");
+            cli_fprintf(a->err, "jsdk-cli: 收到停止请求 —— 先 hold 再 disable\n");
             break;
         }
         jsdk_context_cycle_begin(a->ctx, 0u);
@@ -1367,7 +1439,7 @@ static int cmd_mit(cli_app_t *a)
         jsdk_context_cycle_end(a->ctx);
 
         if (cli_sleep_ms(period_ms)) {
-            fprintf(a->err, "jsdk-cli: 收到停止请求 —— 先 hold 再 disable\n");
+            cli_fprintf(a->err, "jsdk-cli: 收到停止请求 —— 先 hold 再 disable\n");
             break;
         }
         elapsed += period_ms;
@@ -1386,7 +1458,7 @@ static int cmd_mit(cli_app_t *a)
     }
 
     if (!a->o.json) {
-        fprintf(a->out, "MIT 结束：已 hold_position 并 disable（%lu ms 实际运行）\n",
+        cli_fprintf(a->out, "MIT 结束：已 hold_position 并 disable（%lu ms 实际运行）\n",
                 (unsigned long)elapsed);
     }
     return CLI_EXIT_OK;
@@ -1399,37 +1471,82 @@ static int cmd_mit(cli_app_t *a)
 typedef struct {
     const char *name;
     int (*fn)(cli_app_t *a);
-    int  needs_desc;     /**< 1 = 需要端点表（即要先下载/解析描述符） */
+    int  desc_mode;      /**< CLI_DESC_NONE / CLI_DESC_ONLY / CLI_DESC_FULL（见 cli_app.h） */
+    /**
+     * 1 = 本命令会跑**控制/keepalive 循环**，因此必须向 SDK 声明控制周期。
+     *
+     * ⚠ 只给真跑循环的命令声明周期：SDK 有一条安全闸 ——“周期 >= 设备
+     *   break_timeout 则拒绝 configure()”（因为那样的循环喂不了协议看门狗；
+     *   `break_timeout = 0` = **禁用**时该闸不适用）。
+     *   CLI 默认周期是 10 Hz = 100 ms，历史上真机设备又被默认成 100 ms
+     *   → 只读诊断命令全被这条闸拦住（实测，已修）。
+     *   只读命令本来就不跑循环，声明周期对它毫无意义 —— 所以 `period_ns` 传 0。
+     */
+    int  needs_loop;
 } cmd_t;
 
+static const cmd_t *find_cmd(const char *name);   /* 定义在本节末尾（检索函数要用） */
+
 static const cmd_t CMDS[] = {
-    /* 不需要端点表：整条命令不碰描述符（省 41 KB 流量） */
-    { "scan",           cmd_scan,           0 },
-    { "estop",          cmd_estop,          0 },
-    /* 其余都要读参数 / 看端点 / 使能，因此需要端点表 */
-    { "info",           cmd_info,           1 },
-    { "health",         cmd_health,         1 },
-    { "mon",            cmd_mon,            1 },
-    { "read",           cmd_read,           1 },
-    { "batch-read",     cmd_batch_read,     1 },
-    { "dump-config",    cmd_dump_config,    1 },
-    { "err",            cmd_err,            1 },
-    { "hb-dump",        cmd_hb_dump,        1 },
-    { "desc-info",      cmd_desc_info,      1 },
-    { "ep-list",        cmd_ep_list,        1 },
-    { "ep-lookup",      cmd_ep_lookup,      1 },
-    { "desc-export",    cmd_desc_export,    1 },
-    { "desc-import",    cmd_desc_import,    0 },   /* 缓存的意义就是"不下载" */
-    { "write",          cmd_write,          1 },
-    { "save",           cmd_save,           1 },
-    { "set-node-id",    cmd_set_node_id,    1 },
-    { "watchdog",       cmd_watchdog,       1 },
-    { "set-zero",       cmd_set_zero,       1 },
-    { "reset",          cmd_reset,          1 },
-    { "calibrate",      cmd_calibrate,      1 },
-    { "home",           cmd_home,           1 },
-    { "mit",            cmd_mit,            1 }
+    /* 不需要端点表：整条命令不碰描述符（省 ~40 KB 流量） */
+    { "scan",           cmd_scan,           CLI_DESC_NONE, 0 },
+    { "estop",          cmd_estop,          CLI_DESC_NONE, 0 },
+    /* 只读且**不需要端点表**：这三条直接问设备，不依赖 JSON 描述符 */
+    { "info",           cmd_info,           CLI_DESC_NONE, 0 },  /* QUERY_DEVICE_INFO(0x46) */
+    { "err",            cmd_err,            CLI_DESC_NONE, 0 },  /* QUERY_ERROR(0x44) */
+    { "hb-dump",        cmd_hb_dump,        CLI_DESC_NONE, 0 },  /* 心跳原始字节 */
+    /* **只要端点表**（不标定）：标定失败时这些命令必须仍然可用，否则看不清现场 */
+    { "desc-info",      cmd_desc_info,      CLI_DESC_ONLY, 0 },
+    { "ep-list",        cmd_ep_list,        CLI_DESC_ONLY, 0 },
+    { "ep-lookup",      cmd_ep_lookup,      CLI_DESC_ONLY, 0 },
+    { "desc-export",    cmd_desc_export,    CLI_DESC_ONLY, 0 },
+    { "desc-import",    cmd_desc_import,    CLI_DESC_NONE, 0 },  /* 缓存的意义就是"不下载" */
+    /*
+     * ⚠ **读/写原始端点值不需要标定** —— 标定只是把原始值换算成物理量
+     *   （gear_ratio / torque_constant / mit_max_* …）用的。
+     *   `jsdk_joint_param_get/set()` 全程没有标定门（已核对：真正的门在
+     *   `configure()`、group、物理量 API、`home()`、keepalive）。
+     *   把它们标成 FULL 会造成一个**死结**：设备上某个标定值坏了 → 标定失败
+     *   → 连 `read` 都看不了值、连 `write` 都改不了那个坏值 → 无法自救。
+     *   实测（真机）：`health` 报 "calibration values out of range" 之后，
+     *   `read` / `dump-config` 全部不可用，而它们本来与此无关。
+     */
+    { "read",           cmd_read,           CLI_DESC_ONLY, 0 },
+    { "batch-read",     cmd_batch_read,     CLI_DESC_ONLY, 0 },
+    { "write",          cmd_write,          CLI_DESC_ONLY, 0 },
+    { "save",           cmd_save,           CLI_DESC_ONLY, 0 },
+    { "set-node-id",    cmd_set_node_id,    CLI_DESC_ONLY, 0 },
+    { "reset",          cmd_reset,          CLI_DESC_ONLY, 0 },
+    /* **描述符 + 标定**：要物理量、要动电机的命令才需要 */
+    { "health",         cmd_health,         CLI_DESC_FULL, 0 },
+    /* watchdog **必须是 FULL 档**：它写的是 `can.config.break_timeout`，而那个端点 ID
+       是在 configure() 的标定阶段解析出来的；放在 ONLY 档时 `ep_break_timeout` 恒为 0，
+       命令必然以 “endpoint unavailable” 失败（真机与仿真上都复现过 → 见逐命令用例）。 */
+    { "watchdog",       cmd_watchdog,       CLI_DESC_FULL, 0 },
+    /* dump-config 打印的是**标定后的快照**（gear_ratio / mit_max_* / torque_constant /
+       heartbeat_rate_ms…）：放在 ONLY 档时它只能打出一堆 0 与 `valid=0`，
+       看上去像“设备没配好” —— 实际上只是那一次调用没跑标定。 */
+    { "dump-config",    cmd_dump_config,    CLI_DESC_FULL, 0 },
+    { "mon",            cmd_mon,            CLI_DESC_FULL, 1 },   /* 跑采样循环 */
+    { "set-zero",       cmd_set_zero,       CLI_DESC_FULL, 0 },
+    { "calibrate",      cmd_calibrate,      CLI_DESC_FULL, 1 },   /* 阻塞式运转：周期有意义 */
+    { "home",           cmd_home,           CLI_DESC_FULL, 1 },
+    { "mit",            cmd_mit,            CLI_DESC_FULL, 1 }    /* 唯一会驱动电机的命令 */
 };
+
+/** 子命令的描述符需求档（未知子命令 → NONE）。 */
+int cli_cmd_desc_mode(const char *sub)
+{
+    const cmd_t *c = find_cmd(sub);
+    return c ? c->desc_mode : CLI_DESC_NONE;
+}
+
+/** 子命令是否跑控制/keepalive 循环（未知子命令 → 0）。 */
+int cli_cmd_needs_loop(const char *sub)
+{
+    const cmd_t *c = find_cmd(sub);
+    return c ? c->needs_loop : 0;
+}
 
 
 static const cmd_t *find_cmd(const char *name)
@@ -1458,12 +1575,12 @@ int jsdk_cli_run(int argc, char **argv, FILE *out, FILE *err)
 
     c = find_cmd(a.o.sub);
     if (!c) {
-        fprintf(err, "jsdk-cli: 未知子命令 %s（--help 看用法）\n", a.o.sub);
+        cli_fprintf(err, "jsdk-cli: 未知子命令 %s（--help 看用法）\n", a.o.sub);
         return CLI_EXIT_USAGE;
     }
 
     if (!a.o.quiet && !a.o.json && a.o.verbose) {
-        fprintf(err, "jsdk-cli: %s\n", a.o.sub);
+        cli_fprintf(err, "jsdk-cli: %s\n", a.o.sub);
     }
 
     /* cli_open 自己区分"用法/参数问题（2）"与"运行时失败（1）"——
@@ -1472,8 +1589,17 @@ int jsdk_cli_run(int argc, char **argv, FILE *out, FILE *err)
     rc = cli_open(&a);
     if (rc != 0) { cli_close(&a); return rc; }
 
-    if (c->needs_desc) {
-        if (cli_load_desc(&a) != 0) { cli_close(&a); return CLI_EXIT_FAIL; }
+    /*
+     * 端点表：
+     *   FULL → configure()（描述符 + 标定）；
+     *   ONLY → 只下描述符（标定失败也能看端点表）。
+     */
+    {
+        int dm = c->desc_mode;
+        if (dm != CLI_DESC_NONE && cli_load_desc(&a, dm == CLI_DESC_FULL) != 0) {
+            cli_close(&a);
+            return CLI_EXIT_FAIL;
+        }
     }
 
     rc = c->fn(&a);

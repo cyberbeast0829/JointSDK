@@ -47,7 +47,7 @@ def main() -> int:
         j.set_watchdog_ms(250)
         print(f"break_timeout -> "
               f"{j.param_get_u32('can.config.break_timeout')} ms")
-        print("  ⚠ 固件把 0 解释为 **100 ms**（0 不等于关闭）；要放宽请写大值")
+        print("  注意：0 = 关闭设备侧协议级超时检测（最新固件语义，不是 100 ms）")
 
         # --- 持久化 ---
         j.save_config()

@@ -29,10 +29,14 @@
  * @brief   CyberBeast Joint SDK — CYBERBEAST (CAN / CAN-FD) 后端公共 C ABI
  *
  * @details
- *  本头文件是 SDK 的**唯一**对外接口。它把 ODrive-CyberBeast 固件的
- *  CYBERBEAST 协议（CAN ID 位域、Big-Endian 定点打包、Classic/FD 分支、
+ *  本头文件是 SDK 的**唯一**对外接口。它把 CyberBeast 固件的
+ *  CYBERBEAST 协议（CAN ID 位域、定点打包、Classic/FD 分支、
  *  参数分段传输、JSON 描述符分块）全部隔离在内部，客户端只使用
  *  物理量（输出端 rad / rad/s / N·m）与关节级语义。
+ *
+ *  ⚠ 字节序提醒（若要直接用 `jsdk_ctx_write_param()` / SDO 缓冲区等裸字节接口）：
+ *    控制帧与查询响应是**大端**；**参数值是小端**（固件 memcpy 主机序）。
+ *    细节与真机实测证据见 `src/proto_cyberbeast/cb_frame.h` 的 `cb_le_*` 说明。
  *
  *  设计文档：docs/DESIGN.zh-CN.md
  *  协议细节：docs/PROTOCOL_NOTES.zh-CN.md
@@ -290,6 +294,13 @@ typedef enum {
 #define JSDK_JF_FEEDBACK_STALE   0x0008u  /**< 反馈超时（age_ms 超阈值） */
 #define JSDK_JF_TX_FAILED        0x0010u  /**< HAL send 连续失败 */
 #define JSDK_JF_SCALE_INVALID    0x0020u  /**< 未取得标定参数，物理量 API 不可用 */
+#define JSDK_JF_WATCHDOG_UNVERIFIED 0x0040u
+                                         /**< 写 `can.config.break_timeout` 后**读回不符**
+                                              （真机 F28：该端点读回恒为 0）。
+                                              SDK 已按**写入值**保守处理（宁可多喂几帧），
+                                              但调用方**不得**把它当作“已武装”的证据。
+                                              由每次 `jsdk_joint_set_watchdog_ms()`
+                                              重新判定（成功即清除）。 */
 
 /* ==========================================================================
  * 5. 不透明句柄与上下文存储
@@ -453,12 +464,19 @@ typedef struct {
     uint32_t period_ns;             /**< 期望控制周期（ns），用于 keepalive 与超时判定。0 = 自动。 */
 
     uint8_t  auto_keepalive;        /**< 1（默认）= cycle_end 内按需自动补喂狗帧。
-                                         原因见 docs/DESIGN.zh-CN.md §6.3：
-                                         固件看门狗默认 100 ms 生效且无法用 0 关闭。 */
+                                         只对**设备侧开着**的协议超时（`break_timeout > 0`）
+                                         生效；`0` = 设备侧已禁用超时 ⇒ 无狗可喂，
+                                         此时不补帧（也不置风险位）。
+                                         背景见 docs/DESIGN.zh-CN.md §6.3。 */
     uint8_t  clamp_target_position; /**< 目标越界策略（§6.10）：
                                          0（默认）= 拒绝并计数，本周期改发安全帧；
                                          1 = 静默钳位到量程后发送。 */
-    uint8_t  enable_watchdog_hint;  /**< 1 = configure() 时把设备 break_timeout 写为 2×period。
+    uint8_t  enable_watchdog_hint;  /**< 1 = configure() 在**需要时**把设备 break_timeout
+                                         写为 2×period：当前是 0（禁用）或现有超时
+                                         比控制周期还短。设备本来设得很宽松时不动它。
+                                         写完会**读回确认**；读不回来（真机 F28）只记
+                                         一条 NOTE 并置 JSDK_JF_WATCHDOG_UNVERIFIED，
+                                         不算致命错误。
                                          默认 0（不擅自修改客户设备配置）。 */
     uint8_t  max_joints;            /**< 关节容量；0 = JSDK_MAX_JOINTS_STATIC。 */
     uint8_t  rx_burst_limit;        /**< 单周期最多处理的接收帧数；0 = 默认 32。
@@ -499,14 +517,20 @@ typedef struct {
 /**
  * 关键配置参数快照（供 CLI `dump-config` 与 Python `Context.dump_config()` 复用）。
  * 字段均为设备实际生效值（configure() 已读回并校验）。
+ *
+ * ⚠ 本快照需要**已标定**的关节：描述符下载完但没跑标定时，除 `node_id` 外的字段
+ *   都填 0 而 `valid == 0`（`dump-config` 因此属于需要完整配置的命令）。
  */
 typedef struct {
     float    gear_ratio;
     float    mit_max_pos, mit_max_vel, mit_max_torque, mit_max_kp, mit_max_kd;
     float    torque_constant;
     uint32_t node_id;
-    uint32_t heartbeat_rate_ms;
-    uint32_t break_timeout_ms;   /**< 注意：设备侧 0 被固件解释为 100 ms */
+    uint32_t heartbeat_rate_ms;  /**< 设备侧心跳周期；**0 = 固件已关闭心跳**（不是"没读到"） */
+    uint32_t break_timeout_ms;   /**< 设备侧协议级 CAN 超时；**0 = 已禁用超时检测**
+                                      （最新固件语义；不再有 0→100 ms 的归一化）。
+                                      ⚠ 真机实测该端点读回恒为 0（F28）——
+                                      想确认“真的武装了”请看 JSDK_JF_WATCHDOG_UNVERIFIED。 */
     int      valid;
 } jsdk_joint_config_snapshot_t;
 
@@ -541,7 +565,11 @@ JSDK_API jsdk_status_t jsdk_context_add_joint(jsdk_context_t *ctx,
  *      ⚠ 代价：实测描述符 41029 字节，FD 下 1+662 帧、Classic 1M 下 1+6839 帧；
  *      全量保留约 24.9 KB RAM。用 desc.retain / filter_paths 可降到 <1 KB。
  *      ⚠ 禁止在关节使能时执行（设备以 50 帧/ms 灌入，会挤掉控制帧触发看门狗）；
- *   4. 若 enable_watchdog_hint 且 period_ns 已知：设定 break_timeout。
+ *   4. 若 enable_watchdog_hint 且 period_ns 已知：在需要时设定 break_timeout
+ *      （当前为 0 或比周期还短），并**读回确认**（读不回来只记 NOTE + 置
+ *      JSDK_JF_WATCHDOG_UNVERIFIED，不阻断配置）。
+ *      ⚠ 设备侧 `break_timeout == 0` = **超时检测已禁用** ⇒ 不做“周期必须小于它”
+ *        的校验（那个校验只在设备真的开着超时时有意义）。
  * 任一标定参数缺失/异常 → JSDK_ERR_PROTOCOL 且 unit_scale.valid = 0。
  */
 JSDK_API jsdk_status_t jsdk_context_configure(jsdk_context_t *ctx);
@@ -822,9 +850,19 @@ JSDK_API jsdk_status_t jsdk_joint_reset_device(jsdk_joint_t *j);
 JSDK_API jsdk_status_t jsdk_joint_set_node_id(jsdk_joint_t *j, uint8_t new_id, int persist);
 
 /**
- * 设置设备看门狗超时（写端点 73 = can.config.break_timeout）。
- * @warning 固件把 0 解释为 100 ms（**0 不等于关闭**）。要关闭只能写极大值（如 65535）。
- *          写入同样不落 Flash；需要持久化请再调 jsdk_joint_save_config()。
+ * 设置设备看门狗超时（写端点 73 = `can.config.break_timeout`，单位 ms）。
+ *
+ * **`ms == 0` = 关闭设备侧的协议级 CAN 超时检测**（最新固件 `auto_stop_if_timeout()`
+ *   首句 `if (timeout_ms == 0) return;`，且配置项默认值就是 0）。
+ *   早期固件把 0 当成 100 ms 且无法关闭，所以旧文档写的“0 ≠ 关闭”**已经过时**。
+ *   `ms > 0` 时才真正开启；且这个保护**只在该设备收到过控制类帧（`is_ctrl`）后才武装**
+ *   —— 纯 `CURRENT_CONTROL(0x04)` 的客户端永远武装不了（FIRMWARE_ISSUES F19）。
+ *
+ * @warning 写入不落 Flash；需要持久化请再调 `jsdk_joint_save_config()`。
+ * @warning 真机（fw 1545）实测：**该端点的读回恒为 0**，写 250 立刻读也是 0。
+ *          SDK 因此按“写入值”保守处理（继续喂狗是安全方向），但会置
+ *          `JSDK_JF_WATCHDOG_UNVERIFIED` 并在 `last_error` 里说明“未能校验”。
+ *          详见 `FIRMWARE_ISSUES.zh-CN.md` F28。
  */
 JSDK_API jsdk_status_t jsdk_joint_set_watchdog_ms(jsdk_joint_t *j, uint32_t ms);
 
@@ -942,6 +980,15 @@ JSDK_API jsdk_sdo_handle_t jsdk_joint_sdo_create(jsdk_joint_t *j, uint16_t ep_id
 /** 按路径名创建参数槽位（动态描述符的自然用法）。未命中返回 -1。 */
 JSDK_API jsdk_sdo_handle_t jsdk_joint_sdo_create_by_name(jsdk_joint_t *j, const char *path);
 JSDK_API jsdk_sdo_state_t  jsdk_joint_sdo_state    (jsdk_joint_t *j, jsdk_sdo_handle_t h);
+
+/** 参数槽位的**裸字节缓冲区**（长度 = data_size()，由描述符类型推断或创建时指定）。
+ *
+ *  ⚠ **字节序**：这里就是**线上字节**，不经过类型化解码 —— 参数值是
+ *  **小端**（设备端把端点内存原样 memcpy 进/出载荷），而控制帧/查询响应才是大端。
+ *  也就是说：`*(uint16_t *)(void *)jsdk_joint_sdo_data(...)` 在本项目支持的平台
+ *  （x86 / ARM，均小端）上直接可用，但**把这段字节发到别处前要知道它是小端**。
+ *  不想碰裸字节就用 `jsdk_joint_param_get/set*()`（内部按类型做小端编解码）。
+ *  证据与真机实测见 `src/proto_cyberbeast/cb_frame.h` 的 `cb_le_*` 说明。 */
 JSDK_API uint8_t          *jsdk_joint_sdo_data     (jsdk_joint_t *j, jsdk_sdo_handle_t h);
 JSDK_API size_t            jsdk_joint_sdo_data_size(jsdk_joint_t *j, jsdk_sdo_handle_t h);
 

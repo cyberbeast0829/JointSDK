@@ -734,7 +734,7 @@ static void test_heartbeat_timeout(void)
 
     printf("[6] heartbeat / timeout\n");
     /* hb=1：每毫秒一帧，便于逐 ms 断言 */
-    fix_open(&f, "0:id=1,gear=16.5,hb=1,fd");
+    fix_open(&f, "0:id=1,gear=16.5,hb=1,timeout=100,fd");
     n = f.sim ? sim_find_node(f.sim, 1u) : NULL;
     CHECK(n != NULL);
     if (!n) { fix_close(&f); return; }
@@ -857,12 +857,45 @@ static void test_heartbeat_timeout(void)
         }
     }
 
+    /* ===== ⚠ 场景 A2：break_timeout = 0 ⇒ **超时检测整个被禁用** =====
+       新固件语义（也是 `Config_t::break_timeout` 的默认值）：0 **不是** 100 ms，
+       而是“永不超时”。模型必须一致，否则“没武装”会被误读成“100 ms 已武装”。
+       这里先真的武装它（发一条 MIT），再停发 5 s —— 不得停机、不得置错误位。 */
+    {
+        uint8_t mp[8];
+        cb_mit_range_t r;
+
+        fix_reopen(&f, "0:id=1,gear=16.5,timeout=0,fd");
+        n = f.sim ? sim_find_node(f.sim, 1u) : NULL;
+        CHECK(n != NULL);
+        if (n) {
+            CHECK_EQ(n->break_timeout, 0u);
+            r.pos_max = n->mit_max_pos; r.vel_max = n->mit_max_vel;
+            r.kp_max = n->mit_max_kp;   r.kd_max = n->mit_max_kd;
+            r.tau_max = n->mit_max_torque;
+            cb_mit_pack_command(mp, &r, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, NULL);
+            CHECK_EQ(send_frame(&f, 1u, CB_MSG_START_MOTOR, CB_PRI_CTRL, NULL, 0u, 1), 0);
+            CHECK_EQ(send_frame(&f, 1u, CB_MSG_MIT_CONTROL, CB_PRI_HIGH_CTRL,
+                                mp, 8u, 1), 0);
+            CHECK(n->last_cmd_ms != 0u);            /* 计时器已武装 */
+
+            drain(&f);
+            jsdk_hal_virtual_advance_ms(f.h, 5000u);/* 远超任何 100 ms 假设 */
+            CHECK((n->error_axis & SIM_ERR_CAN_BUS_FAILED) == 0u);
+            CHECK_EQ(n->armed, 1u);
+            CHECK(n->last_cmd_ms != 0u);            /* 计时器未被清零 */
+            printf("      timeout=0（= 禁用）：武装后停发 5 s 也不停（0 != 100 ms）\n");
+        }
+    }
+
     /* ===== ⚠ 场景 B：先发过一次 is_ctrl 再只发 CURRENT → 会被误停 ===== */
     {
         uint8_t mp[8], cur[4];
         cb_mit_range_t r;
 
-        fix_reopen(&f, "0:id=1,gear=16.5,fd");
+        /* ⚠ 必须显式 `timeout=`：0（缺省）在新语义下是**禁用超时**，那样永远停不了，
+              这个场景就测不出来了。 */
+        fix_reopen(&f, "0:id=1,gear=16.5,timeout=100,fd");
         n = f.sim ? sim_find_node(f.sim, 1u) : NULL;
         CHECK(n != NULL);
         if (n) {
@@ -879,7 +912,7 @@ static void test_heartbeat_timeout(void)
                                 mp, 8u, 1), 0);
             CHECK(n->last_cmd_ms != 0u);
 
-            /* 之后只发 CURRENT（每条都喂了 ODrive 看门狗，但不刷新计时器） */
+            /* 之后只发 CURRENT（每条都喂了驱动器看门狗，但不刷新计时器） */
             for (int i = 0; i < 5; ++i) {
                 drain(&f);
                 CHECK_EQ(send_frame(&f, 1u, CB_MSG_CURRENT_CONTROL, CB_PRI_CTRL,
@@ -927,10 +960,10 @@ static void test_params(void)
             CHECK_EQ(cb_param_unpack_read_rsp(out.data, out.len, &rs), 0);
             CHECK_EQ(rs.ep_id, 180u);
             CHECK_EQ(rs.data_len, 4u);
-            CHECK_EQ(rs.value[0], 0x00u);
+            CHECK_EQ(rs.value[0], 0x01u);      /* node_id = 1，u32 LE */
             CHECK_EQ(rs.value[1], 0x00u);
             CHECK_EQ(rs.value[2], 0x00u);
-            CHECK_EQ(rs.value[3], 0x01u);      /* node_id = 1，u32 BE */
+            CHECK_EQ(rs.value[3], 0x00u);
             CHECK_EQ(cb_param_rsp_has_more(&rs), 0);
         }
     }
@@ -959,10 +992,11 @@ static void test_params(void)
                 memcpy(&joined[off], rs.value, 4);
             }
         }
-        CHECK_EQ(joined[0], 0x11u); CHECK_EQ(joined[1], 0x22u);
-        CHECK_EQ(joined[2], 0x33u); CHECK_EQ(joined[3], 0x44u);
-        CHECK_EQ(joined[4], 0x55u); CHECK_EQ(joined[5], 0x66u);
-        CHECK_EQ(joined[6], 0x77u); CHECK_EQ(joined[7], 0x88u);
+        /* 拼回来的字节是**线上字节流**：小端下 Low4 = 88 77 66 55，High4 = 44 33 22 11 */
+        CHECK_EQ(joined[0], 0x88u); CHECK_EQ(joined[1], 0x77u);
+        CHECK_EQ(joined[2], 0x66u); CHECK_EQ(joined[3], 0x55u);
+        CHECK_EQ(joined[4], 0x44u); CHECK_EQ(joined[5], 0x33u);
+        CHECK_EQ(joined[6], 0x22u); CHECK_EQ(joined[7], 0x11u);
     }
 
     /* --- 单读：FD 一次读完 8 字节 --- */
@@ -984,7 +1018,7 @@ static void test_params(void)
     {
         uint8_t req[12];
         uint8_t val[4];
-        cb_be_put_f32(val, 8.0f);
+        cb_le_put_f32(val, 8.0f);      /* 参数值 = 小端 */
         CHECK_EQ(cb_param_pack_write_req(req, sizeof req, 242u, val, 4u), 8u);
 
         drain(&f);
@@ -1010,7 +1044,7 @@ static void test_params(void)
         uint8_t req[12];
         uint8_t val[4];
         float before = n->pos_estimate;
-        cb_be_put_f32(val, 123.0f);
+        cb_le_put_f32(val, 123.0f);
         CHECK_EQ(cb_param_pack_write_req(req, sizeof req, 372u, val, 4u), 8u);
         drain(&f);
         CHECK_EQ(send_frame(&f, 1u, CB_MSG_PARAM_WRITE, CB_PRI_CONFIG, req, 8u, 1), 0);
@@ -1054,16 +1088,16 @@ static void test_params(void)
             CHECK_EQ(br.bitmap_bytes, 1u);
             CHECK_EQ(br.bitmap[0], 0x07u);
             CHECK_EQ(br.values_len, 10u);           /* 4 + 2 + 4 */
-            /* msb-first：node_id = 1 */
-            CHECK_EQ(br.values[0], 0x00u);
-            CHECK_EQ(br.values[3], 0x01u);
-            /* break_timeout = 100 (u16 BE) */
+            /* 值流里的字节也是**小端**：node_id = 1 */
+            CHECK_EQ(br.values[0], 0x01u);
+            CHECK_EQ(br.values[3], 0x00u);
+            /* break_timeout = 0（缺省 = 禁用，见 sim_device.h）；u16 LE */
             CHECK_EQ(br.values[4], 0x00u);
-            CHECK_EQ(br.values[5], 0x64u);
-            /* cpr = 8192 → 0x00002000 */
+            CHECK_EQ(br.values[5], 0x00u);
+            /* cpr = 8192 → 0x00002000 (i32 LE) */
             CHECK_EQ(br.values[6], 0x00u);
-            CHECK_EQ(br.values[7], 0x00u);
-            CHECK_EQ(br.values[8], 0x20u);
+            CHECK_EQ(br.values[7], 0x20u);
+            CHECK_EQ(br.values[8], 0x00u);
             CHECK_EQ(br.values[9], 0x00u);
         }
     }
@@ -1116,17 +1150,18 @@ static void test_params(void)
         n->error_motor = 0ull;
         drain(&f);
 
-        /* 块 1：More = 1，TotalLen = 8，offset 0 */
+        /* 块 1：More = 1，TotalLen = 8，offset 0 —— 小端下 offset 0 是**低 4 字节**
+           （0xCAFEBABE），所以字节是 BE BA FE CA */
         CHECK_EQ(cb_param_pack_write_chunk(chunk, sizeof chunk, 193u, 8u, 0u,
-                                           (const uint8_t *)"\xDE\xAD\xBE\xEF",
+                                           (const uint8_t *)"\xBE\xBA\xFE\xCA",
                                            4u, 1), 8u);
         CHECK_EQ(send_frame(&f, 1u, CB_MSG_PARAM_WRITE, CB_PRI_CONFIG, chunk, 8u, 0), 0);
         CHECK_EQ(recv_frame(&f, &out), 0);           /* 还没完成，不应答 */
         CHECK(n->error_motor == 0ull);                /* 未写入 */
 
-        /* 块 2：More = 0 */
+        /* 块 2：More = 0 —— offset 4 = 高 4 字节（0xDEADBEEF）→ EF BE AD DE */
         CHECK_EQ(cb_param_pack_write_chunk(chunk, sizeof chunk, 193u, 8u, 4u,
-                                           (const uint8_t *)"\xCA\xFE\xBA\xBE",
+                                           (const uint8_t *)"\xEF\xBE\xAD\xDE",
                                            4u, 0), 8u);
         CHECK_EQ(send_frame(&f, 1u, CB_MSG_PARAM_WRITE, CB_PRI_CONFIG, chunk, 8u, 0), 0);
         CHECK(n->error_motor == want);
@@ -1154,7 +1189,7 @@ static void test_params(void)
             fr.len = 8u;
             fr.flags = JSDK_FRAME_EXT;
             cb_param_pack_write_chunk(fr.data, 8u, 193u, 8u, 0u,
-                                      (const uint8_t *)"\xAA\xBB\xCC\xDD", 4u, 1);
+                                      (const uint8_t *)"\x01\x00\xFF\xEE", 4u, 1);
             CHECK_EQ(f.hal.send(f.hal.user, &fr), 0);
         }
         CHECK_EQ(n->error_motor, 0ull);           /* 原半截值必须被丢弃 */
@@ -1167,7 +1202,7 @@ static void test_params(void)
             fr.len = 8u;
             fr.flags = JSDK_FRAME_EXT;
             cb_param_pack_write_chunk(fr.data, 8u, 193u, 8u, 4u,
-                                      (const uint8_t *)"\xEE\xFF\x00\x01", 4u, 0);
+                                      (const uint8_t *)"\xDD\xCC\xBB\xAA", 4u, 0);
             CHECK_EQ(f.hal.send(f.hal.user, &fr), 0);
         }
         CHECK(n->error_motor == 0xAABBCCDDEEFF0001ull);
@@ -1201,11 +1236,12 @@ static void test_params(void)
         chunk[3] = 8u;                               /* TotalLen = 8（与 u64 宽度一致）*/
         chunk[4] = 0x11u; chunk[5] = 0x22u; chunk[6] = 0x33u; chunk[7] = 0x44u;
         CHECK_EQ(send_frame(&f, 1u, CB_MSG_PARAM_WRITE, CB_PRI_CONFIG, chunk, 8u, 0), 0);
-        /* ⚠ 固件会直接写入一个后 4 字节被静默补 0 的“完整值” */
-        CHECK(n->error_motor == 0x1122334400000000ull);
+        /* ⚠ 固件会直接写入一个后 4 字节被静默补 0 的"完整值"；
+           小端下这 4 个字节是**低** 32 位，补 0 的是**高** 32 位 */
+        CHECK(n->error_motor == 0x0000000044332211ull);
         drain(&f);
         printf("      malformed frame (TotalLen=8, only 4 B sent) wrote "
-               "0x1122334400000000 → 后 4 字节被静默补 0（固件 F13）\n");
+               "0x0000000044332211 → 高 4 字节被静默补 0（固件 F13）\n");
     }
 
     fix_close(&f);

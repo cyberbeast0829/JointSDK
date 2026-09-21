@@ -1,6 +1,6 @@
 # CyberBeast Joint SDK（CAN / CAN-FD 后端）
 
-包装关节电机驱动器的 **CYBERBEAST 协议**（ODrive CyberBeast 分支）的纯 C99 SDK，
+包装关节电机驱动器的 **CYBERBEAST 协议**的纯 C99 SDK，
 目标是 **Windows / Linux / 嵌入式 MCU 同一套 API**。
 
 与 `jsdk_*` 家族（`SOEM/joint-sdk`、`EtherCAT_Master/joint-sdk`）同名同义，是第三个后端。
@@ -28,7 +28,7 @@ cmake -S . -B build -G "MinGW Makefiles" -DJSDK_WERROR=ON
 cmake --build build && ctest --test-dir build
 
 # 库 + 测试 + PC 诊断 CLI（CLI 需要堆模式）
-cmake -S . -B build -G "MinGW Makefiles" -DJSDK_WERROR=ON -DJSDK_ENABLE_HEAP=ON
+cmake -S . -B build -G "MinGW Makefiles" -DJSDK_WERROR=ON -DJSDK_ENABLE_HEAP=ON -DJSDK_BUILD_CLI=ON
 cmake --build build
 ./build/jsdk-cli --if virtual scan          # 无硬件也能跑
 ```
@@ -118,13 +118,26 @@ src/proto_cyberbeast/ L2 协议层（cb_*：帧编解码 / MIT / 控制 / 查询
 src/core/             L3 关节层（jsdk_*：上下文 / 关节 / 看门狗 / 描述符 / 运维 / 参数 / 分组）
 src/hal/              内置 HAL 后端（virtual / socketcan / pcan / slcan）
 tools/jsdk_cli/       PC 诊断 CLI
-tests/                10 套单元与集成测试（含字节级黄金向量对拍）
-tools/                测试夹具与黄金向量生成脚本
+tests/                11 套 C 单元与集成测试（含字节级黄金向量对拍）
+tools/                夹具/黄金向量生成、构建与验证脚本（`wsl_build.sh`、`hw_verify.sh`、
+                      packaging/amalgam/arduino/live_can 冒烟 + 变异测试）
 ```
 
 ---
 
 ## 当前状态
 
-WP1 ~ WP7 已实现并通过回归（**10 套 / 25624 项断言，`-Werror` 干净**）。
-未完成：**WP8 Python 绑定**、真机冒烟（见 `PORTING.zh-CN.md` §7.5.3）。
+**WP1 ~ WP9 全部实现并通过回归**，交付面 **A1~A13**、审计项 **B1~B4 / B8~B10** 已完成。
+| 维度 | 现状（可复现） |
+|---|---|
+| 构建 | `-Werror` 干净（`-Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes`） |
+| C 测试 | **11 套 / 30486 项断言**，0 失败（Windows MinGW gcc 13；Linux WSL gcc 9；ASan+UBSan 同样全过） |
+| ctest | **21 项**（11 套 C + 8 个示例 + `cli_text_lint` + `hw_verify_virtual`；共享库构建 `bsh` 为 18 项） |
+| Python | **213 passed / 2 skipped**（Windows 3.12 与 Linux 3.8 结果一致）；公共 C API **114/114 已绑定，0 缺口**；`python -m jsdk_can` 与 `jsdk-cli` **24 个子命令对齐**（同款安全闸、同款退出码、同款 JSON 字段） |
+| 真机 | slcan + CANable + 一台关节（node 1，fw 1545）：`scan`/`info`/`desc-*`/`read`/`batch-read`/`health`/`dump-config` **与写路径**（原值回写 / 写探针后恢复，实测 `100 → 150 → 恢复 100`）均已逐条验证；自检脚本 10 轮 **160 项**、含写路径 3 轮 **51 项**全过 |
+
+**未完成与已知限制的完整清单见 [`docs/BACKLOG.zh-CN.md`](docs/BACKLOG.zh-CN.md)**
+（§1 未完成项 A12、B6；§3 已知限制 L1~L7 与记录缺失）。
+真机层面**必须人工**的部分（终端电阻、error-frame/bus-off、真驱动器运动、写路径）见
+[`docs/PORTING.zh-CN.md`](docs/PORTING.zh-CN.md) §7.5.3 B 段；只读自检步骤见
+[`docs/CLI.zh-CN.md`](docs/CLI.zh-CN.md) §8。

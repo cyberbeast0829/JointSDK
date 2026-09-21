@@ -88,7 +88,7 @@ int main(void)
         uint32_t back = 0u;
         if (jsdk_joint_param_get_u32(j, "axis0.config.can.heartbeat_rate_ms", &back) == JSDK_OK) {
             printf("  读回校验   : %s（要的就是这个：写完必须读回，别信'已发送'）\n",
-                   (back == 50u) ? "一致 ✓" : "不一致 ✗");
+                   (back == 50u) ? "一致 [OK]" : "不一致 [FAIL]");
         }
     }
 

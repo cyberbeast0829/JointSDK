@@ -40,8 +40,65 @@ static void store_init(jsdk_context_t *ctx)
                                 ? ctx->cfg.desc.max_endpoints : 2048u;
 }
 
-/** 至少有一个关节已被使能 → 禁止下载（DESIGN §6.6 硬约束 1）。 */
+/**
+ * 丢掉 RX 里**已有的**帧，直到总线安静下来（连续 @p quiet_ms 没有新帧）。
+ *
+ * ⚠ 请求 `0x24` 之前必须做，真机（slcan）实测的现场：
+ *   上一条被中断的传输（超时 / Ctrl-C / 报错退出）会让设备停在半路、继续把
+ *   剩下的帧发完；我们重新打开适配器（`C`→`Y5`→`O`）时它们就涌出来。
+ *   不清掉的话，这些残留会：
+ *     1. 被 fetch 当成"本次的元数据帧"（fetch 自己也会跳过，但那是有界的）；
+ *     2. **吃掉 `desc.timeout_ms` 的预算** —— 真机上残留尾巴可以有 1.5 s 以上，
+ *        而一次完整的 38 KB 传输本身也要 ~1.3 s，3 s 默认超时直接不够，
+ *        表现为"第一次连不上、第二次就好了"（实测）。
+ *   所以这里要**等它发完**再请求：请求前清干净，超时预算就全留给自己的传输。
+ *
+ * 这里只读"已经排好的"帧，不主动等待数据；唯一的等待是"静默窗口"，
+ * 而且有 @p max_frames 与 @p quiet_ms 双重上限，不会把调用者卡死。
+ *
+ * @param max_frames 最多丢多少帧（硬上限）
+ * @param quiet_ms   连续多久没有帧就算"安静"（典型 100 ms）
+ */
+static void desc_drain_rx(jsdk_context_t *ctx, unsigned max_frames, uint32_t quiet_ms)
+{
+    jsdk_can_frame_t junk;
+    uint32_t         last;
+    unsigned         i;
 
+    if (!ctx->cfg.hal.recv) return;
+
+    last = ctx->cfg.hal.now_ms(ctx->cfg.hal.user);
+    for (i = 0u; i < max_frames; ++i) {
+        if (ctx->cfg.hal.recv(ctx->cfg.hal.user, &junk) == 1) {
+            last = ctx->cfg.hal.now_ms(ctx->cfg.hal.user);
+            continue;
+        }
+        if ((uint32_t)(ctx->cfg.hal.now_ms(ctx->cfg.hal.user) - last) >= quiet_ms) break;
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * “首个请求丢了”的重发策略
+ *
+ * ⚠ 真机实测（slcan + CANable）：打开端口之后的**第一条请求概率性丢失**
+ *   （适配器在 `C`/`Y5`/`O` 之后还要配置自己的 CAN 控制器）。丢的次数不确定，
+ *   单次 250 ms 重试会撞上“还没就绪”，表现就是“第一次跑失败、再跑一次成功”。
+ *   设备对 `0x24` 幂等（重复请求会从头重发），所以多试几次无副作用。
+ *
+ * 递增间隔：0.25 s → 0.6 s → 1.2 s（共 4 次尝试）。仅当**一帧都没收到**时启用。
+ * ------------------------------------------------------------------------ */
+
+#define JSDK_DESC_REQUEST_RETRIES 3u
+
+static uint32_t jsdk_desc_retry_delay_ms(unsigned retry_index)
+{
+    static const uint16_t k_delay_ms[JSDK_DESC_REQUEST_RETRIES] = { 250u, 600u, 1200u };
+
+    return (retry_index < JSDK_DESC_REQUEST_RETRIES) ? k_delay_ms[retry_index]
+                                                    : 0xFFFFFFFFu;
+}
+
+/** 至少有一个关节已被使能 → 禁止下载（DESIGN §6.6 硬约束 1）。 */
 /**
  * 从 @p node 完整下载并解析描述符（**阻塞**）。
  *
@@ -53,8 +110,8 @@ static jsdk_status_t desc_fetch_from(jsdk_context_t *ctx, uint8_t node)
     uint8_t req[CB_DESC_REQ_LEN];
     uint32_t deadline;
     size_t   req_len;
-    unsigned spin = 0u;
-    const unsigned spin_cap = 4000000u;
+    uint32_t spin_clock = 0u;   /* 与 frozen 一起做"时钟冻结"检测 */
+    unsigned frozen = 0u;
 
     store_init(ctx);
 
@@ -68,6 +125,12 @@ static jsdk_status_t desc_fetch_from(jsdk_context_t *ctx, uint8_t node)
     req_len = cb_desc_build_request(req, sizeof req, 0u);
     if (req_len == 0u) return JSDK_ERR_INVALID_ARG;
 
+    /*
+     * 上限取 4096 帧 / 100 ms 静默：真机上一条被中断的流的尾巴可以有几百帧、
+     * 持续 1 s 以上（实测），要等它发完再请求，否则残留会占掉超时预算。
+     */
+    desc_drain_rx(ctx, 4096u, 100u);
+
     if (jsdk_ctx_send(ctx, CB_PRI_CONFIG, CB_MSG_JSON_DESC_READ, node,
                       req, (uint8_t)req_len) != 0) {
         jsdk_ctx_seterr(ctx, "descriptor request to node %u could not be sent",
@@ -79,6 +142,8 @@ static jsdk_status_t desc_fetch_from(jsdk_context_t *ctx, uint8_t node)
     deadline = cb_desc_timeout_ms(&ctx->cfg.desc);
     {
         uint32_t t0 = ctx->cfg.hal.now_ms(ctx->cfg.hal.user);
+        uint32_t req_at = t0;      /* 上一次发请求的时刻（用于重试判定） */
+        unsigned retries = 0u;     /* 已重发次数（见下面的递增间隔） */
 
         while (!cb_desc_fetch_is_done(&ctx->fetch)) {
             jsdk_can_frame_t f;
@@ -99,18 +164,64 @@ static jsdk_status_t desc_fetch_from(jsdk_context_t *ctx, uint8_t node)
             }
 
             ctx->now_ms = ctx->cfg.hal.now_ms(ctx->cfg.hal.user);
+
+            /*
+             * 请求重发（最多 3 次，共 4 次尝试）。
+             *
+             * ⚠ 真机实测：**刚打开适配器后的第一条请求可能丢**（`C`/`Y5`/`O`
+             *   之后适配器还要配置自己的 CAN 控制器），现场表现就是"第一次连不上、
+             *   再敲一次就好了"。丢失概率与延迟**不确定**，所以按递增间隔多试几次；
+             *   设备对 `0x24` 幂等（会从头重发），重试无副作用。
+             *
+             * ⚠⚠ 判据只能是"**本次传输还没开始**"（没收到元数据帧），**不能**是
+             *   "一帧都没收到"：RX 里常常有上一次被中断传输的**残留帧**，
+             *   真机实测过 680 帧残留、而我们的请求根本没到达设备 ——
+             *   用帧数当判据就永远不重发，然后超时（那次的报错正是
+             *   `(0/0 bytes, 680 frames received)`）。
+             */
+            if (retries < JSDK_DESC_REQUEST_RETRIES
+                && !cb_desc_fetch_started(&ctx->fetch)
+                && jsdk_elapsed(ctx->now_ms, req_at) >= jsdk_desc_retry_delay_ms(retries)) {
+                retries++;
+                req_at = ctx->now_ms;
+                if (jsdk_ctx_send(ctx, CB_PRI_CONFIG, CB_MSG_JSON_DESC_READ, node,
+                                  req, (uint8_t)req_len) == 0) {
+                    ctx->tx_seq = cb_seq_next(ctx->tx_seq);
+                }
+            }
+
             if (jsdk_elapsed(ctx->now_ms, t0) >= deadline) {
+                /* `rx` = 一共收到过多少帧：区分两种完全不同的故障
+                   （通道没开 → 0；请求丢了但心跳在流 → >0）。 */
                 jsdk_ctx_seterr(ctx, "descriptor download from node %u timed out "
-                                     "after %u ms (%u/%u bytes)",
+                                     "after %u ms (%u/%u bytes, %u frames received)",
                                 (unsigned)node, (unsigned)deadline,
                                 (unsigned)ctx->fetch.bytes_scanned,
-                                (unsigned)ctx->fetch.total_len);
+                                (unsigned)ctx->fetch.total_len,
+                                (unsigned)ctx->bus.rx_frames);
                 return JSDK_ERR_TIMEOUT;
             }
-            if (++spin >= spin_cap) {
-                jsdk_ctx_seterr(ctx, "descriptor download from node %u stalled "
-                                     "(no frames; frozen clock?)", (unsigned)node);
-                return JSDK_ERR_TIMEOUT;
+            /*
+             * "卡死"只认**时钟不动**这一种情况。
+             *
+             * ⚠ 旧实现看的是**迭代次数**（`spin >= spin_cap`，400 万次）。那条
+             *   判断在真机上是**误报**：空缓冲上的 `recv` 是**立即返回**的，
+             *   400 万次循环只需几十毫秒 —— 而真实设备从收到 `0x24` 到开口
+             *   可能要 100 ms 以上（slcan 上还要排队），于是第一次连接会随机
+             *   报 `stalled (no frames; frozen clock?)`（真机实测）。
+             *   它本来的用途只是"虚拟 HAL 没开 autotick、时钟冻结"时不要死循环，
+             *   那就直接看时钟有没有走：走了就交给上面的超时负责。
+             */
+            if (ctx->now_ms == spin_clock) {
+                if (++frozen >= 4000000u) {
+                    jsdk_ctx_seterr(ctx, "descriptor download from node %u stalled "
+                                         "(no frames and the clock is frozen?)",
+                                    (unsigned)node);
+                    return JSDK_ERR_TIMEOUT;
+                }
+            } else {
+                spin_clock = ctx->now_ms;
+                frozen     = 0u;
             }
         }
     }
@@ -316,6 +427,8 @@ jsdk_status_t jsdk_context_desc_poll(jsdk_context_t *ctx, uint64_t app_time_ns)
 
         req_len = cb_desc_build_request(req, sizeof req, 0u);
         if (req_len == 0u) return JSDK_ERR_INVALID_ARG;
+        /* 与阻塞路径同理：先等总线安静下来再请求 */
+        desc_drain_rx(ctx, 1024u, 50u);
         if (jsdk_ctx_send(ctx, CB_PRI_CONFIG, CB_MSG_JSON_DESC_READ, node,
                           req, (uint8_t)req_len) != 0) {
             ctx->fetch_active = 0;

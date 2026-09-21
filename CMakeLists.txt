@@ -460,6 +460,7 @@ if(JSDK_BUILD_CLI)
   endif()
 
   add_library(jsdk_cli_core STATIC
+    tools/jsdk_cli/cli_text.c
     tools/jsdk_cli/cli_json.c
     tools/jsdk_cli/cli_stop.c
     tools/jsdk_cli/cli_app.c
@@ -480,6 +481,49 @@ if(JSDK_BUILD_CLI)
     target_compile_options(test_cli PRIVATE ${JSDK_WARN_FLAGS})
 
     add_test(NAME cli COMMAND test_cli)
+
+    # 终端文本输出（代码页转换）：纯逻辑 + 注入式转换器，不需要真控制台。
+    # 背景：Windows 控制台默认 CP936，而工程里的中文是 UTF-8 字面量。
+    add_executable(test_cli_text tests/test_cli_text.c)
+    target_link_libraries(test_cli_text PRIVATE jsdk_cli_core)
+    target_compile_options(test_cli_text PRIVATE ${JSDK_WARN_FLAGS})
+
+    add_test(NAME cli_text COMMAND test_cli_text)
+  endif()
+
+  # 静态检查（防"乱码"复发）：CLI 的输出必须走 cli_text.h 的包装，
+  # 而且输出字符串必须在 CP936 里可表示（⚠/✓ 这种会变成 '?'）。
+  # 只在有 Python 时注册 —— 与 python_bindings 同一原则：缺工具不能弄挂 configure。
+  if(JSDK_BUILD_TESTS)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+      add_test(NAME cli_text_lint
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_cli_text.py"
+                "${CMAKE_CURRENT_SOURCE_DIR}")
+      message(STATUS "CLI text: 'cli_text_lint' ctest registered")
+    else()
+      message(STATUS "CLI text: Python3 未找到 → 'cli_text_lint' 跳过")
+    endif()
+  endif()
+
+  # 真机自检脚本的**无硬件**回归：`--if virtual` 跑一层，证明脚本本身没坏
+  # （分层判据、JSON 解析、退出码）。真机那部分只能人工 —— 见 CLI.zh-CN.md §8。
+  # 缺 bash（Windows 上是 Git-Bash）就跳过，不弄挂 configure。
+  if(JSDK_BUILD_TESTS)
+    find_program(JSDK_BASH_EXECUTABLE bash)
+    if(JSDK_BASH_EXECUTABLE AND TARGET jsdk-cli)
+      add_test(NAME hw_verify_virtual
+        COMMAND ${CMAKE_COMMAND} -E env "JSDK_CLI=$<TARGET_FILE:jsdk-cli>"
+                "${JSDK_BASH_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/hw_verify.sh"
+                --if virtual --runs 1)
+      set_tests_properties(hw_verify_virtual PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+      message(STATUS "hw_verify: 'hw_verify_virtual' ctest registered")
+    else()
+      message(STATUS "hw_verify: 缺 bash 或缺 jsdk-cli → 'hw_verify_virtual' 跳过")
+    endif()
   endif()
 endif()
 

@@ -101,13 +101,56 @@ static void test_platform(void)
     CHECK_EQ(b[0], 0xFFu); CHECK_EQ(b[1], 0xFEu);
     CHECK_EQ(cb_be_get_i16(b), -2);
 
-    /* Little-Endian（仅 JSON 描述符用） */
-    cb_le_put_u32(b, 0x01020304u);
-    CHECK_EQ(b[0], 0x04u); CHECK_EQ(b[3], 0x01u);
-    CHECK_EQ(cb_le_get_u32(b), 0x01020304u);
+    /* ⚙ 参数值在线上是**小端**（设备端 memcpy 主机序，见 cb_frame.h）——
+       这里把两套字节序的**布局**都钉死：谁被改反了都会立刻红。 */
+    printf("  param-value (LE) codec\n");
+
     cb_le_put_u16(b, 0xA045u);
     CHECK_EQ(b[0], 0x45u); CHECK_EQ(b[1], 0xA0u);
     CHECK_EQ(cb_le_get_u16(b), 0xA045u);
+
+    cb_le_put_i16(b, -2);
+    CHECK_EQ(b[0], 0xFEu); CHECK_EQ(b[1], 0xFFu);
+    CHECK_EQ(cb_le_get_i16(b), -2);
+
+    cb_le_put_u32(b, 0x01020304u);
+    CHECK_EQ(b[0], 0x04u); CHECK_EQ(b[1], 0x03u);
+    CHECK_EQ(b[2], 0x02u); CHECK_EQ(b[3], 0x01u);
+    CHECK_EQ(cb_le_get_u32(b), 0x01020304u);
+    CHECK_EQ(cb_le_get_i32(b), 0x01020304);
+
+    cb_le_put_u64(b, 0x0102030405060708ull);
+    CHECK_EQ(b[0], 0x08u); CHECK_EQ(b[7], 0x01u);
+    CHECK_EQ(cb_le_get_u64(b), 0x0102030405060708ull);
+
+    /* f32：-12.5 = 0xC1480000 → 小端字节 C1 48 的**反序** 00 00 48 C1 */
+    cb_le_put_f32(b, -12.5f);
+    CHECK_EQ(b[0], 0x00u); CHECK_EQ(b[1], 0x00u);
+    CHECK_EQ(b[2], 0x48u); CHECK_EQ(b[3], 0xC1u);
+    CHECK_FEQ(cb_le_get_f32(b), -12.5f);
+
+    /* 真机实测过的三个值，按小端写出时必须得到设备真正在用的字节 */
+    cb_le_put_u32(b, 1u);                          /* node_id */
+    CHECK_EQ(cb_le_get_u32(b), 1u);
+    CHECK_EQ(b[0], 0x01u); CHECK_EQ(b[1], 0x00u);
+    CHECK_EQ(b[2], 0x00u); CHECK_EQ(b[3], 0x00u);
+
+    cb_le_put_u32(b, 100u);                        /* heartbeat_rate_ms */
+    CHECK_EQ(b[0], 0x64u); CHECK_EQ(b[1], 0x00u);
+
+    cb_le_put_f32(b, 7.75f);                       /* gear_ratio（真机值） */
+    CHECK_EQ(b[0], 0x00u); CHECK_EQ(b[1], 0x00u);
+    CHECK_EQ(b[2], 0xF8u); CHECK_EQ(b[3], 0x40u);  /* 0x40F80000 反序 */
+    CHECK_FEQ(cb_le_get_f32(b), 7.75f);
+
+    /* 两套字节序必须**互为反序**（同一个值，BE 与 LE 的字节数组正好倒过来） */
+    {
+        uint8_t be[4], le[4];
+        cb_be_put_f32(be, 16.5f);
+        cb_le_put_f32(le, 16.5f);
+        CHECK_EQ(be[0], le[3]); CHECK_EQ(be[1], le[2]);
+        CHECK_EQ(be[2], le[1]); CHECK_EQ(be[3], le[0]);
+    }
 }
 
 /* ==========================================================================

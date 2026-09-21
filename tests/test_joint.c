@@ -431,12 +431,15 @@ static void test_configure(void)
         CHECK_NEAR(snap.mit_max_torque, 50.0, 1e-6);
         CHECK_NEAR(snap.mit_max_kp, 500.0, 1e-6);
         CHECK_NEAR(snap.mit_max_kd, 5.0, 1e-6);
-        CHECK_NEAR(snap.break_timeout_ms, 100.0, 0);   /* 设备默认 0 → 固件当 100 ms */
+        /* ⚠ 新语义：设备侧 break_timeout = 0 = **超时检测已禁用**（不再是“当 100 ms”）。
+           本夹具没写 `timeout=` ⇒ 用固件默认的 0 ⇒ 快照必须是 0。
+           （这里同时验证了“禁用时不得拿 0 去比周期”——fx_up 给的控制周期是 1 ms。） */
+        CHECK_EQ(snap.break_timeout_ms, 0u);
         printf("      calibrated: gear=%.3f tconst=%.4f pos=%.1f vel=%.1f "
-               "tau=%.1f kp=%.1f kd=%.1f wd=%.0fms\n",
+               "tau=%.1f kp=%.1f kd=%.1f wd=%ums(0=disabled)\n",
                snap.gear_ratio, snap.torque_constant, snap.mit_max_pos,
                snap.mit_max_vel, snap.mit_max_torque, snap.mit_max_kp,
-               snap.mit_max_kd, (double)snap.break_timeout_ms);
+               snap.mit_max_kd, (unsigned)snap.break_timeout_ms);
     }
 
     /* 反馈：设备在跑，反馈必须新鲜 */

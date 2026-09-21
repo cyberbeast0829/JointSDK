@@ -204,3 +204,6 @@ class StatusFlag(IntEnum):
     TX_FAILED = 0x0010
     #: 未取得标定参数，物理量 API 不可用
     SCALE_INVALID = 0x0020
+    #: 写 ``can.config.break_timeout`` 后设备读回不符（真机 F28：该端点读回恒 0）
+    #: —— 已按写入值保守处理，但**不能**当成“已武装”
+    WATCHDOG_UNVERIFIED = 0x0040

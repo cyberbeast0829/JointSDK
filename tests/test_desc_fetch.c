@@ -615,33 +615,52 @@ static void test_failures(void)
     meta[2] = 0x45u; meta[3] = 0xA0u; meta[4] = 0x00u; meta[5] = 0x00u;  /* 41029 */
     meta[6] = 0x34u; meta[7] = 0x12u;                                    /* crc 0x1234 */
 
-    /* --- 首帧是 offset=0 的数据帧（buf[2] == '{'）→ 必须失败 --- */
+    /* --- 首帧是 offset=0 的数据帧（buf[2] == '{'）→ **跳过**，继续等元数据帧 ---
+       ⚠ 旧行为是"直接失败"。真机（slcan）实测证明必须改成跳过：请求发出前后
+         可能还残留上一条被中断传输的帧（其中 offset=0 的数据帧最像元数据帧），
+         把它当元数据帧会报出看不懂的 total_len 错误，而且每次退出又留下新的
+         残留 → 连接彻底锁死。上限见 CB_DESC_MAX_SKIPPED。 */
     RESET_FETCH();
     memset(data, 0, sizeof data);
     data[0] = 0u; data[1] = 0u; data[2] = (uint8_t)'{';
-    CHECK_EQ(feed_one(&f, data, 64u), JSDK_ERR_PROTOCOL);
-    CHECK_EQ(cb_desc_fetch_is_done(&f), 1);
-    CHECK_EQ(cb_desc_fetch_is_ok(&f), 0);
-    CHECK_STR(cb_desc_fetch_error(&f), CB_DESC_ERR_META_EXPECTED);
-    CHECK_EQ(jsdk_ep_store_count(&store), 0u);
-    printf("      first frame looks like data (buf[2]='{') -> %s\n",
-           cb_desc_fetch_error(&f));
+    CHECK_EQ(feed_one(&f, data, 64u), JSDK_OK);
+    CHECK_EQ(cb_desc_fetch_is_done(&f), 0);
+    CHECK_EQ(f.skipped_rx, 1u);
+    CHECK_EQ(cb_desc_fetch_error(&f), CB_DESC_ERR_NONE);
+    printf("      frame looking like data (buf[2]='{') -> skipped\n");
 
-    /* --- 元数据帧头两字节非 0 → 失败 --- */
+    /* --- 同一个坑，但描述符以 '[' 开头 —— **本固件的真实情况** ---
+       （旧代码只认 '{'，于是这个交叉校验形同虚设：真机上 offset=0 的数据帧
+         被当成元数据帧，报出 "total_len must be 1..65535"。） */
+    memset(data, 0, sizeof data);
+    data[2] = (uint8_t)'[';
+    CHECK_EQ(feed_one(&f, data, 64u), JSDK_OK);
+    CHECK_EQ(f.skipped_rx, 2u);
+    CHECK_EQ(cb_desc_fetch_is_done(&f), 0);
+    /* 关键：这一帧的拒绝理由必须是"它不是元数据帧"，而不是"total_len 越界"
+       —— 后者说明交叉校验没认 `[`，只是碰巧被长度范围检查拦住（症状会变成
+       真机上那句让人摸不着头脑的 "total_len must be 1..65535"）。 */
+    CHECK_STR(f.err_detail, CB_DESC_ERR_META_EXPECTED);
+
+    /* --- 元数据帧头两字节非 0 → 同样跳过 --- */
     RESET_FETCH();
     memset(data, 0, sizeof data);
     data[1] = 0x01u;
-    CHECK_EQ(feed_one(&f, data, 64u), JSDK_ERR_PROTOCOL);
-    CHECK_STR(cb_desc_fetch_error(&f), CB_DESC_ERR_META_EXPECTED);
+    CHECK_EQ(feed_one(&f, data, 64u), JSDK_OK);
+    CHECK_EQ(f.skipped_rx, 1u);
 
-    /* --- total_len = 0 --- */
+    /* --- total_len = 0 / 65536 → 跳过（不是失败：可能只是残留帧） --- */
     RESET_FETCH();
+    memset(meta, 0, sizeof meta);                       /* total_len = 0 */
+    CHECK_EQ(feed_one(&f, meta, 64u), JSDK_OK);
+    CHECK_EQ(f.skipped_rx, 1u);
     memset(meta, 0, sizeof meta);
-    CHECK_EQ(feed_one(&f, meta, 64u), JSDK_ERR_PROTOCOL);
-    CHECK_STR(cb_desc_fetch_error(&f), CB_DESC_ERR_META_TOTAL);
-    printf("      total_len=0 -> %s\n", cb_desc_fetch_error(&f));
+    meta[2] = 0x00u; meta[3] = 0x00u; meta[4] = 0x01u; meta[5] = 0x00u;  /* 65536 */
+    CHECK_EQ(feed_one(&f, meta, 64u), JSDK_OK);
+    CHECK_EQ(f.skipped_rx, 2u);
+    printf("      total_len 0 / 65536 -> skipped (could be a stale frame)\n");
 
-    /* --- total_len = 65535 是上限（允许）；65536 必须拒绝 --- */
+    /* --- total_len = 65535 是上限（允许）--- */
     RESET_FETCH();
     memset(meta, 0, sizeof meta);
     meta[2] = 0xFFu; meta[3] = 0xFFu; meta[4] = 0x00u; meta[5] = 0x00u;  /* 65535 */
@@ -649,12 +668,48 @@ static void test_failures(void)
     CHECK_EQ(f.total_len, 65535u);
     printf("      total_len=65535 accepted (chunkOffset u16 limit)\n");
 
+    /* --- **关键回归（真机现场）**：残留帧之后才来真正的元数据帧 → 必须成功 ---
+       三帧模拟上一条传输的尾巴：offset=0 的 `[` 数据帧、offset=744 的数据帧。 */
     RESET_FETCH();
-    memset(meta, 0, sizeof meta);
-    meta[2] = 0x00u; meta[3] = 0x00u; meta[4] = 0x01u; meta[5] = 0x00u;  /* 65536 */
-    CHECK_EQ(feed_one(&f, meta, 64u), JSDK_ERR_PROTOCOL);
-    CHECK_STR(cb_desc_fetch_error(&f), CB_DESC_ERR_META_TOTAL);
-    printf("      total_len=65536 rejected (would wrap chunkOffset)\n");
+    memset(data, 0, sizeof data);
+    data[0] = 0u; data[1] = 0u; data[2] = (uint8_t)'[';
+    CHECK_EQ(feed_one(&f, data, 64u), JSDK_OK);
+    memset(data, 0, sizeof data);
+    data[0] = 0xE8u; data[1] = 0x02u;                    /* offset 744 */
+    CHECK_EQ(feed_one(&f, data, 64u), JSDK_OK);
+    memset(meta, 0, sizeof meta);                        /* 本次真正的元数据帧 */
+    meta[2] = 0x45u; meta[3] = 0xA0u; meta[4] = 0x00u; meta[5] = 0x00u;  /* 41029 */
+    meta[6] = 0x34u; meta[7] = 0x12u;                                    /* crc 0x1234 */
+    CHECK_EQ(feed_one(&f, meta, 64u), JSDK_OK);
+    CHECK_EQ(f.started, 1u);
+    CHECK_EQ(f.total_len, 41029u);
+    CHECK_EQ(f.crc, 0x1234u);
+    CHECK_EQ(f.skipped_rx, 2u);
+    CHECK_EQ(cb_desc_fetch_is_done(&f), 0);
+    memset(data, 0, sizeof data);                        /* 之后 offset=0 必须被接受 */
+    memcpy(&data[2], g_json, 62u);                       /* 真 JSON 片段（解析器才会接受） */
+    CHECK_EQ(feed_one(&f, data, 64u), JSDK_OK);
+    CHECK_EQ(f.next_offset, 62u);
+    printf("      2 stale frames + real metadata -> accepted (skipped=%u)\n",
+           f.skipped_rx);
+
+    /* --- 残留太多（超上限）→ 必须失败，且原因可读、具体原因留在 err_detail --- */
+    RESET_FETCH();
+    {
+        unsigned k;
+        memset(data, 0, sizeof data);
+        data[0] = 0u; data[1] = 0u; data[2] = (uint8_t)'[';
+        for (k = 0u; k < CB_DESC_MAX_SKIPPED; ++k) {
+            CHECK_EQ(feed_one(&f, data, 64u), JSDK_OK);
+        }
+        CHECK_EQ(f.skipped_rx, CB_DESC_MAX_SKIPPED);
+        CHECK_EQ(feed_one(&f, data, 64u), JSDK_ERR_PROTOCOL);
+        CHECK_EQ(cb_desc_fetch_is_done(&f), 1);
+        CHECK_STR(cb_desc_fetch_error(&f), CB_DESC_ERR_META_SKIPPED);
+        CHECK_STR(f.err_detail, CB_DESC_ERR_META_EXPECTED);
+        printf("      more than %u stale frames -> %s\n", CB_DESC_MAX_SKIPPED,
+               cb_desc_fetch_error(&f));
+    }
 
     /* --- 帧长非法 --- */
     RESET_FETCH();

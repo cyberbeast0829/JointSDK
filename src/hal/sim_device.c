@@ -110,8 +110,12 @@ const sim_ep_def_t *sim_find_ep(const sim_node_t *n, uint16_t ep_id)
     return NULL;
 }
 
-/* 端点读写用**线上字节序（BE）**，与固件 `float_to_big_endian_bytes` /
-   `big_endian_bytes_to_float` 一致；直接把 cb_frame.h 的存取器复用起来。 */
+/* 端点读写用**参数值字节序 = 小端**，与真固件一致：
+   固件的参数通路是把端点值原样 memcpy 进/出 CAN 载荷（`endpoint_handler`\+
+   `memcpy(&txmsg.buf[4], &value_buf[offset], n)`），所以线上就是主机序 LE。
+   ⚠ 旧的注释说"与固件 float_to_big_endian_bytes 一致"是**错的**：
+     那些 BE 辅助函数只用于控制帧/查询响应，参数通路根本不经过它们。
+     实测依据见 `cb_frame.h` 的 `cb_le_*` 说明。 */
 
 uint8_t sim_ep_read(const sim_node_t *n, const sim_ep_def_t *def,
                     uint8_t *out, uint8_t cap)
@@ -128,13 +132,13 @@ uint8_t sim_ep_read(const sim_node_t *n, const sim_ep_def_t *def,
         switch (def->type) {
         case SIM_T_U8: case SIM_T_BOOL: out[0] = p[0]; break;
         case SIM_T_I8:   out[0] = p[0]; break;
-        case SIM_T_U16:  cb_be_put_u16(out, *(const uint16_t *)p); break;
-        case SIM_T_I16:  cb_be_put_i16(out, *(const int16_t *)p); break;
-        case SIM_T_U32:  cb_be_put_u32(out, *(const uint32_t *)p); break;
-        case SIM_T_I32:  cb_be_put_i32(out, *(const int32_t *)p); break;
-        case SIM_T_U64:  cb_be_put_u64(out, *(const uint64_t *)p); break;
-        case SIM_T_I64:  cb_be_put_u64(out, (uint64_t)(*(const int64_t *)p)); break;
-        case SIM_T_F32:  cb_be_put_f32(out, *(const float *)p); break;
+        case SIM_T_U16:  cb_le_put_u16(out, *(const uint16_t *)p); break;
+        case SIM_T_I16:  cb_le_put_i16(out, *(const int16_t *)p); break;
+        case SIM_T_U32:  cb_le_put_u32(out, *(const uint32_t *)p); break;
+        case SIM_T_I32:  cb_le_put_i32(out, *(const int32_t *)p); break;
+        case SIM_T_U64:  cb_le_put_u64(out, *(const uint64_t *)p); break;
+        case SIM_T_I64:  cb_le_put_u64(out, (uint64_t)(*(const int64_t *)p)); break;
+        case SIM_T_F32:  cb_le_put_f32(out, *(const float *)p); break;
         /* ⚠ F64 暂时无端点使用；保留分支以免 sim_ep_width 与读写不一致 */
         case SIM_T_F64:  return 0u;
         default:         return 0u;
@@ -159,13 +163,13 @@ int sim_ep_write(sim_node_t *n, const sim_ep_def_t *def,
     switch (def->type) {
     case SIM_T_U8: case SIM_T_BOOL: p[0] = in[0]; break;
     case SIM_T_I8:   p[0] = in[0]; break;
-    case SIM_T_U16:  *(uint16_t *)p = cb_be_get_u16(in); break;
-    case SIM_T_I16:  *(int16_t *)p  = cb_be_get_i16(in); break;
-    case SIM_T_U32:  *(uint32_t *)p = cb_be_get_u32(in); break;
-    case SIM_T_I32:  *(int32_t *)p  = cb_be_get_i32(in); break;
-    case SIM_T_U64:  *(uint64_t *)p = cb_be_get_u64(in); break;
-    case SIM_T_I64:  *(int64_t *)p  = (int64_t)cb_be_get_u64(in); break;
-    case SIM_T_F32:  *(float *)p    = cb_be_get_f32(in); break;
+    case SIM_T_U16:  *(uint16_t *)p = cb_le_get_u16(in); break;
+    case SIM_T_I16:  *(int16_t *)p  = cb_le_get_i16(in); break;
+    case SIM_T_U32:  *(uint32_t *)p = cb_le_get_u32(in); break;
+    case SIM_T_I32:  *(int32_t *)p  = cb_le_get_i32(in); break;
+    case SIM_T_U64:  *(uint64_t *)p = cb_le_get_u64(in); break;
+    case SIM_T_I64:  *(int64_t *)p  = (int64_t)cb_le_get_u64(in); break;
+    case SIM_T_F32:  *(float *)p    = cb_le_get_f32(in); break;
     default:         return -1;      /* F64 未使用，与 sim_ep_width 保持一致 */
     }
     return 0;
@@ -1200,11 +1204,11 @@ void sim_tick(sim_bus_t *b, uint32_t now_ms)
                 if (n->settle_to == SIM_AS_IDLE) n->armed = 0u;
             }
 
-            /* ---- break_timeout：仅对已武装（收到过 is_ctrl 帧）的节点生效 ---- */
-            if (n->last_cmd_ms != 0u) {
-                timeout = (n->break_timeout != 0u)
-                        ? (uint32_t)n->break_timeout
-                        : SIM_BREAK_TIMEOUT_DEFAULT_MS;
+            /* ---- break_timeout：仅对已武装（收到过 is_ctrl 帧）的节点生效 ----
+               ⚠ `0` = **超时检测被禁用**（与最新固件 `auto_stop_if_timeout()` 一致：
+                  `if (timeout_ms == 0) return;`）。旧模型把 0 当成 100 ms 是错的。 */
+            if (n->last_cmd_ms != 0u && n->break_timeout != 0u) {
+                timeout = (uint32_t)n->break_timeout;
                 if ((uint32_t)(t - n->last_cmd_ms) > timeout) {
                     n->error_axis |= SIM_ERR_CAN_BUS_FAILED;
                     n->armed = 0u;

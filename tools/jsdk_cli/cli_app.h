@@ -54,7 +54,8 @@ typedef struct {
     /* --- 子命令专用 --- */
     unsigned    max_probe;   /**< --probe，主动探测上限，默认 16 */
     uint32_t    timeout_ms;  /**< --timeout，单次操作超时，默认 3000 */
-    const char *csv;         /**< --csv <file> */
+    int         csv;         /**< --csv：**输出格式开关**（CSV 代替 NDJSON/表格） */
+    const char *csv_file;    /**< --csv-file <file>：额外把同一份 CSV 写到文件 */
     const char *filter;      /**< --filter <prefix>（ep-list） */
     double      pos, vel, kp, kd, tau;
     int         have[5];     /**< 各 MIT 分量是否给出过（含显式 0） */
@@ -133,16 +134,48 @@ void cli_usage(FILE *f, const char *argv0);
 int cli_open(cli_app_t *a);
 
 /**
- * 下载/解析描述符并读回标定量（等价于客户 `configure()` 做的事）。
- * 需要端点表的子命令才调用它。
+ * 下载/解析描述符（可选带标定）。
+ *
+ * @param full 1 = 连标定量一起读（= `jsdk_context_configure()`）；
+ *             0 = **只要描述符**（= `jsdk_context_desc_fetch()`）。
+ *
+ * ⚠ 分成两档的理由：`desc-info` / `ep-list` / `ep-lookup` / `desc-export`
+ *   只关心「设备有哪些端点」，**不需要**标定量。而 `configure()` 的最后一步是
+ *   标定，它会因为“标定量超范围”而整个失败 —— 于是这些只读诊断命令
+ *   在真机上根本用不了（实测：明明描述符已经下完了，却报 calibration 错）。
+ *   这在现场是个死结：最需要看端点表的时候（标定失败），恰恰看不到。
  */
-int cli_load_desc(cli_app_t *a);
+int cli_load_desc(cli_app_t *a, int full);
 
 /** 关闭：先安全停车（若使能过），再释放上下文与 HAL。 */
 void cli_close(cli_app_t *a);
 
 /** 按 `--node` 找关节（找不到打印错误）。 */
 jsdk_joint_t *cli_joint(cli_app_t *a);
+
+/**
+ * 子命令对描述符的需求档。
+ *
+ * - `CLI_DESC_NONE`：不碰描述符（省 ~40 KB 流量）；
+ * - `CLI_DESC_ONLY`：只要端点表（`desc-info`/`ep-list`/`ep-lookup`/`desc-export`）；
+ * - `CLI_DESC_FULL`：还要标定量（值读写、物理量、使能…）。
+ */
+#define CLI_DESC_NONE 0
+#define CLI_DESC_ONLY 1
+#define CLI_DESC_FULL 2
+
+/** 子命令的描述符需求档（未知子命令 → `CLI_DESC_NONE`）。实现在 `cli_cmd.c`。 */
+int cli_cmd_desc_mode(const char *sub);
+
+/**
+ * 子命令是否会跑**控制/keepalive 循环**。
+ *
+ * ⚠ 只有跑循环的命令才应向 SDK 声明 `period_ns`：SDK 有一条安全闸
+ *   “周期 >= 设备 break_timeout 就拒绝 configure()”（`break_timeout = 0`
+ *    = 禁用时该闸不适用），而 CLI 默认周期是 100 ms —— 只读诊断命令
+ *   会因此被拦（真机实测，已修）。
+ */
+int cli_cmd_needs_loop(const char *sub);
 
 /** 睡眠（毫秒），用于 `--rate-hz` 节奏；被 Ctrl-C 请求时提前返回 1。 */
 int cli_sleep_ms(unsigned ms);

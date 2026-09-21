@@ -62,8 +62,19 @@
  */
 #define JSDK_ACTIVATE_TIMEOUT_MS 5000u
 
-/** `can.config.break_timeout == 0` 在固件里按 **100 ms** 处理（0 ≠ 关闭）。 */
-#define JSDK_WD_DEFAULT_MS   100u
+/**
+ * 设备侧协议级超时被禁用时的取值（`can.config.break_timeout == 0`）。
+ *
+ * ⚠⚠ **最新固件语义（本项目 v0.25 修正）**：`auto_stop_if_timeout()` 首句就是
+ *   `if (timeout_ms == 0) return;`，且 `Config_t::break_timeout` 的**默认值就是 0**
+ *   ⇒ **0 = 超时检测被禁用**，不是“按 100 ms 处理”。
+ *   旧固件（本项目早期真机联调时）确实把 0 当 100 ms，当时的适配是错的，
+ *   它曾经把“没武装”显示成“100 ms 已武装”，非常容易误导（见 FIRMWARE_ISSUES F28）。
+ *
+ * 凡是从 `jsdk_watchdog_device_ms()` 取超时的地方，都必须把 `JSDK_WD_DISABLED_MS`
+ * 当作“**无狗可喂 / 无门限可比较**”处理，而不是“一个很小的超时”。
+ */
+#define JSDK_WD_DISABLED_MS  0u
 
 /** 未提供 period_ns 时，式微序列用这个周期估算（ms）。 */
 #define JSDK_CFG_PERIOD_FALLBACK_MS  1u
@@ -157,7 +168,7 @@ struct jsdk_joint {
     uint16_t ep_requested_state, ep_current_state, ep_node_id, ep_break_timeout;
 
     /* ---- 设备侧配置读回 ---- */
-    uint32_t break_timeout_ms;    /**< can.config.break_timeout（0 → 固件当 100 ms） */
+    uint32_t break_timeout_ms;    /**< can.config.break_timeout；**0 = 设备侧超时检测已禁用** */
     uint32_t node_id_readback;    /**< axis0.config.can.node_id */
     uint32_t heartbeat_rate_ms;   /**< axis0.config.can.heartbeat_rate_ms（0 = 设备不发心跳） */
     uint8_t  current_state_raw;   /**< axis0.current_state（固件 AxisState 0..16） */
@@ -429,7 +440,13 @@ void jsdk_watchdog__cycle_end(jsdk_context_t *ctx);
 
 /**
  * 设备侧协议级超时（`can.config.break_timeout`，单位 ms）。
- * @note 读回的 0 在固件里按 **100 ms** 处理 —— 0 **不是**“关闭”（PROTOCOL_NOTES §2.5）。
+ *
+ * @return `> 0` = 超时毫秒数（设备侧已武装后才生效）；**`JSDK_WD_DISABLED_MS`（0）
+ *          = 设备侧超时检测已禁用**（最新固件语义，见 PROTOCOL_NOTES §4.6）。
+ *         句柄无效时也返回 0（“未知”按“不巡喂”处理）。
+ *
+ * ⚠ 调用方必须把 0 当作“**没有门限**”而不是“一个很小的超时”：
+ *   例如 `period_ms >= wd` 这种校验在 0 时会**恒真**，必须显式跳过。
  */
 uint32_t jsdk_watchdog_device_ms(const jsdk_joint_t *j);
 
@@ -486,10 +503,9 @@ int jsdk_ctx_read_param_exact(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_
 /**
  * 阻塞写一个参数值（配置阶段）；写完等 8 字节静默 ACK。
  *
- * @param val 值字节，**必须是线上大端序**（与全协议一致）。
- *            直接传主机序的 `uint16_t *` 会得到字节交换后的值 —— 本项目胉过
- *            （250 变成 64000）。要写数值请用 `jsdk_joint_param_set*()`，
- *            它内部会做 `cb_be_put_*()`。
+ * @param val 值字节，**必须是线上小端序**（设备端参数通路是 memcpy 主机序；
+ *            控制帧/查询响应才是大端，见 `cb_frame.h` 的 `cb_le_*` 说明）。
+ *            要写数值请用 `jsdk_joint_param_set*()`，它内部会做 `cb_le_put_*()`。
  */
 int jsdk_ctx_write_param(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_id,
                          const void *val, uint8_t len, uint32_t timeout_ms);

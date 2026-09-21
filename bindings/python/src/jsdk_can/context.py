@@ -40,7 +40,7 @@ import time
 from typing import Iterator
 
 from . import _abi
-from .enums import DescMode, DescRetain, EpType, Mode
+from .enums import DescMode, DescRetain, EpType, Mode, Status
 from .errors import error_for_status, raise_for_status
 from .hal import Hal, VirtualHal
 from .joint import ConfigSnapshot, DeviceInfo, FaultInfo, Joint
@@ -212,6 +212,9 @@ class Context:
         self._joints: list[Joint] = []
         self._configured = False
         self._closed = False
+        #: 存活的 ctypes 回调对象。**必须**持有引用：CFUNCTYPE 对象被 GC 之后，
+        #: C 侧还留着那个函数指针 —— 下一次回调就是跳转到已释放内存。
+        self._callbacks: dict[str, object] = {}
         self._next_deadline_ns = 0
         self._paced_cycles = 0
         self._pace_worst_late_ms = 0.0
@@ -512,12 +515,162 @@ class Context:
         return ctypes.string_at(ptr, out_len.value)
 
     def desc_import(self, blob: bytes) -> None:
-        """导入 :meth:`desc_export` 的产物（**不下载**）。"""
+        """导入 :meth:`desc_export` 的产物（**不下载**）。
+
+        ⚠ 导入的只是**描述符**，不会代替 :meth:`configure`：后者仍要跑握手与标定
+        （C 侧发现描述符已在手就不会再下载）。早期版本这里把“已配置”标记置上了，
+        于是 `desc_import()` 之后的 `configure()` **静默什么都不做** —— 没握手、
+        没标定，之后所有涉及物理量的操作都拿到 0（见回归用例）。
+        """
         buf = ctypes.create_string_buffer(bytes(blob), len(blob))
         raise_for_status(self._lib.jsdk_context_desc_import(
             self._ctx_ptr, ctypes.cast(buf, ctypes.c_void_p), len(blob)),
             "desc_import", self.last_error())
-        self._configured = True
+
+    # --- 描述符：显式下载 / 非阻塞推进 / 原始 JSON 缓存 -------------------
+
+    def desc_fetch(self) -> None:
+        """下载并解析描述符（**阻塞**，= ``configure()`` 里的第一步）。
+
+        ⚠ 禁止在任一关节使能时调用（描述符帧会挤掉控制帧 → 触发设备的
+        ``break_timeout``）。要那一步的细节请直接用 :meth:`configure`。
+        """
+        raise_for_status(self._lib.jsdk_context_desc_fetch(self._ctx_ptr),
+                         "desc_fetch", self.last_error())
+
+    def desc_poll(self, app_time_ns: int = 0) -> bool:
+        """**非阻塞**推进描述符下载（裸机/MCU 主循环用）。
+
+        :return: ``True`` = 已完成；``False`` = 还在进行中（``BUSY``）
+        :raises JsdkError: 真错误（超时/解析/arena 不足）
+
+        用法::
+
+            ctx.desc_fetch_start()            # 或直接反复调 desc_poll()
+            while not ctx.desc_poll():
+                ...                            # 你自己的主循环
+        """
+        st = int(self._lib.jsdk_context_desc_poll(self._ctx_ptr, int(app_time_ns)))
+        if st == int(Status.BUSY):
+            return False
+        raise_for_status(st, "desc_poll", self.last_error())
+        return True
+
+    def desc_import_raw(self, json_bytes: bytes, *, crc: int,
+                        fw_version: int) -> None:
+        """用**原始 JSON** 建表（路线 B：从 Flash/磁盘缓存恢复，不经 CAN）。
+
+        :param crc: 描述符 ``VersionCRC``（下载时从 ``desc_info().crc`` 取得）
+        :param fw_version: 设备固件版本（``device_info().fw_version``）
+
+        与 :meth:`desc_import` 的区别：那个导入 SDK 自己的紧凑格式（已解析、
+        已按 retain 裁剪）；本方法导入设备原始 JSON，**按当前 cfg 重新解析**，
+        因此改 ``retain`` / ``filter`` 不用重新下载。
+
+        ⚠ 与 :meth:`desc_import` 一样：**不会**代替 :meth:`configure`（仍需握手与标定）。
+        """
+        b = bytes(json_bytes)
+        buf = ctypes.create_string_buffer(b, len(b))
+        hint = _abi.DescHint()
+        hint.crc = int(crc)
+        hint.fw_version = int(fw_version)
+        raise_for_status(self._lib.jsdk_context_desc_import_raw(
+            self._ctx_ptr, ctypes.cast(buf, ctypes.c_void_p), len(b),
+            ctypes.byref(hint)), "desc_import_raw", self.last_error())
+
+    def desc_raw_sink(self, cb) -> None:
+        """安装/取消**原始 JSON 流出**回调（路线 B 的写侧）。``cb=None`` 取消。
+
+        Python 回调形如 ``cb(data: bytes, offset: int) -> bool | None``：
+        返回 ``True`` 以外的非 0 值表示放弃（下载继续，但 raw 缓存不完整）。
+
+        ⚠ ``data`` **只在回调期间有效**（这里已经替你复制成 bytes）；不要把
+          它缓存成 memoryview 到回调之外用。
+        ⚠ 必须配合 ``desc_remain_all``/``stop_when_satisfied = 0``，否则流会被
+          提前终止 → 缓存不完整（``desc_info().complete == 0`` 时不要写缓存）。
+        """
+        if cb is None:
+            self._callbacks.pop("raw_sink", None)
+            self._lib.jsdk_context_set_desc_raw_sink(self._ctx_ptr, None, None)
+            return
+
+        def _trampoline(_ctx, data, length, offset, _user):
+            try:
+                r = cb(ctypes.string_at(data, length), int(offset))
+            except Exception:        # 回调里抛异常不能穿过 C 栈
+                return 1
+            return 0 if r is None else (0 if r else 1)
+
+        fn = _abi.DESC_RAW_SINK_FN(_trampoline)
+        self._callbacks["raw_sink"] = fn
+        self._lib.jsdk_context_set_desc_raw_sink(self._ctx_ptr,
+                                                 ctypes.cast(fn, ctypes.c_void_p),
+                                                 None)
+
+    def desc_progress(self, cb) -> None:
+        """安装/取消下载进度回调（``cb(done, total)``）；``cb=None`` 取消。"""
+        if cb is None:
+            self._callbacks.pop("progress", None)
+            self._lib.jsdk_context_set_desc_progress(self._ctx_ptr, None, None)
+            return
+
+        def _trampoline(_ctx, done, total, _user):
+            try:
+                cb(int(done), int(total))
+            except Exception:
+                pass                     # 进度回调不该影响下载
+
+        fn = _abi.DESC_PROGRESS_FN(_trampoline)
+        self._callbacks["progress"] = fn
+        self._lib.jsdk_context_set_desc_progress(self._ctx_ptr,
+                                                 ctypes.cast(fn, ctypes.c_void_p),
+                                                 None)
+
+    def on_fault(self, cb) -> None:
+        """安装/取消故障**边沿**回调（0→1 只报一次）；``cb=None`` 取消。
+
+        Python 回调形如 ``cb(joint, info: FaultInfo)``。
+
+        ⚠ 它在 ``cycle_begin/end`` 里被调用（控制路径）：回调里**不要**做重活，
+          也**不得**重入 SDK（会踩到正在使用中的内部状态）。硬实时场景请改用
+          轮询 ``joint.is_fault()`` / ``joint.fault_info()``。
+        """
+        if cb is None:
+            self._callbacks.pop("fault", None)
+            self._lib.jsdk_context_set_fault_callback(self._ctx_ptr, None, None)
+            return
+
+        def _trampoline(jptr, info_ptr, _user):
+            try:
+                cb(self._joint_by_ptr(jptr), FaultInfo._from_c(info_ptr.contents))
+            except Exception:
+                pass                     # 异常不能穿过 C 栈
+
+        fn = _abi.FAULT_CALLBACK_FN(_trampoline)
+        self._callbacks["fault"] = fn
+        self._lib.jsdk_context_set_fault_callback(
+            self._ctx_ptr, ctypes.cast(fn, ctypes.c_void_p), None)
+
+    def _joint_by_ptr(self, jptr):
+        """把 C 传来的 ``jsdk_joint_t*`` 换回 Python 对象（找不到就返回 None）。
+
+        ⚠ 两侧的指针形态不一样：C 回调给的参数是 **int**，而 ``Joint._ptr`` 存的是
+          ``c_void_p`` 实例 —— 直接 ``==`` 永远不相等（真踩过：回调里 joint 恒为
+          None）。统一用 ``ctypes.cast(...).value`` 归一化再比。
+        """
+        def _addr(p):
+            try:
+                return int(ctypes.cast(p, ctypes.c_void_p).value or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        want = _addr(jptr)
+        if want == 0:
+            return None
+        for j in self._joints:
+            if _addr(j._ptr) == want:
+                return j
+        return None
 
     # --- 关节集合 ---------------------------------------------------------
 

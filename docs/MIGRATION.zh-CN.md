@@ -166,7 +166,7 @@ jsdk_context_init(ctx, &cfg);                        /* cfg 必须与 arena 同�
 | 5 | 依赖 ESI/profile 的代码 → 改成路径字符串（`jsdk_endpoint_lookup`） | |
 | 6 | `jsdk_context_create` → `jsdk_context_init` + 静态存储（或开 `JSDK_ENABLE_HEAP`） | |
 | 7 | 新增 `desc_fetch()` 步骤（或导入缓存） | |
-| 8 | 控制周期与**设备 `break_timeout`**（CAN 独有！默认 100 ms）对齐 | |
+| 8 | 控制周期与**设备 `break_timeout`**（CAN 独有！**设备默认 0 = 禁用**，主站需主动武装并读回确认）对齐 | |
 | 9 | 多关节同步：PDO 同步 → `jsdk_group_set_mit()`（**仅 node_id 1..7 可广播**） | |
 | 10 | 故障恢复：`jsdk_joint_request_fault_reset()` + `jsdk_joint_get_fault_info()`（同名，不用改） | |
 | 11 | 单位自检（`UNITS.zh-CN.md` §7 的三件套）在**不接电机**时先跑一遍 | |

@@ -9,9 +9,13 @@
  *    - Classic → 直接逐条单读，**不让客户看到 ERR**
  *  客户只调一次 `jsdk_joint_param_get_batch()`，由 SDK 决定走哪条路。
  *
- * @par 参数的字节序
- *  参数值是**大端**（与全协议一致，JSON 描述符是唯一例外）。读到调用方缓冲后
- *  由本文件负责按端点类型宽度解成主机序的 `jsdk_value_t`。
+ * @par 参数的字节序（⚙ 实测修正）
+ *  参数值是**小端**。协议文档曾写"与全协议一致（大端）"，但真机不是：
+ *  固件在 PARAM_READ/WRITE 里把端点值原样 `memcpy` 进/出载荷，线上就是
+ *  ARM 主机序（LE）。完整证据（固件源码锚点 + 真机实测三例）见
+ *  `src/proto_cyberbeast/cb_frame.h` 里的 `cb_le_*` 说明。
+ *  控制帧与查询响应（0x40/0x46/0x49）**仍然是大端**。
+ *  读到调用方缓冲后由本文件负责按端点类型宽度解成主机序的 `jsdk_value_t`。
  */
 
 #include "jsdk_core_internal.h"
@@ -43,10 +47,14 @@ static jsdk_status_t resolve(jsdk_joint_t *j, const char *path,
 }
 
 /* ==========================================================================
- * 大端窄宽度 ↔ 主机序
+ * 参数值 ↔ 主机序：**小端**
+ *
+ * ⚠⚠ 参数值在线上是**小端**（设备端 `memcpy` 主机序），与控制/查询帧的大端
+ *   相反。完整理由（固件源码锚点 + 真机实测三例）见 `cb_frame.h` 的小端
+ *   存取器说明 —— 那里是这条约定的唯一权威注释。
  * ======================================================================== */
 
-static void be_to_value(jsdk_ep_type_t t, const uint8_t *b, jsdk_value_t *out)
+static void le_to_value(jsdk_ep_type_t t, const uint8_t *b, jsdk_value_t *out)
 {
     memset(out, 0, sizeof *out);
     out->type = t;
@@ -55,17 +63,17 @@ static void be_to_value(jsdk_ep_type_t t, const uint8_t *b, jsdk_value_t *out)
     case JSDK_EP_U8:  out->v.u8  = b[0]; break;
     case JSDK_EP_I8:  out->v.i8  = (int8_t)b[0]; break;
     case JSDK_EP_BOOL: out->v.boolean = (b[0] != 0u) ? 1 : 0; break;
-    case JSDK_EP_U16: out->v.u16 = cb_be_get_u16(b); break;
-    case JSDK_EP_I16: out->v.i16 = cb_be_get_i16(b); break;
-    case JSDK_EP_U32: out->v.u32 = cb_be_get_u32(b); break;
-    case JSDK_EP_I32: out->v.i32 = cb_be_get_i32(b); break;
-    case JSDK_EP_U64: out->v.u64 = cb_be_get_u64(b); break;
-    case JSDK_EP_I64: out->v.i64 = (int64_t)cb_be_get_u64(b); break;
-    case JSDK_EP_F32: out->v.f32 = cb_be_get_f32(b); break;
+    case JSDK_EP_U16: out->v.u16 = cb_le_get_u16(b); break;
+    case JSDK_EP_I16: out->v.i16 = cb_le_get_i16(b); break;
+    case JSDK_EP_U32: out->v.u32 = cb_le_get_u32(b); break;
+    case JSDK_EP_I32: out->v.i32 = cb_le_get_i32(b); break;
+    case JSDK_EP_U64: out->v.u64 = cb_le_get_u64(b); break;
+    case JSDK_EP_I64: out->v.i64 = (int64_t)cb_le_get_u64(b); break;
+    case JSDK_EP_F32: out->v.f32 = cb_le_get_f32(b); break;
     case JSDK_EP_F64: {
         /* 协议里没有 f64 线格式；按两个 u32 拼（保留位，仅用于透传） */
-        uint64_t hi = cb_be_get_u32(b);
-        uint64_t lo = cb_be_get_u32(b + 4);
+        uint64_t lo = cb_le_get_u32(b);
+        uint64_t hi = cb_le_get_u32(b + 4);
         uint64_t raw = (hi << 32) | lo;
         double d;
         memcpy(&d, &raw, sizeof d);      /* 位模式搬运，不做数值转换 */
@@ -77,7 +85,7 @@ static void be_to_value(jsdk_ep_type_t t, const uint8_t *b, jsdk_value_t *out)
     }
 }
 
-static int value_to_be(jsdk_ep_type_t t, const jsdk_value_t *in,
+static int value_to_le(jsdk_ep_type_t t, const jsdk_value_t *in,
                        uint8_t *b, uint8_t *out_len)
 {
     unsigned w = jsdk_ep_type_size(t);
@@ -89,18 +97,18 @@ static int value_to_be(jsdk_ep_type_t t, const jsdk_value_t *in,
     case JSDK_EP_U8:   b[0] = in->v.u8; break;
     case JSDK_EP_I8:   b[0] = (uint8_t)in->v.i8; break;
     case JSDK_EP_BOOL: b[0] = (uint8_t)(in->v.boolean ? 1 : 0); break;
-    case JSDK_EP_U16:  cb_be_put_u16(b, in->v.u16); break;
-    case JSDK_EP_I16:  cb_be_put_i16(b, in->v.i16); break;
-    case JSDK_EP_U32:  cb_be_put_u32(b, in->v.u32); break;
-    case JSDK_EP_I32:  cb_be_put_i32(b, in->v.i32); break;
-    case JSDK_EP_U64:  cb_be_put_u64(b, in->v.u64); break;
-    case JSDK_EP_I64:  cb_be_put_u64(b, (uint64_t)in->v.i64); break;
-    case JSDK_EP_F32:  cb_be_put_f32(b, in->v.f32); break;
+    case JSDK_EP_U16:  cb_le_put_u16(b, in->v.u16); break;
+    case JSDK_EP_I16:  cb_le_put_i16(b, in->v.i16); break;
+    case JSDK_EP_U32:  cb_le_put_u32(b, in->v.u32); break;
+    case JSDK_EP_I32:  cb_le_put_i32(b, in->v.i32); break;
+    case JSDK_EP_U64:  cb_le_put_u64(b, in->v.u64); break;
+    case JSDK_EP_I64:  cb_le_put_u64(b, (uint64_t)in->v.i64); break;
+    case JSDK_EP_F32:  cb_le_put_f32(b, in->v.f32); break;
     case JSDK_EP_F64: {
         uint64_t raw;
         memcpy(&raw, &in->v.f64, sizeof raw);
-        cb_be_put_u32(b, (uint32_t)(raw >> 32));
-        cb_be_put_u32(b + 4, (uint32_t)raw);
+        cb_le_put_u32(b, (uint32_t)raw);
+        cb_le_put_u32(b + 4, (uint32_t)(raw >> 32));
         break;
     }
     default:
@@ -153,7 +161,7 @@ jsdk_status_t jsdk_joint_param_get(jsdk_joint_t *j, const char *path,
         return JSDK_ERR_PROTOCOL;
     }
 
-    be_to_value(t, buf, out);
+    le_to_value(t, buf, out);
     return JSDK_OK;
 }
 
@@ -181,7 +189,7 @@ jsdk_status_t jsdk_joint_param_set(jsdk_joint_t *j, const char *path,
                           jsdk_ep_type_string(in->type));
         return JSDK_ERR_PROTOCOL;
     }
-    if (value_to_be(t, in, buf, &len) != 0) {
+    if (value_to_le(t, in, buf, &len) != 0) {
         return JSDK_ERR_UNSUPPORTED;
     }
 
@@ -444,7 +452,7 @@ jsdk_status_t jsdk_joint_param_get_batch(jsdk_joint_t *j, jsdk_param_req_t *reqs
                             continue;
                         }
                         if (off + w > rsp.values_len) { usable = 0; break; }
-                        be_to_value(types[base + k], rsp.values + off,
+                        le_to_value(types[base + k], rsp.values + off,
                                     &reqs[slot].value);
                         reqs[slot].status = JSDK_OK;
                         off += w;

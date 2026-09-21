@@ -16,6 +16,7 @@
 #endif
 
 #include "jsdk_cli.h"        /* jsdk_cli_stop_requested() */
+#include "cli_text.h"
 
 /* ==========================================================================
  * 选项解析
@@ -23,7 +24,7 @@
 
 void cli_usage(FILE *f, const char *argv0)
 {
-    fprintf(f,
+    cli_fprintf(f,
         "用法: %s [全局选项] <子命令> [子命令选项]\n"
         "\n"
         "全局选项\n"
@@ -50,7 +51,7 @@ void cli_usage(FILE *f, const char *argv0)
         "  scan                          节点发现（被动 200 ms + 主动探测）\n"
         "  info                          QUERY_DEVICE_INFO：hw/fw/serial\n"
         "  health                        模式/错误码/心跳标志/温度/母线/新鲜度/链路统计\n"
-        "  mon [--csv F]                 周期监控\n"
+        "  mon [--csv] [--csv-file F]   周期监控\n"
         "  read <path>                   按名读参数\n"
         "  batch-read <path>...          批量读（FD 单帧；Classic 自动退化）\n"
         "  dump-config                   读回关键配置快照\n"
@@ -96,7 +97,7 @@ static int opt_value(int *i, int argc, char **argv, const char *tok,
 
     if (strcmp(tok, name) == 0) {
         if (*i + 1 >= argc) {
-            fprintf(err, "jsdk-cli: 选项 %s 需要一个值\n", name);
+            cli_fprintf(err, "jsdk-cli: 选项 %s 需要一个值\n", name);
             return -1;
         }
         (*i)++;
@@ -175,7 +176,7 @@ int cli_opts_parse(cli_opts_t *o, int argc, char **argv, FILE *err)
             } else if (o->nargs < (unsigned)(sizeof o->args / sizeof o->args[0])) {
                 o->args[o->nargs++] = t;
             } else {
-                fprintf(err, "jsdk-cli: 位置参数过多（最多 %u 个）\n",
+                cli_fprintf(err, "jsdk-cli: 位置参数过多（最多 %u 个）\n",
                         (unsigned)(sizeof o->args / sizeof o->args[0]));
                 return 2;
             }
@@ -186,6 +187,11 @@ int cli_opts_parse(cli_opts_t *o, int argc, char **argv, FILE *err)
         if (strcmp(t, "--json") == 0) { o->json = 1; continue; }
         if (strcmp(t, "--classic") == 0) { o->classic = 1; o->data_bitrate = 0u; continue; }
         if (strcmp(t, "--yes") == 0) { o->yes = 1; continue; }
+        /* ⚠ `--csv` 是**格式开关**（与 Python 版 `python -m jsdk_can` 一致）。
+           它以前是“要一个文件名”，于是 `mon --csv --duration 1` 会把 `--duration`
+           当成文件名、**静默写出一个叫 `--duration` 的 CSV**（真发生过，清理时才发现）。
+           写文件的能力保留在 `--csv-file <file>`（取值时也会拒绍以 `-` 开头的东西）。 */
+        if (strcmp(t, "--csv") == 0) { o->csv = 1; continue; }
         if (strcmp(t, "--verbose") == 0 || strcmp(t, "-v") == 0) { o->verbose = 1; continue; }
         if (strcmp(t, "--quiet") == 0 || strcmp(t, "-q") == 0) { o->quiet = 1; continue; }
         if (strcmp(t, "--help") == 0 || strcmp(t, "-h") == 0) { cli_usage(err, argv[0]); return 1; }
@@ -198,7 +204,7 @@ int cli_opts_parse(cli_opts_t *o, int argc, char **argv, FILE *err)
                 { "--master-id",    4 },  { "--node",         5 },
                 { "--probe",        6 },  { "--timeout",      7 },
                 { "--rate-hz",      8 },  { "--duration",     9 },
-                { "--hold",        10 },  { "--csv",         11 },
+                { "--hold",        10 },  { "--csv-file",    20 },
                 { "--filter",      12 },  { "--pos",         13 },
                 { "--vel",         14 },  { "--kp",          15 },
                 { "--kd",          16 },  { "--tau",         17 },
@@ -217,7 +223,7 @@ int cli_opts_parse(cli_opts_t *o, int argc, char **argv, FILE *err)
                 /* 一处集中报"值非法"，避免每个分支重复四行 */
 #define CLI_BAD_VALUE()                                                      \
                 do {                                                         \
-                    fprintf(err, "jsdk-cli: 选项 %s 的值非法: %s\n",          \
+                    cli_fprintf(err, "jsdk-cli: 选项 %s 的值非法: %s\n",          \
                             VAL[k].name, v);                                 \
                     return 2;                                                \
                 } while (0)
@@ -252,7 +258,16 @@ int cli_opts_parse(cli_opts_t *o, int argc, char **argv, FILE *err)
                 case 10:
                     if (parse_i32(v, &o->hold_s) != 0 || o->hold_s < 0) CLI_BAD_VALUE();
                     break;
-                case 11: o->csv = v; break;
+                case 20:
+                    /* 防的就是那一个坑：`--csv-file --duration 1` 会把下一个选项当文件名，
+                       然后静默写出一个叫 `--duration` 的文件（真发生过）。 */
+                    if (v[0] == '-') {
+                        cli_fprintf(err, "jsdk-cli: %s 需要一个文件路径，"
+                                         "但得到的是另一个选项（%s）\n", VAL[k].name, v);
+                        return 2;
+                    }
+                    o->csv_file = v;
+                    break;
                 case 12: o->filter = v; break;
                 case 13:
                     if (parse_f64(v, &o->pos) != 0) CLI_BAD_VALUE();
@@ -291,12 +306,12 @@ int cli_opts_parse(cli_opts_t *o, int argc, char **argv, FILE *err)
             if (hit) continue;
         }
 
-        fprintf(err, "jsdk-cli: 未知选项 %s（--help 看用法）\n", t);
+        cli_fprintf(err, "jsdk-cli: 未知选项 %s（--help 看用法）\n", t);
         return 2;
     }
 
     if (!o->sub) {
-        fprintf(err, "jsdk-cli: 缺少子命令（--help 看用法）\n");
+        cli_fprintf(err, "jsdk-cli: 缺少子命令（--help 看用法）\n");
         return 2;
     }
     return 0;
@@ -467,7 +482,7 @@ int cli_open(cli_app_t *a)
         st = jsdk_hal_pcan_open(&a->user_hal, &a->hal, chan,
                                a->o.bitrate, a->o.data_bitrate);
         if (st == JSDK_ERR_NOT_FOUND) {
-            fprintf(a->err, "jsdk-cli: 打不开 PCAN：找不到 PCANBasic 库。%s\n",
+            cli_fprintf(a->err, "jsdk-cli: 打不开 PCAN：找不到 PCANBasic 库。%s\n",
                     "请安装 PEAK 的 PCAN-Basic 驱动（32/64 位要与本进程一致）");
         }
     } else if (strcmp(ifname, "slcan") == 0) {
@@ -479,26 +494,26 @@ int cli_open(cli_app_t *a)
         st = jsdk_hal_slcan_open(&a->user_hal, &a->hal, chan, a->o.baud,
                                  a->o.data_bitrate);
         if (st == JSDK_ERR_UNSUPPORTED) {
-            fprintf(a->err, "jsdk-cli: slcan 的数据段速率 %u 不在已知表里"
+            cli_fprintf(a->err, "jsdk-cli: slcan 的数据段速率 %u 不在已知表里"
                             "（仅支持 2000000 与 5000000；"
                             "其它速率请先用厂家工具配好，再传 --data-bitrate 0）\n",
                     (unsigned)a->o.data_bitrate);
         }
         if (a->o.bitrate != 1000000u) {
-            fprintf(a->err, "jsdk-cli: 提示：--bitrate 对 slcan 无意义"
+            cli_fprintf(a->err, "jsdk-cli: 提示：--bitrate 对 slcan 无意义"
                             "（CAN 仲裁段速率由适配器自己配），串口速率用 --baud %u\n",
                     (unsigned)a->o.baud);
         }
         /* 注：--classic 在解析阶段就把 data_bitrate 归 0（见 cli_app.c 的选项循环），
            所以"Classic 却要发 Y 命令"这种情况不可能出现，不需要额外提示。 */
     } else {
-        fprintf(a->err, "jsdk-cli: 未知后端 --if %s（socketcan|pcan|slcan|virtual）\n",
+        cli_fprintf(a->err, "jsdk-cli: 未知后端 --if %s（socketcan|pcan|slcan|virtual）\n",
                 ifname);
         return 2;
     }
 
     if (st != JSDK_OK) {
-        fprintf(a->err, "jsdk-cli: 打开 %s(%s) 失败：%s\n",
+        cli_fprintf(a->err, "jsdk-cli: 打开 %s(%s) 失败：%s\n",
                 ifname, chan ? chan : "", jsdk_status_string(st));
         return 1;
     }
@@ -515,7 +530,7 @@ int cli_open(cli_app_t *a)
     a->fd = (a->o.data_bitrate != 0u) ? 1 : 0;
 
     if (a->o.verbose) {
-        fprintf(a->err, "jsdk-cli: %s(%s) bitrate=%u data=%u %s master=%u node=%u\n",
+        cli_fprintf(a->err, "jsdk-cli: %s(%s) bitrate=%u data=%u %s master=%u node=%u\n",
                 ifname, chan ? chan : "", a->o.bitrate, a->o.data_bitrate,
                 a->fd ? "FD" : "Classic", (unsigned)a->o.master_id,
                 (unsigned)a->o.node);
@@ -540,7 +555,7 @@ static int cli_init_ctx(cli_app_t *a)
 
     a->ctx = (jsdk_context_t *)calloc(1u, jsdk_context_size(NULL));
     if (!a->ctx) {
-        fprintf(a->err, "jsdk-cli: 内存不足（上下文 %u 字节）\n",
+        cli_fprintf(a->err, "jsdk-cli: 内存不足（上下文 %u 字节）\n",
                 (unsigned)jsdk_context_size(NULL));
         return 1;
     }
@@ -551,8 +566,19 @@ static int cli_init_ctx(cli_app_t *a)
     cfg->is_fd     = (uint8_t)a->fd;
     /* `period_ns` 是 **uint32_t**（ns 计，上限 ~4.29 s）；
        这里不要多此一举地转成 uint64_t —— `-Wconversion` 会正确地报
-       "long unsigned → uint32_t 可能丢值"（rate_hz 已校验 1..1000）。 */
-    cfg->period_ns = (uint32_t)(1000000000u / (uint32_t)a->o.rate_hz);
+       "long unsigned → uint32_t 可能丢值"（rate_hz 已校验 1..1000）。
+
+       ⚠ **只给真跑循环的命令声明周期**（理由见 `cli_cmd_needs_loop()`）：
+         SDK 有一条安全闸“周期 >= 设备 break_timeout 就拒绝 configure()”
+         （因为那样的循环喂不了协议看门狗；`break_timeout = 0` = 禁用时该闸**不适用**）。
+         而 CLI 默认周期是 10 Hz = 100 ms，历史上真机设备又被默认成 100 ms，
+         于是只读诊断命令会**全部**被这条闸拦住（真机实测，已修）。
+         只读命令本来就不跑循环，周期对它没有意义。 */
+    if (cli_cmd_needs_loop(a->o.sub)) {
+        cfg->period_ns = (uint32_t)(1000000000u / (uint32_t)a->o.rate_hz);
+    } else {
+        cfg->period_ns = 0u;   /* 0 = 不声明控制周期（SDK 跳过那条安全闸） */
+    }
 
     /* arena 先给上（大小按 RETAIN_ALL 的保守推荐值）；下载描述符时再用。
        ⚠ arena 本身要由我们释放（否则每次 run 漏 32 KB）；cfg 由 a 持有。 */
@@ -561,7 +587,7 @@ static int cli_init_ctx(cli_app_t *a)
     cfg->desc.timeout_ms = a->o.timeout_ms;
     a->arena = calloc(1u, jsdk_desc_arena_size(&cfg->desc));
     if (!a->arena) {
-        fprintf(a->err, "jsdk-cli: 内存不足（描述符 arena）\n");
+        cli_fprintf(a->err, "jsdk-cli: 内存不足（描述符 arena）\n");
         return 1;
     }
     cfg->desc.arena      = a->arena;
@@ -569,7 +595,7 @@ static int cli_init_ctx(cli_app_t *a)
 
     st = jsdk_context_init(a->ctx, cfg);
     if (st != JSDK_OK) {
-        fprintf(a->err, "jsdk-cli: 初始化上下文失败：%s\n", jsdk_status_string(st));
+        cli_fprintf(a->err, "jsdk-cli: 初始化上下文失败：%s\n", jsdk_status_string(st));
         return 1;
     }
 
@@ -578,14 +604,14 @@ static int cli_init_ctx(cli_app_t *a)
     jc.initial_mode = JSDK_MODE_MIT;
     st = jsdk_context_add_joint(a->ctx, &jc, &a->joint);
     if (st != JSDK_OK) {
-        fprintf(a->err, "jsdk-cli: 添加关节 %u 失败：%s\n",
+        cli_fprintf(a->err, "jsdk-cli: 添加关节 %u 失败：%s\n",
                 (unsigned)a->o.node, jsdk_status_string(st));
         return 1;
     }
     return 0;
 }
 
-int cli_load_desc(cli_app_t *a)
+int cli_load_desc(cli_app_t *a, int full)
 {
     jsdk_status_t st;
     uint32_t      t0;
@@ -593,17 +619,44 @@ int cli_load_desc(cli_app_t *a)
     if (!a->ctx) return 1;
 
     t0 = cli_wall_ms();
-    st = jsdk_context_configure(a->ctx);
+    /*
+     * 两档：
+     *   full = 1 → configure()：描述符 + 标定（要读值的命令）；
+     *   full = 0 → 只下描述符（`desc-info`/`ep-list`/`ep-lookup`/`desc-export`）。
+     * 为什么必须分：标定会因"标定量超范围"失败，而那些命令根本不需要标定 ——
+     * 合在一起会让"最需要看端点表的时候看不到"（真机实测）。
+     */
+    st = full ? jsdk_context_configure(a->ctx)
+              : jsdk_context_desc_fetch(a->ctx);
     if (st != JSDK_OK) {
-        fprintf(a->err, "jsdk-cli: configure() 失败：%s\n%s\n",
+        cli_fprintf(a->err, "jsdk-cli: %s 失败：%s\n%s\n",
+                full ? "configure()" : "desc_fetch()",
                 jsdk_status_string(st), jsdk_context_last_error(a->ctx));
+        /*
+         * 真机上最常见的一条：设备的 break_timeout 比我们的控制周期还短。
+         * SDK 的提示只说"周期 >= break_timeout"，这里补上**怎么改**。
+         */
+        if (st == JSDK_ERR_BAD_STATE && cli_cmd_needs_loop(a->o.sub)) {
+            cli_fprintf(a->err,
+                    "提示：本命令会跑控制循环，周期 = 1e9/--rate-hz = %u ms，"
+                    "而设备侧 break_timeout 是它自己的配置。\n"
+                    "      提高 --rate-hz（例如 --rate-hz 100 → 10 ms），"
+                    "或把设备的 can.config.break_timeout 调大。\n",
+                    (unsigned)(1000u / (unsigned)a->o.rate_hz));
+        }
+        /* 标定失败时提醒：端点是有的，用 desc-only 命令看现场 */
+        if (full && st == JSDK_ERR_PROTOCOL) {
+            cli_fprintf(a->err,
+                    "提示：描述符已经下完，失败的是**标定**。用 `desc-info` / "
+                    "`ep-lookup <path>` / `ep-list` 看设备到底提供了哪些端点。\n");
+        }
         return 1;
     }
 
     if (a->o.verbose) {
         jsdk_desc_info_t di;
         if (jsdk_context_get_desc_info(a->ctx, &di) == JSDK_OK) {
-            fprintf(a->err, "jsdk-cli: 描述符 %u 字节 / %u 端点 / %u 帧 / %u ms\n",
+            cli_fprintf(a->err, "jsdk-cli: 描述符 %u 字节 / %u 端点 / %u 帧 / %u ms\n",
                     (unsigned)di.total_len, di.endpoint_count,
                     di.frames_rx, (unsigned)(cli_wall_ms() - t0));
         }
@@ -636,7 +689,7 @@ void cli_close(cli_app_t *a)
 jsdk_joint_t *cli_joint(cli_app_t *a)
 {
     if (!a->joint) {
-        fprintf(a->err, "jsdk-cli: 没有节点 %u\n", (unsigned)a->o.node);
+        cli_fprintf(a->err, "jsdk-cli: 没有节点 %u\n", (unsigned)a->o.node);
     }
     return a->joint;
 }
@@ -656,9 +709,9 @@ void cli_error(cli_app_t *a, const char *what, jsdk_status_t st)
 {
     const char *detail = a->ctx ? jsdk_context_last_error(a->ctx) : NULL;
 
-    fprintf(a->err, "jsdk-cli: %s 失败：%s\n", what ? what : "操作",
+    cli_fprintf(a->err, "jsdk-cli: %s 失败：%s\n", what ? what : "操作",
             jsdk_status_string(st));
-    if (detail && detail[0]) fprintf(a->err, "         %s\n", detail);
+    if (detail && detail[0]) cli_fprintf(a->err, "         %s\n", detail);
 }
 
 void cli_error_json(cli_app_t *a, cli_json_t *j, const char *what, jsdk_status_t st)
@@ -672,7 +725,7 @@ void cli_error_json(cli_app_t *a, cli_json_t *j, const char *what, jsdk_status_t
     cli_json_str(j, "message", (detail && detail[0]) ? detail : "");
     cli_json_obj_end(j);
 
-    fprintf(a->err, "jsdk-cli: %s 失败：%s%s%s\n", what ? what : "操作",
+    cli_fprintf(a->err, "jsdk-cli: %s 失败：%s%s%s\n", what ? what : "操作",
             jsdk_status_string(st),
             (detail && detail[0]) ? " — " : "",
             (detail && detail[0]) ? detail : "");

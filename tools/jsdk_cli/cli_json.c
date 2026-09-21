@@ -6,6 +6,7 @@
 #include "cli_json.h"
 
 #include <string.h>
+#include "cli_text.h"
 
 /* --------------------------------------------------------------------------
  * 内部：逗号与缩进
@@ -16,13 +17,13 @@ static void j_pre(cli_json_t *j)
 {
     if (j->depth <= 0) return;
     if (j->need_comma[j->depth - 1]) {
-        fputc(',', j->f);
+        cli_fputc(',', j->f);
     }
     j->need_comma[j->depth - 1] = 1;    /* 这一次之后就是必需的了 */
-    if (j->pretty) fputc('\n', j->f);
+    if (j->pretty) cli_fputc('\n', j->f);
     if (j->pretty) {
         int k;
-        for (k = 0; k < j->depth; ++k) fputs("  ", j->f);
+        for (k = 0; k < j->depth; ++k) cli_fputs("  ", j->f);
     }
 }
 
@@ -32,8 +33,8 @@ static void j_key(cli_json_t *j, const char *key)
     j_pre(j);
     if (key) {
         cli_json_escape(j->f, key);
-        fputc(':', j->f);
-        if (j->pretty) fputc(' ', j->f);
+        cli_fputc(':', j->f);
+        if (j->pretty) cli_fputc(' ', j->f);
     }
 }
 
@@ -56,7 +57,7 @@ void cli_json_init(cli_json_t *j, FILE *f, int pretty)
     j->f = f;
     j->pretty = pretty ? 1 : 0;
     j_push(j);                    /* 根对象 */
-    fputc('{', f);
+    cli_fputc('{', f);
 }
 
 void cli_json_finish(cli_json_t *j)
@@ -66,18 +67,18 @@ void cli_json_finish(cli_json_t *j)
         j->depth--;
         if (j->pretty && j->depth > 0) {
             int k;
-            fputc('\n', j->f);
-            for (k = 0; k < j->depth; ++k) fputs("  ", j->f);
+            cli_fputc('\n', j->f);
+            for (k = 0; k < j->depth; ++k) cli_fputs("  ", j->f);
         }
-        fputc('}', j->f);
+        cli_fputc('}', j->f);
     }
-    fputc('\n', j->f);
+    cli_fputc('\n', j->f);
 }
 
 void cli_json_obj_begin(cli_json_t *j, const char *key)
 {
     j_key(j, key);
-    fputc('{', j->f);
+    cli_fputc('{', j->f);
     j_push(j);
 }
 
@@ -88,82 +89,82 @@ void cli_json_obj_end(cli_json_t *j)
         (j->depth < CLI_JSON_MAX_DEPTH && j->need_comma[j->depth])) {
         /* 只有当对象非空时才换行 */
         int k;
-        fputc('\n', j->f);
-        for (k = 0; k < j->depth; ++k) fputs("  ", j->f);
+        cli_fputc('\n', j->f);
+        for (k = 0; k < j->depth; ++k) cli_fputs("  ", j->f);
     }
-    fputc('}', j->f);
+    cli_fputc('}', j->f);
     if (j->depth < CLI_JSON_MAX_DEPTH) j->need_comma[j->depth] = 1;
 }
 
 void cli_json_arr_begin(cli_json_t *j, const char *key)
 {
     j_key(j, key);
-    fputc('[', j->f);
+    cli_fputc('[', j->f);
     j_push(j);
 }
 
 void cli_json_arr_end(cli_json_t *j)
 {
     if (j->depth > 0) j->depth--;
-    if (j->pretty) fputc('\n', j->f);
-    fputc(']', j->f);
+    if (j->pretty) cli_fputc('\n', j->f);
+    cli_fputc(']', j->f);
     if (j->depth < CLI_JSON_MAX_DEPTH) j->need_comma[j->depth] = 1;
 }
 
 void cli_json_num(cli_json_t *j, const char *key, double v)
 {
     j_key(j, key);
-    fprintf(j->f, "%.6g", v);
+    cli_fprintf(j->f, "%.6g", v);
 }
 
 void cli_json_i64(cli_json_t *j, const char *key, long long v)
 {
     j_key(j, key);
-    fprintf(j->f, "%lld", v);
+    cli_fprintf(j->f, "%lld", v);
 }
 
 void cli_json_bool(cli_json_t *j, const char *key, int v)
 {
     j_key(j, key);
-    fputs(v ? "true" : "false", j->f);
+    cli_fputs(v ? "true" : "false", j->f);
 }
 
 void cli_json_null(cli_json_t *j, const char *key)
 {
     j_key(j, key);
-    fputs("null", j->f);
+    cli_fputs("null", j->f);
 }
 
 void cli_json_raw_num(cli_json_t *j, double v)
 {
     j_key(j, NULL);
-    fprintf(j->f, "%.6g", v);
+    cli_fprintf(j->f, "%.6g", v);
 }
 
 void cli_json_escape(FILE *f, const char *s)
 {
-    fputc('"', f);
+    cli_fputc('"', f);
     if (s) {
         const unsigned char *p = (const unsigned char *)s;
         for (; *p; ++p) {
             unsigned char c = *p;
             switch (c) {
-            case '"':  fputs("\\\"", f); break;
-            case '\\': fputs("\\\\", f); break;
-            case '\n': fputs("\\n", f);  break;
-            case '\r': fputs("\\r", f);  break;
-            case '\t': fputs("\\t", f);  break;
+            case '"':  cli_fputs("\\\"", f); break;
+            case '\\': cli_fputs("\\\\", f); break;
+            case '\n': cli_fputs("\\n", f);  break;
+            case '\r': cli_fputs("\\r", f);  break;
+            case '\t': cli_fputs("\\t", f);  break;
             default:
                 if (c < 0x20u) {
-                    fprintf(f, "\\u%04x", (unsigned)c);
+                    cli_fprintf(f, "\\u%04x", (unsigned)c);
                 } else {
-                    fputc((int)c, f);
+                    cli_fputc((int)c, f);
                 }
                 break;
             }
         }
     }
-    fputc('"', f);
+    cli_fputc('"', f);
 }
 
 void cli_json_str(cli_json_t *j, const char *key, const char *v)

@@ -15,13 +15,25 @@
 from __future__ import annotations
 
 import ctypes
+import struct
+import time
 from dataclasses import dataclass
 
 from . import _abi
-from .enums import AxisState, EpType, Mode, ModeState, StatusFlag
+from .enums import AxisState, EpType, Mode, ModeState, Status, StatusFlag
 from .errors import raise_for_status
 
-__all__ = ["Joint", "Feedback", "ConfigSnapshot", "DeviceInfo", "FaultInfo"]
+__all__ = ["Joint", "Feedback", "ConfigSnapshot", "DeviceInfo", "FaultInfo",
+           "Sdo"]
+
+
+def _c_str(value: object) -> str:
+    """把 C 侧返回的 `const char*` 变成 `str`（None/空都当空串）。"""
+    if not value:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return str(value)
 
 
 @dataclass
@@ -74,6 +86,22 @@ class Feedback:
     def has_flag(self) -> "StatusFlagQuery":
         """``fb.has_flag(StatusFlag.FEEDBACK_STALE)``。"""
         return StatusFlagQuery(self.status_flags)
+
+    def axis_state_name(self) -> str:
+        """字面名字，**取自 C 侧的 `jsdk_axis_state_string()`**。
+
+        ⚠ 别用 ``axis_state.name`` 代替：C 版 CLI 打的是这个函数的文本
+        （如 ``switch-on-disabled(idle)``），两版输出要能逐字节对拍。
+        """
+        raw = self.axis_state
+        num = int(raw) if isinstance(raw, int) else -1
+        return _c_str(_abi.lib().jsdk_axis_state_string(num))
+
+    def mode_name(self) -> str:
+        """同 :meth:`axis_state_name`，取自 `jsdk_mode_string()`（如 ``mit(0x00)``）。"""
+        raw = self.mode
+        num = int(raw) if isinstance(raw, int) else -1
+        return _c_str(_abi.lib().jsdk_mode_string(num))
 
 
 @dataclass
@@ -192,6 +220,161 @@ class FaultInfo:
         }
 
 
+class Sdo:
+    """SDO 风格端点槽位：**裸字节** + 非阻塞状态机。
+
+    与 `jsdk-cli` 的 ``read``/``write`` 等价，但拿到的是**线上字节**：
+
+    * ``data`` 就是线上字节，参数值是**小端**（`PROTOCOL_NOTES` §3.1）；
+    * 长度恒等于端点**真实类型宽度**（``size``），不需要也不允许自己凑；
+    * ``read()`` / ``write()`` 是**阻塞便利**（内部自己跑控制周期直到状态机离开
+      ``busy``）。控制回路里请用 :meth:`start_read` / :attr:`state` 自己轮询；
+    * 想按物理量读写就别用 SDO：用 :meth:`Joint.param_get` / :meth:`Joint.param_set`
+      （内部做小端编解码）。
+
+    ⚠ **槽位有限且不可释放**：每个关节最多 8 个，其中 0 号保留给故障详情
+      ⇒ 实际可用 7 个。:meth:`Joint.sdo` 对**同一个端点**返回同一个对象，
+      所以正常用法不会耗尽；但不要用循环去创建一堆不同端点的槽位。
+
+    状态（``jsdk_sdo_state_t``）：``0 idle`` → ``1 busy`` → ``2 success`` / ``3 error``。
+    """
+
+    __slots__ = ("_j", "_lib", "handle", "path", "ep_id", "size", "_ptype")
+
+    def __init__(self, joint: "Joint", handle: int, path: str | None,
+                 ep_id: int, size: int, ptype) -> None:
+        self._j = joint
+        self._lib = joint._lib
+        self.handle = int(handle)
+        self.path = path
+        self.ep_id = int(ep_id)
+        self.size = int(size)
+        self._ptype = ptype
+
+    # --- 状态 -------------------------------------------------------------
+
+    @property
+    def state(self) -> int:
+        """0 idle / 1 busy / 2 success / 3 error。"""
+        return int(self._lib.jsdk_joint_sdo_state(self._j._ptr, self.handle))
+
+    @property
+    def state_name(self) -> str:
+        return {0: "idle", 1: "busy", 2: "success",
+                3: "error"}.get(self.state, "?")
+
+    @property
+    def data(self) -> bytes:
+        """槽位的**裸字节**（副本；长度 = :attr:`size`）。"""
+        ptr = self._lib.jsdk_joint_sdo_data(self._j._ptr, self.handle)
+        if not ptr:
+            raise ValueError("SDO 句柄无效或数据不可取")
+        return ctypes.string_at(ptr, self.size)
+
+    def _data_ptr(self):
+        return self._lib.jsdk_joint_sdo_data(self._j._ptr, self.handle)
+
+    # --- 非阻塞 -----------------------------------------------------------
+
+    def start_read(self) -> None:
+        """发起读（**不等待**）。之后用 :attr:`state` 轮询。"""
+        self._j._chk(self._lib.jsdk_joint_sdo_read(self._j._ptr, self.handle),
+                     "sdo_read")
+
+    def start_write(self, data: bytes | bytearray) -> None:
+        """把 ``data`` 写进槽位并**发起写**（不等待）。
+
+        ``data`` 长度必须等于 :attr:`size`（否则设备按长度校验会拒收）。
+        """
+        b = bytes(data)
+        if len(b) != self.size:
+            raise ValueError(f"{self.path or self.ep_id}: 需要 {self.size} 字节，"
+                             f"给了 {len(b)}")
+        ptr = self._data_ptr()
+        if not ptr:
+            raise ValueError("SDO 句柄无效")
+        ctypes.memmove(ptr, b, self.size)
+        self._j._chk(self._lib.jsdk_joint_sdo_write(self._j._ptr, self.handle),
+                     "sdo_write")
+
+    # --- 阻塞便利（内部自己跑周期）----------------------------------------
+
+    def _pump_until(self, done, timeout_ms: int) -> int:
+        """跑控制周期直到 ``done(state)`` 为真；返回最终 state。超时抛异常。"""
+        ctx = self._j._ctx
+        deadline = time.monotonic() + max(1, timeout_ms) / 1000.0
+        while True:
+            ctx.cycle_begin(0)
+            ctx.cycle_end()
+            st = self.state
+            if done(st):
+                return st
+            if time.monotonic() >= deadline:
+                raise_for_status(int(Status.TIMEOUT), "sdo_wait",
+                                 f"SDO 状态={self.state_name}（{timeout_ms} ms 内没完成）")
+            # 与真实控制回路同节奏；period_ns=0 时退化成很短的小睡
+            if ctx.period_ns > 0:
+                ctx.pace()
+            else:  # pragma: no cover - 非默认配置
+                time.sleep(0.0005)
+
+    def read(self, timeout_ms: int = 1000) -> bytes:
+        """读并返回裸字节（阻塞，内部跑周期）。"""
+        self.start_read()
+        self._pump_until(lambda st: st in (2, 3), timeout_ms)
+        if self.state == 3:
+            raise_for_status(int(Status.PROTOCOL), "sdo_read",
+                             f"{self.path or self.ep_id}: 设备拒绝（state=error）")
+        return self.data
+
+    def write(self, data: bytes | bytearray, timeout_ms: int = 1000) -> None:
+        """写裸字节（阻塞，内部跑周期）。"""
+        self.start_write(data)
+        self._pump_until(lambda st: st in (2, 3), timeout_ms)
+        if self.state == 3:
+            raise_for_status(int(Status.PROTOCOL), "sdo_write",
+                             f"{self.path or self.ep_id}: 设备拒绝（state=error）")
+
+    # --- 便利：按端点类型解成 Python 值（小端，与 C 侧 cb_le_* 一致）-------
+
+    #: 端点类型 → struct 格式（**小端、无填充**，与线上字节一一对应）
+    _FMT = {
+        EpType.U8: "B", EpType.I8: "b", EpType.BOOL: "B",
+        EpType.U16: "H", EpType.I16: "h",
+        EpType.U32: "I", EpType.I32: "i",
+        EpType.U64: "Q", EpType.I64: "q",
+        EpType.F32: "f", EpType.F64: "d",
+    }
+
+    def read_value(self) -> object:
+        """读并按端点类型解成 Python 值（⚠ 线上是小端）。
+
+        与 ``Joint.param_get(path)`` 读同一个端点时必须得到同一个值 ——
+        测试里就是这么对拍的（两条解析路径互相验证）。
+        """
+        fmt = self._FMT.get(self._ptype)
+        if fmt is None:
+            raise ValueError(f"{self.path or self.ep_id}: 类型 {self._ptype} 不是标量")
+        b = self.read()
+        return struct.unpack("<" + fmt, b[:struct.calcsize(fmt)])[0]
+
+    def write_value(self, value: object, timeout_ms: int = 1000) -> None:
+        """按端点类型编码并写（**小端**）。"""
+        fmt = self._FMT.get(self._ptype)
+        if fmt is None:
+            raise ValueError(f"{self.path or self.ep_id}: 类型 {self._ptype} 不是标量")
+        if isinstance(value, bool):
+            value = int(value)
+        packed = struct.pack("<" + fmt, value)
+        if len(packed) < self.size:
+            packed = packed + b"\x00" * (self.size - len(packed))
+        self.write(packed, timeout_ms=timeout_ms)
+
+    def __repr__(self) -> str:  # pragma: no cover - 人读
+        return (f"<Sdo h={self.handle} {self.path or self.ep_id} "
+                f"size={self.size} state={self.state_name}>")
+
+
 class Joint:
     """一个关节。
 
@@ -204,6 +387,7 @@ class Joint:
         self.index = index
         self.node_id = node_id
         self._lib = ctx._lib
+        self._sdos: dict[int, Sdo] = {}
 
     # --- 内部 -------------------------------------------------------------
 
@@ -359,8 +543,20 @@ class Joint:
     def set_watchdog_ms(self, ms: int) -> None:
         """写设备看门狗（``can.config.break_timeout``）。
 
-        ⚠ 固件把 ``0`` 解释为 **100 ms** —— ``0`` 不等于关闭。要放宽请写大值
-        （如 65535）。写入不落 Flash，需要持久化请再 :meth:`save_config`。
+        ``ms == 0`` = **关闭**设备侧的协议级超时检测（最新固件的语义：
+        ``auto_stop_if_timeout()`` 首句就是 ``if (timeout_ms == 0) return;``，
+        且配置项默认值就是 0）。早期固件把 0 当成 100 ms 且无法关闭，
+        所以旧文档写的“0 ≠ 关闭”**已过时**。
+
+        ``ms > 0`` 时才真正开启；而该保护**只在设备收到过控制类帧后才武装**
+        （纯 ``CURRENT_CONTROL`` 客户端武装不了 —— 固件 F19）。
+
+        ⚠ 真机（fw 1545）实测：该端点的**读回恒为 0**（F28）——写 250 立刻读也是 0。
+        因此写非 0 值时若读不回来，会置 :attr:`StatusFlag.WATCHDOG_UNVERIFIED`，
+        并且**不抛异常**（SDK 按写入值保守处理：继续喂狗是安全方向）。
+        调用方要判断“到底确认了没有”，读这个标志位，或看 ``Context.last_error()``。
+
+        写入不落 Flash，需要持久化请再 :meth:`save_config`。
         """
         self._chk(self._lib.jsdk_joint_set_watchdog_ms(self._ptr, int(ms)),
                   "set_watchdog_ms")
@@ -485,6 +681,121 @@ class Joint:
             else:
                 out[p] = error_for_status(int(arr[i].status), f"param_get({p})")
         return out
+
+    # --- SDO 槽位（裸字节 / 轮询状态机） ----------------------------------
+
+    #: 端点类型 → 字节宽度（用于创建 SDO 槽位时的显式长度校验）
+    _WIDTHS = {
+        EpType.U8: 1, EpType.I8: 1, EpType.BOOL: 1,
+        EpType.U16: 2, EpType.I16: 2,
+        EpType.U32: 4, EpType.I32: 4, EpType.F32: 4,
+        EpType.U64: 8, EpType.I64: 8, EpType.F64: 8,
+    }
+
+    @property
+    def sdo_slots_used(self) -> int:
+        """本关节已占用的 SDO 槽位数（每关节最多 8 个，0 号保留给故障详情）。"""
+        return len(self._sdos)
+
+    def sdo(self, path_or_ep: str | int, *, subindex: int = 0,
+            size: int = 0) -> Sdo:
+        """取一个 SDO 槽位（**同一个端点复用同一个对象**）。
+
+        :param path_or_ep: 端点路径（str）或端点 ID（int）
+        :param subindex: 本协议恒为 0（端点 ID 是平铺的）
+        :param size: 0 = 从描述符推断（推荐）
+        :raises JsdkNotFoundError: 端点不存在 / 端点没有标量宽度 / 槽位用尽
+
+        ⚠ 槽位**不可释放**（C 侧没有 free），所以这里按端点 ID 复用对象；
+          真正的边界是"不同端点的个数"：一个关节最多 7 个（0 号留给故障详情）。
+        """
+        ctx = self._ctx
+        ptype = None
+
+        if isinstance(path_or_ep, str):
+            ep = ctx.lookup(path_or_ep)          # 未命中会抛 NOT_FOUND
+            ep_id = int(ep.ep_id)
+            ptype = ep.type
+            if size == 0:
+                w = self._WIDTHS.get(ep.type)
+                if w is None:
+                    raise_for_status(int(Status.UNSUPPORTED), "sdo",
+                                     f"{path_or_ep}: 类型 {ep.type_name} 不是标量"
+                                     "（SDO 只访问标量端点）")
+                size = w
+            key = ep_id
+            path = path_or_ep
+        else:
+            ep_id = int(path_or_ep)
+            key = ep_id
+            path = None
+            for e in ctx.endpoints():            # 反过来找路径（为了取类型名）
+                if int(e.ep_id) == ep_id:
+                    path = e.path
+                    ptype = e.type
+                    break
+
+        cached = self._sdos.get(key)
+        if cached is not None:
+            return cached
+
+        h = int(self._lib.jsdk_joint_sdo_create(self._ptr, ep_id, int(subindex),
+                                                int(size)))
+        if h <= 0:
+            raise_for_status(int(Status.NOT_FOUND), f"sdo({path or ep_id})",
+                             self._ctx.last_error())
+        width = int(self._lib.jsdk_joint_sdo_data_size(self._ptr, h))
+        obj = Sdo(self, h, path, ep_id, width, ptype)
+        self._sdos[key] = obj
+        return obj
+
+    # --- 逃生通道：协议原始量 / 电流模式 / 手工换算 ------------------------
+
+    def set_position_raw(self, raw: int) -> None:
+        """目标位置 = ``raw / 1000`` **度**（输出端；CSP/POS 模式的协议原始量）。
+
+        ⚠ 这是**逃生通道**：SDK 不做任何换算，单位也不是 rad。
+        常规用法请用 :meth:`set_position`（rad，自动按标定换算）。
+        """
+        self._lib.jsdk_joint_set_target_position(self._ptr, int(raw))
+
+    def set_velocity_raw(self, raw: int) -> None:
+        """目标速度 = ``raw / 1000`` **RPM**（输出端；CSV/VEL 模式）。"""
+        self._lib.jsdk_joint_set_target_velocity(self._ptr, int(raw))
+
+    def set_torque_raw(self, raw: int) -> None:
+        """目标力矩 = ``raw / 1000`` **N·m**（输出端；CST 模式）。"""
+        self._lib.jsdk_joint_set_target_torque(self._ptr, int(raw))
+
+    def set_current(self, amp: float) -> None:
+        """CURRENT 模式的**电机端**电流（A）。
+
+        ⚠⚠ 本调用**不喂看门狗**（与固件一致：``0x04`` 不刷新 ``last_cmd_time_``）。
+        也就是说：只发电流指令时设备的协议级超时保护**永远不会武装**，
+        掉线也不会自动停机（`FIRMWARE_ISSUES` 的 **F19**）。
+        必须周期性另发一条 MIT 帧（随便什么目标值）才能把保护维持住 ——
+        用 :meth:`set_mit` 或 :meth:`hold_position`。
+        """
+        self._lib.jsdk_joint_set_current_A(self._ptr, float(amp))
+
+    def set_scale(self, scale) -> None:
+        """手工覆盖输出端换算系数（:class:`~jsdk_can.units.UnitScale`）。
+
+        ⚠ 只在"设备标定不可用、但你手里有权威换算表"时用：覆盖之后 SDK 不再用
+        从设备读回的 ``gear_ratio`` / ``torque_constant`` 做换算。
+        """
+        from .units import UnitScale
+
+        s = scale if isinstance(scale, UnitScale) else UnitScale.from_dict(scale)
+        self._lib.jsdk_joint_set_scale(self._ptr, ctypes.byref(s._c))
+
+    def get_scale(self):
+        """当前生效的换算系数（:class:`~jsdk_can.units.UnitScale`）。"""
+        from .units import UnitScale
+
+        c = _abi.UnitScale()
+        self._lib.jsdk_joint_get_scale(self._ptr, ctypes.byref(c))
+        return UnitScale._from_c(c)
 
     def __repr__(self) -> str:  # pragma: no cover - 人读
         return f"<Joint node_id={self.node_id} index={self.index}>"

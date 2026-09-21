@@ -76,6 +76,24 @@ extern "C" {
 
 /** JSON 文本的第一个字节（用于第一帧的交叉校验） */
 #define CB_DESC_JSON_FIRST_BYTE  0x7Bu   /* '{' */
+/** 描述符的根也可以是数组：**本固件就是** `[{"name":...,"id":0,...}]`。
+    两者都说明"这一帧是 offset=0 的数据帧"，不是元数据帧。 */
+#define CB_DESC_JSON_FIRST_ARR   0x5Bu   /* '[' */
+
+/**
+ * 元数据帧之前最多容忍多少个"不像元数据帧"的 0x25 帧。
+ *
+ * ⚠ 真机必需：请求发出前后，适配器/设备里可能还残留**上一条被中断的传输**
+ *   （超时 / Ctrl-C / 报错退出）的帧。它们必须被跳过，而不是当成
+ *   "本次的元数据帧" —— 否则会报出让人看不懂的 `total_len must be 1..65535`，
+ *   而且每次退出又会留下新的残留，形成自锁（slcan 现场实测）。
+ *
+ * ⚠ **不要把这个值设小**：slcan 上一条（被中断的）流的**尾巴可以有几百帧**
+ *   （真机实测：64 帧预算当场不够用，而一次完整传输是 600+ 帧）。
+ *   真正的时间上限由 `desc.timeout_ms`（默认 3000 ms）负责 —— 这里只是防止
+ *   "设备根本不是在跟我们说话"时无限等下去。
+ */
+#define CB_DESC_MAX_SKIPPED      4096u
 
 /* --------------------------------------------------------------------------
  * 失败原因（静态字符串，便于日志与测试断言）
@@ -83,8 +101,10 @@ extern "C" {
 
 #define CB_DESC_ERR_NONE          ((const char *)0)
 #define CB_DESC_ERR_FRAME_LEN     "0x25 frame length must be 8 (Classic) or 64 (FD)"
-#define CB_DESC_ERR_META_EXPECTED "first 0x25 frame must be the metadata frame"
+#define CB_DESC_ERR_META_EXPECTED "0x25 frame is not the metadata frame (and not a usable data frame)"
 #define CB_DESC_ERR_META_TOTAL    "metadata total_len must be 1..65535"
+#define CB_DESC_ERR_META_SKIPPED  "no metadata frame before running out of patience: " \
+                                  "the 0x25 stream is a stale one from an earlier transfer?"
 #define CB_DESC_ERR_OFFSET        "chunkOffset out of sequence"
 #define CB_DESC_ERR_PARSE         "JSON parser rejected the descriptor"
 #define CB_DESC_ERR_ARENA         "endpoint arena exhausted"
@@ -116,7 +136,8 @@ typedef struct {
     uint16_t crc;            /**< 来自元数据帧（VersionCRC） */
     uint32_t next_offset;    /**< 期望的下一个 chunkOffset */
     uint32_t bytes_scanned;  /**< 已喂给解析器的字节数 */
-    uint32_t frames_rx;      /**< 收到的 0x25 帧数（含元数据帧） */
+    uint32_t frames_rx;      /**< 收到的 0x25 帧数（含元数据帧与被跳过的残留帧） */
+    uint32_t skipped_rx;     /**< 元数据帧之前被跳过的 0x25 帧数（上一次传输的残留） */
     uint32_t last_report;    /**< 上次回调进度时的字节数（节流用） */
 
     uint8_t  started;        /**< 已经收到过元数据帧 */
@@ -188,6 +209,17 @@ int cb_desc_fetch_frame(cb_desc_fetch_t *f, const uint8_t *payload, size_t len);
 
 /** 传输是否已结束（成功或失败）。 */
 int cb_desc_fetch_is_done(const cb_desc_fetch_t *f);
+
+/**
+ * **本次传输是否已经开始**：元数据帧已收到并接受。
+ *
+ * 为什么需要它：调用方判断"要不要重发 `0x24` 请求"时，
+ *   **不能用"收到了多少帧"当依据** —— RX 里可能有上一次被中断传输的**残留帧**
+ *   （真机实测：一次失败会看到 680 帧残留、而我们的请求从没到达设备），
+ *   那时"收到帧"与"请求被设备接受"完全不是一回事。
+ *   正确的依据是"有没有进入本次传输"，即本函数。
+ */
+int cb_desc_fetch_started(const cb_desc_fetch_t *f);
 
 /**
  * 传输是否**可用**：未失败，且（完整收到 或 按 filter 提前终止且 filter 全命中）。

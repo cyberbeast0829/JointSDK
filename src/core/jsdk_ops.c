@@ -342,8 +342,8 @@ jsdk_status_t jsdk_joint_set_node_id(jsdk_joint_t *j, uint8_t new_id, int persis
 
 jsdk_status_t jsdk_joint_set_watchdog_ms(jsdk_joint_t *j, uint32_t ms)
 {
-    uint8_t be[2];
-    int     warn_zero;
+    uint8_t le[2];
+    int     disable;
 
     if (!jsdk_joint_check(j)) return JSDK_ERR_INVALID_ARG;
     if (j->ep_break_timeout == 0u) {
@@ -355,40 +355,71 @@ jsdk_status_t jsdk_joint_set_watchdog_ms(jsdk_joint_t *j, uint32_t ms)
         jsdk_joint_seterr(j, "break_timeout max is 65535 ms (got %u)", (unsigned)ms);
         return JSDK_ERR_INVALID_ARG;
     }
-    warn_zero = (ms == 0u);
+    disable = (ms == 0u);
 
-    /* ⚠ 参数值是**大端**（与全协议一致）。直接传主机序 u16 会字节交换，
-       设备把 250 读成 64000 —— 本项目确实胉过这个坑。 */
-    cb_be_put_u16(be, (uint16_t)ms);
+    /* 每次调用重新判定“能不能读回校验”，所以先清掉上一次的结果位 */
+    jsdk_joint_clear_status_flags(j, (uint16_t)JSDK_JF_WATCHDOG_UNVERIFIED);
+
+    /* ⚠ 参数值在线上是**小端**（设备端 memcpy 主机序），见 cb_frame.h。
+       旧注释曾写"大端"并把 250→64000 归咎于"传主机序"——那是错的：
+       64000 恰恰是**按大端发包**的结果，真机上是小端。 */
+    cb_le_put_u16(le, (uint16_t)ms);
     if (jsdk_ctx_write_param(j->ctx, j->cfg.node_id, j->ep_break_timeout,
-                             be, 2u, 0u) != JSDK_OK) {
+                             le, 2u, 0u) != JSDK_OK) {
         jsdk_joint_seterr(j, "failed to write can.config.break_timeout");
         return JSDK_ERR_TRANSPORT;
     }
 
-    /* 读回校验（端点可读，没必要盲信写入） */
+    /* 读回校验（端点可读，没必要盲信写入）
+     *
+     * ⚠⚠ 真机实测（fw 1545）：**`can.config.break_timeout` 的读回恒为 0** ——
+     *    紧随写入之后立刻读、同一个进程，读回来的也是 0（`sdo.data` 证实我们
+     *    确实发出去了 `96 00` = 150 小端）。对照端点 `heartbeat_rate_ms` 的
+     *    写入→读回是正常的，所以这是**该端点的固件问题**（FIRMWARE_ISSUES F28），
+     *    不是请求打包问题。
+     *    后果很重：`break_timeout = 0` 在新固件里的含义是**禁用超时检测**，
+     *    所以“写 250 却读回 0”意味着**客户端无法证明自己武装了保护**。
+     *    处理原则：
+     *      - 读回 == 写入值      → 校验通过；
+     *      - 读回 0 且写入非 0   → **未能校验**：置 JSDK_JF_WATCHDOG_UNVERIFIED、
+     *                              保留写入值（安全方向：宁可多喂几帧），返回 OK；
+     *      - 其它不一致          → 真矛盾 → PROTOCOL（这条不能放松）。
+     */
     {
         uint8_t buf[8];
         uint8_t len = 0u;
+
         if (jsdk_ctx_read_param(j->ctx, j->cfg.node_id, j->ep_break_timeout,
                                 buf, &len, 0u) == JSDK_OK && len >= 2u) {
-            j->break_timeout_ms = cb_be_get_u16(buf);
-            if (j->break_timeout_ms != ms) {
+            uint32_t back = cb_le_get_u16(buf);
+            if (back == ms) {
+                j->break_timeout_ms = back;          /* 含 0 == 0：禁用也能量化确认 */
+            } else if (back == 0u && ms != 0u) {
+                jsdk_joint_set_flags(j, (uint16_t)JSDK_JF_WATCHDOG_UNVERIFIED);
+                j->break_timeout_ms = ms;            /* 保守：按“已武装”继续喂狗 */
+            } else {
+                j->break_timeout_ms = back;
                 jsdk_joint_seterr(j, "break_timeout read back as %u, expected %u",
-                                  (unsigned)j->break_timeout_ms, (unsigned)ms);
+                                  (unsigned)back, (unsigned)ms);
                 return JSDK_ERR_PROTOCOL;
             }
         } else {
-            j->break_timeout_ms = ms;   /* 读不回来就用写入值 */
+            jsdk_joint_set_flags(j, (uint16_t)JSDK_JF_WATCHDOG_UNVERIFIED);
+            j->break_timeout_ms = ms;                /* 读不回来就用写入值 */
         }
+
+        jsdk_ctx_seterr(j->ctx,
+            "break_timeout set to %u ms on node %u%s%s (not persisted; call "
+            "save_config())",
+            (unsigned)ms, (unsigned)j->cfg.node_id,
+            disable ? "; 0 = protocol timeout DISABLED on the device" : "",
+            (j->status_flags & (uint16_t)JSDK_JF_WATCHDOG_UNVERIFIED)
+                ? "; NOTE: could not verify by read-back (this firmware's "
+                  "can.config.break_timeout reads back 0 — see FIRMWARE_ISSUES "
+                  "F28): treat the watchdog as NOT confirmed"
+                : "");
     }
 
-    /* ⚠ 0 **不是**关闭：固件按 100 ms 处理。这条警告必须活到最后 ——
-       早先的写法是 write 前发警告、成功后又被成功串覆盖，客户就看不到了。 */
-    jsdk_ctx_seterr(j->ctx,
-        "break_timeout set to %u ms on node %u%s (not persisted; call save_config())",
-        (unsigned)ms, (unsigned)j->cfg.node_id,
-        warn_zero ? "; WARNING: 0 means 100 ms, NOT disabled" : "");
     return JSDK_OK;
 }
 

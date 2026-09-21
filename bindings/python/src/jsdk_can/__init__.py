@@ -88,7 +88,8 @@ from .hal import (
     SocketCanHal,
     VirtualHal,
 )
-from .joint import ConfigSnapshot, DeviceInfo, FaultInfo, Feedback, Joint
+from .joint import ConfigSnapshot, DeviceInfo, FaultInfo, Feedback, Joint, Sdo
+from .units import UnitScale, unit_scale_calc, unit_scale_default
 
 __version__ = "0.1.0"
 
@@ -103,6 +104,11 @@ __all__ = [
     "BusState",
     "DescInfo",
     "Endpoint",
+    "Sdo",
+    # 单位 / 标度（与 EtherCAT 家族同名同义，但 CAN 版是恒等映射）
+    "UnitScale",
+    "unit_scale_default",
+    "unit_scale_calc",
     # 传输后端
     "Hal",
     "VirtualHal",

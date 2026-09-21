@@ -4,7 +4,7 @@ libdir=${exec_prefix}/@CMAKE_INSTALL_LIBDIR@
 includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
 
 Name: joint-sdk-can
-Description: CyberBeast CAN/CAN-FD joint SDK (ODrive-CyberBeast protocol), pure C99
+Description: CyberBeast CAN/CAN-FD joint SDK (CyberBeast protocol), pure C99
 URL: https://example.invalid/joint-sdk
 Version: @PROJECT_VERSION@
 

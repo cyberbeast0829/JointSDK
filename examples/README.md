@@ -45,7 +45,7 @@ gcc examples/01_hello_virtual.c dist/jsdk_can_amalgam.c -lm -o hello
    `jsdk_hal_slcan_open(...)` / `jsdk_hal_pcan_open(...)`，或者（MCU）换成你自己的
    `jsdk_can_hal_t`（照抄示例 07）；
 2. **看门狗**：`configure()` 会检查"控制周期能不能喂得动设备的 `break_timeout`"
-   （默认 100 ms）。周期 >100 ms 时要么把周期改小，要么用
+   （设备侧 `0` = 禁用，此时不检查）。周期大于设备的超时时，要么把周期改小，要么用
    `jsdk_joint_set_watchdog_ms()` 放宽（示例为了跑得快，把 `timeout` 设成了 30 s）；
 3. **量程**：`configure()` 从设备读 `mit_max_*` / `gear_ratio`。真机上这些是设备的实况值，
    示例里的 spec 只是仿真设备的参数。

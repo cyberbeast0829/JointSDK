@@ -182,7 +182,7 @@ int jsdk_ctx_read_param_exact(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_
  * | 5..8 B | **FD** | 一帧写完（4 + 8 = 12 B ≤ 64） |
  * | 5..8 B | **Classic** | **必须分段**：每块 4 B，末块补齐（固件在 Classic 下不接受单帧长值） |
  *
- * @param val 值字节，**必须是线上大端序**（见头文件说明）。
+ * @param val 值字节，**必须是线上小端序**（参数值小端；见 `cb_frame.h`）。
  */
 int jsdk_ctx_write_param(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_id,
                          const void *val, uint8_t len, uint32_t timeout_ms)
@@ -277,11 +277,11 @@ static int read_f32(jsdk_context_t *ctx, uint8_t node, uint16_t ep_id, float *ou
 
     if (jsdk_ctx_read_param(ctx, node, ep_id, buf, &len, 0u) != JSDK_OK) return -1;
     if (len < 4u) return -1;
-    *out = cb_be_get_f32(buf);
+    *out = cb_le_get_f32(buf);      /* ⚠ 参数值小端，见 cb_frame.h */
     return 0;
 }
 
-/** 读一个整数端点（1/2/4 字节，小端无关：协议是 BE，但数值宽度按类型）。 */
+/** 读一个整数端点（1/2/4 字节）；⚙ 参数值是**小端**（设备端 memcpy 主机序）。 */
 static int read_int(jsdk_context_t *ctx, uint8_t node, uint16_t ep_id,
                     jsdk_ep_type_t type, uint32_t *out)
 {
@@ -293,11 +293,10 @@ static int read_int(jsdk_context_t *ctx, uint8_t node, uint16_t ep_id,
     if (jsdk_ctx_read_param(ctx, node, ep_id, buf, &len, 0u) != JSDK_OK) return -1;
     if (len < need) return -1;
 
-    /* 设备回的是**大端**的原始字节；按类型宽度取 */
     switch (type) {
     case JSDK_EP_U8:  case JSDK_EP_BOOL: *out = (uint32_t)buf[0]; break;
-    case JSDK_EP_U16: *out = (uint32_t)cb_be_get_u16(buf); break;
-    case JSDK_EP_U32: *out = cb_be_get_u32(buf); break;
+    case JSDK_EP_U16: *out = (uint32_t)cb_le_get_u16(buf); break;
+    case JSDK_EP_U32: *out = cb_le_get_u32(buf); break;
     default: return -1;
     }
     return 0;
@@ -312,6 +311,54 @@ static void handshake(jsdk_context_t *ctx, uint8_t node)
 {
     (void)jsdk_ctx_send(ctx, CB_PRI_QUERY, CB_MSG_QUERY_STATUS, node, NULL, 0u);
     ctx->tx_seq = cb_seq_next(ctx->tx_seq);
+}
+
+/**
+ * 握手尝试次数 / 每次等应答的上限。
+ *
+ * ⚠ 为什么是"短超时 × 多次重发"而不是"一次等 3 s"：
+ *   设备的 master_id 是从**收到的帧**里学来的（`source_id == 0` 时它完全不回复），
+ *   所以**握手帧丢了就等于整个会话哑掉**——真机（slcan）实测丢帧率约 1/10，
+ *   而且丢的就是"打开端口后的头几帧"。中位应答时间只有几毫秒，
+ *   把 3 s 预算花在"干等一帧永不到来的帧"上没有任何好处；拆成 6×50 ms
+ *   既能把丢失的首帧补上，又把失败时的等待从 3 s 降到 ~300 ms。
+ */
+#define JSDK_HANDSHAKE_TRIES   6u
+#define JSDK_HANDSHAKE_WAIT_MS 50u
+
+/**
+ * 握手并**确认它真的生效**：发 `QUERY_STATUS`，等它的应答（MsgType 0x00），
+ * 没等到就重发（最多 `JSDK_HANDSHAKE_TRIES` 次）。
+ *
+ * 为什么不能只发一次：设备的 `master_id` 是从**收到的帧**里学来的
+ * （`source_id == 0` 时它不回复任何东西）。所以握手帧丢了 = 整个会话哑掉，
+ * 现场表现为 `configure()` 超时、而描述符/心跳看起来都正常。
+ * 握手本身是幂等的（`QUERY_STATUS` 不改任何状态），重发无副作用。
+ *
+ * 成功后顺手把这一帧当作首次反馈吃进去（少一次等待）。
+ */
+static jsdk_status_t handshake_verified(jsdk_context_t *ctx, jsdk_joint_t *j)
+{
+    unsigned i;
+
+    for (i = 0u; i < JSDK_HANDSHAKE_TRIES; ++i) {
+        jsdk_can_frame_t rsp;
+
+        handshake(ctx, j->cfg.node_id);
+        if (jsdk_ctx_wait_response(ctx, CB_MSG_MIT_CONTROL, j->cfg.node_id,
+                                   &rsp, JSDK_HANDSHAKE_WAIT_MS) == JSDK_OK) {
+            jsdk_joint__on_mit_response(j, rsp.data, rsp.len);
+            return JSDK_OK;
+        }
+    }
+
+    jsdk_joint_seterr(j,
+        "no response to handshake after %u attempts (node %u, %u ms each): "
+        "check node_id / wiring / master_id; if the port was just opened, the "
+        "adapter may be dropping the first frames",
+        (unsigned)JSDK_HANDSHAKE_TRIES, (unsigned)j->cfg.node_id,
+        (unsigned)JSDK_HANDSHAKE_WAIT_MS);
+    return JSDK_ERR_TIMEOUT;
 }
 
 /**
@@ -441,22 +488,49 @@ static jsdk_status_t calibrate_joint(jsdk_context_t *ctx, jsdk_joint_t *j)
         uint32_t period_ms = (uint32_t)(ctx->cfg.period_ns / 1000000u);
         uint32_t wd = jsdk_watchdog_device_ms(j);
 
-        if (ctx->cfg.enable_watchdog_hint && j->ep_break_timeout != 0u) {
+        if (ctx->cfg.enable_watchdog_hint && j->ep_break_timeout != 0u
+            && (wd == 0u || (period_ms != 0u && period_ms >= wd))) {
+            /* 主动武装：只在**需要**时才改设备 —— 当前是禁用（0），或者现有的超时
+               比我们的控制周期还短（回路本来就喂不住）。设备本来设得很宽松时
+               不动它：把 30000 ms 改成 2×周期只会让设备**更容易**被误停。
+               写完必须**读回确认** —— 真机上这个端点的读回恒为 0（F28），
+               也就是说“写成功”并不能证明“已经武装”。 */
             uint16_t want = (uint16_t)(period_ms * 2u);
-            uint8_t  want_be[2];
+            uint8_t  want_le[2];
             if (want < 2u) want = 2u;
-            cb_be_put_u16(want_be, want);      /* ⚠ 线上一律大端 */
+            cb_le_put_u16(want_le, want);      /* ⚠ 参数值小端，见 cb_frame.h */
             if (write_param_sync(ctx, j->cfg.node_id, j->ep_break_timeout,
-                                 want_be, 2u, 0u) == JSDK_OK) {
-                j->break_timeout_ms = want;
-                wd = want;
+                                 want_le, 2u, 0u) == JSDK_OK) {
+                uint8_t  buf[8];
+                uint8_t  len = 0u;
+                uint32_t back = 0u;
+                if (jsdk_ctx_read_param(ctx, j->cfg.node_id, j->ep_break_timeout,
+                                        buf, &len, 0u) == JSDK_OK && len >= 2u) {
+                    back = cb_le_get_u16(buf);
+                }
+                if (back == want) {
+                    j->break_timeout_ms = back;             /* 读回一致 = 真的武装了 */
+                } else {
+                    /* 读回不是我们要的值：**保守地认为“未武装”**。
+                       ⚠ 这里不能报致命错误 —— 设备完全可以合法地把该功能关着；
+                         但必须让客户知道“这一步没成”，否则他会以为有保护。 */
+                    j->break_timeout_ms = jsdk_watchdog_device_ms(j);
+                    jsdk_joint_seterr(j,
+                        "watchdog hint: wrote break_timeout = %u ms but the device "
+                        "reads back %u (see FIRMWARE_ISSUES F28): treat the protocol "
+                        "watchdog as NOT armed", (unsigned)want, (unsigned)back);
+                }
             }
+            wd = jsdk_watchdog_device_ms(j);
         }
-        if (period_ms != 0u && period_ms >= wd) {
+        /* ⚠ 只有**确实开着**超时（wd > 0）时，“周期必须小于超时”才有意义。
+           0 = 禁用 ⇒ 没有门限要满足，绝不能拿 0 去比较（那会让每个循环命令都被拒）。 */
+        if (wd != JSDK_WD_DISABLED_MS && period_ms != 0u && period_ms >= wd) {
             jsdk_joint_seterr(j,
                 "control period %u ms >= device break_timeout %u ms: the loop "
-                "cannot feed the protocol watchdog", (unsigned)period_ms,
-                (unsigned)wd);
+                "cannot feed the protocol watchdog (set break_timeout = 0 to "
+                "disable it on the device, or shorten the period)",
+                (unsigned)period_ms, (unsigned)wd);
             return JSDK_ERR_BAD_STATE;
         }
     }
@@ -508,20 +582,9 @@ jsdk_status_t jsdk_context_configure(jsdk_context_t *ctx)
     for (i = 0u; i < ctx->nj; ++i) {
         jsdk_joint_t *j = &ctx->joints[i];
 
-        handshake(ctx, j->cfg.node_id);
-        {
-            /* 握手帧的应答顺手确认设备在不在 */
-            jsdk_can_frame_t rsp;
-            if (jsdk_ctx_wait_response(ctx, CB_MSG_MIT_CONTROL, j->cfg.node_id,
-                                       &rsp, JSDK_CFG_TIMEOUT_MS) == JSDK_OK) {
-                jsdk_joint__on_mit_response(j, rsp.data, rsp.len);
-            } else {
-                jsdk_joint_seterr(j, "no response to handshake (node %u): check "
-                                     "node_id / wiring / master_id",
-                                  (unsigned)j->cfg.node_id);
-                return JSDK_ERR_TIMEOUT;
-            }
-        }
+        jsdk_status_t hst = handshake_verified(ctx, j);
+
+        if (hst != JSDK_OK) return hst;
 
         st = calibrate_joint(ctx, j);
         if (st != JSDK_OK) return st;
@@ -807,7 +870,8 @@ jsdk_status_t jsdk_joint_read_config_snapshot(jsdk_joint_t *j,
     out->mit_max_kd       = j->range.kd_max;
     out->torque_constant  = j->torque_constant;
     out->node_id          = j->node_id_readback ? j->node_id_readback : j->cfg.node_id;
-    out->heartbeat_rate_ms = 0u;               /* 由 P1 的心跳配置 API 补齐 */
+    /* 设备真值（标定阶段读回）。⚠ 语义已确认：**0 = 固件关闭了心跳**，不是"没读到" */
+    out->heartbeat_rate_ms = j->heartbeat_rate_ms;
     out->break_timeout_ms = jsdk_watchdog_device_ms(j);
     out->valid            = j->calibrated ? 1 : 0;
     return JSDK_OK;

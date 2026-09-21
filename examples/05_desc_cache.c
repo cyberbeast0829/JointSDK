@@ -129,7 +129,7 @@ int main(void)
     printf("  raw tee  : %lu 字节（路线 B 的原始 JSON，真机上直接写 Flash）\n",
            (unsigned long)cache.len);
     if (info.complete == 0) {
-        printf("  ⚠ complete=0：**不得**缓存原始 JSON（数据不完整）\n");
+        printf("  注意：complete=0 时不得缓存原始 JSON（数据不完整）\n");
     }
 
     ex_check("configure", jsdk_context_configure(e.ctx));

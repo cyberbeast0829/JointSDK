@@ -182,7 +182,7 @@ size_t cb_ctrl_min_len(uint8_t msgtype, int classic);
  *   `ERROR_CAN_BUS_FAILED` + `disarm()` —— 尽管 CURRENT 一直在发。
  *   两种都不好；SDK 的 `auto_keepalive` 必须周期插入一条 `is_ctrl` 帧来两头兼顾。
  *
- * @note 任何帧都会喂 ODrive 自身的 `axis.watchdog_feed()`（`do_command()` 开头
+ * @note 任何帧都会喂驱动器自身的 `axis.watchdog_feed()`（`do_command()` 开头
  *       无条件调用），那是**另一套机制**，不要与上面这个协议级超时混淆。
  */
 int cb_ctrl_expects_response(uint8_t msgtype);

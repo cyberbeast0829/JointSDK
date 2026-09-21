@@ -26,7 +26,8 @@ int main(void)
     printf("=== 02 enable → MIT → disable ===\n");
 
     /* 周期 2 ms（500 Hz）；设备的 break_timeout 在 spec 里设成 30 s，
-       所以 configure() 不会报"回路喂不了看门狗"（真机上要按 100 ms 默认值算）。 */
+       所以 configure() 不会报"回路喂不了看门狗"（真机上设备默认超时是 0 = 禁用；
+       若设备侧已武装了某个较短的超时，则要按那个值算）。 */
     ex_open(&e, "0:id=1,gear=16.5,pmax=12.5,vmax=65,tmax=50,hb=10,timeout=30000,fd",
             nodes, 1u, 2000u);
     printf("  device  : gear=16.5 pos_max=12.5 rad tau_max=50 N·m\n");

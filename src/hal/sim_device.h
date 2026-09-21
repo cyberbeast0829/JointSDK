@@ -57,7 +57,15 @@ extern "C" {
 #define SIM_MIT_KP_DEFAULT           500.0f
 #define SIM_MIT_KD_DEFAULT           5.0f
 #define SIM_MIT_TAU_DEFAULT          50.0f
-#define SIM_BREAK_TIMEOUT_DEFAULT_MS 100u
+/**
+ * 仿真节点的 `can.config.break_timeout` 默认值。
+ *
+ * ⚠ **0 = 协议级超时检测被禁用** —— 与最新固件的默认值（`Config_t::break_timeout = 0`）
+ *   以及 `auto_stop_if_timeout()` 的首句 `if (timeout_ms == 0) return;` 一致。
+ *   旧模型把 0 当 100 ms，会让“未武装”看起来像“已武装 100 ms”（曾被真机扇了一耳光，
+ *   见 FIRMWARE_ISSUES F28）。要模拟“已武装”请在节点规格里显式写 `timeout=<ms>`。
+ */
+#define SIM_BREAK_TIMEOUT_DEFAULT_MS 0u
 #define SIM_JSON_FRAMES_PER_CYCLE    50u     /**< 固件 kMaxJsonFramesPerCycle */
 #define SIM_NODE_ID_DEFAULT          1u
 #define SIM_DEFAULT_VBUS             48.0f

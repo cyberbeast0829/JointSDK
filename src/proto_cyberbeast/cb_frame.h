@@ -171,10 +171,43 @@ void cb_be_put_i32(uint8_t *b, int32_t v);
 void cb_be_put_u64(uint8_t *b, uint64_t v);
 void cb_be_put_f32(uint8_t *b, float v);
 
+/* --------------------------------------------------------------------------
+ * 小端存取器：**只用于参数值**（PARAM_READ 0x20 / PARAM_WRITE 0x21 的载荷）
+ *
+ * ⚠⚠ 为什么参数值是小端，而帧字段是大端（实测结论，与协议文档 P7 写的
+ *     "全协议 Big-Endian" 不一致）：
+ *
+ *   固件的参数通路是把端点值**原样 memcpy** 进/出 CAN 载荷的：
+ *     `can_cyberbeast.cpp` 的 `cmd_param_read()`   → `endpoint_handler(..., &output_buffer)`
+ *                                                     → `memcpy(&txmsg.buf[4], &value_buf[offset], n)`
+ *     `can_cyberbeast.cpp` 的 `cmd_param_write()`  → `input_buffer{&msg.buf[4], data_len}`
+ *                                                     → `endpoint_handler(...)`
+ *   所以线上就是 **ARM 主机序 = 小端**。
+ *
+ *   真机实测三例（slcan + CANable，读回来的值）：
+ *     `node_id`            = 0x01000000（应为 1）
+ *     `heartbeat_rate_ms`  = 0x64000000（应为 100）
+ *     `gear_ratio`         = 8.9e-41（应为 7.75）
+ *   三个都恰好是"字节反序"，而且读写走的是同一份 memcpy 路径。
+ *
+ *   控制帧（MIT/POS/VEL/…）与查询响应（0x40/0x46/0x49）**仍然是大端**
+ *   —— 那些字段是固件手写拆字节的（`float_to_uint` / `float_to_big_endian_bytes`）。
+ *   旁证：`info` 从 0x46 读回的 `fw_version = 1544` 用大端解才合理，
+ *   小端会得到 134610944 这种荒谬值。
+ * ------------------------------------------------------------------------ */
 uint16_t cb_le_get_u16(const uint8_t *b);
+int16_t  cb_le_get_i16(const uint8_t *b);
 uint32_t cb_le_get_u32(const uint8_t *b);
-void     cb_le_put_u16(uint8_t *b, uint16_t v);
-void     cb_le_put_u32(uint8_t *b, uint32_t v);
+int32_t  cb_le_get_i32(const uint8_t *b);
+uint64_t cb_le_get_u64(const uint8_t *b);
+float    cb_le_get_f32(const uint8_t *b);
+
+void cb_le_put_u16(uint8_t *b, uint16_t v);
+void cb_le_put_i16(uint8_t *b, int16_t v);
+void cb_le_put_u32(uint8_t *b, uint32_t v);
+void cb_le_put_i32(uint8_t *b, int32_t v);
+void cb_le_put_u64(uint8_t *b, uint64_t v);
+void cb_le_put_f32(uint8_t *b, float v);
 
 /**
  * 平台自检：验证 float 为 IEEE-754 单精度且字节序访问正确。

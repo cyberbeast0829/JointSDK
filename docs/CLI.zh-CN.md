@@ -16,7 +16,7 @@
 | 标定量对不对？ | `dump-config` |
 | 改参数 / 存 Flash / 改节点号 | `write`、`save`、`set-node-id`、`watchdog` |
 | 让它转一下（**唯一会驱动电机**） | `mit --yes --hold N` |
-| 采集一段数据 | `mon --csv out.csv` |
+| 采集一段数据 | `mon --csv > run1.csv` |
 | 省掉每次上电的 41 KB 下载 | `desc-export` / `desc-import` |
 
 **默认只读。** 凡会写设备或让电机动的子命令都要显式加 `--yes`。
@@ -39,14 +39,67 @@ cmake --build build
 
 MCU 构建不需要 CLI，也就不会付这部分体积。
 
-### Windows 控制台的中文显示
+### Windows 控制台的中文显示（v0.22 起自动处理）
 
-输出是 UTF-8。旧版 `cmd.exe` 默认用 GBK 代码页，会显示成乱码。两种解法：
+**背景**：本工程的中文全是 **UTF-8** 字面量，而 Windows 控制台的默认代码页是
+**CP936(GBK)**（中文机器上 `chcp` 会告诉你 `936`）。C 运行时不看代码页，只把
+字节原样交给控制台，控制台按**自己的**代码页解释 → 于是现场看到的是
 
-```cmd
-chcp 65001
 ```
-或用 `--json`（机器可读，脚本里本来也不该解析中文）。
+$ jsdk-cli --if slcan scan
+鍙戠幇 0 涓�鑺傜偣锛堣��鍔� 200 ms + 涓诲姩鎺㈡祴 1..16锛�:
+```
+
+（实际想显示"发现 0 个节点（被动 200 ms + 主动探测 1..16）"。）
+
+**现在的规则**（`tools/jsdk_cli/cli_text.h`，与 git for Windows 的做法同思路）：
+
+| 输出去哪 | 怎么发 |
+|---|---|
+| **控制台** | UTF-8 先转成 `GetConsoleOutputCP()` 再发 → 中文正常 |
+| **管道/重定向到文件** | 原样发 UTF-8 → 脚本、`| jq`、编辑器都拿到 UTF-8 |
+
+也就是说：**`jsdk-cli ... > out.txt` 与 `jsdk-cli ... | grep x` 里是 UTF-8，
+屏幕上是控制台代码页**，两边都不用你操心。
+
+**逃生门**：`JSDK_CLI_TEXT` 环境变量（排查或特殊管道用）
+
+| 值 | 含义 |
+|---|---|
+| 不设 | 自动（上表的默认行为） |
+| `utf8`（或 `off`） | 一律按 UTF-8 原样写。给**本来就吃 UTF-8** 的终端（MinTTY、Windows Terminal）或管道另一端期待 UTF-8 的场合 |
+| 代码页数字，如 `936` | 一律按"控制台 + 该代码页"处理。CI 里用它验证转码路径，不必造真控制台 |
+
+**怎么自查**（三行，直接看字节，不靠眼睛）：
+
+```bash
+# 1) 屏幕上直接看：应当是中文（不是 鍙戠幇 ...）
+./build/jsdk-cli.exe --if virtual scan
+
+# 1b) A/B 对照：加 JSDK_CLI_TEXT=utf8 就会**复现**修复前的乱码
+JSDK_CLI_TEXT=utf8 ./build/jsdk-cli.exe --if virtual scan
+
+# 2) 重定向后必须是 UTF-8（能被 python 以 utf-8 解码）
+./build/jsdk-cli.exe --if virtual scan > out.txt
+python -c "import io;print(io.open('out.txt',encoding='utf-8').read()[:40])"
+
+# 3) 强制走"控制台 + 936"路径，直接看字节（应为 b7 a2 cf d6 = 发现）
+JSDK_CLI_TEXT=936 ./build/jsdk-cli.exe --if virtual scan > gbk.bin
+python -c "d=open('gbk.bin','rb').read();print(d[:4].hex(' '), d.decode('gbk')[:16])"
+```
+
+**⚠ 两个副作用要知道**
+
+1. 控制台代码页里**表示不了**的字符会变成 `?`（不是悄悄换成别的字）。所以
+   输出字符串里不要用 `⚠`（U+26A0）、`✓`（U+2713）这类字符 —— 这条已经写成了
+   静态检查 `tools/check_cli_text.py`（ctest 里的 `cli_text_lint`），
+   它同时挡住"绕过 `cli_text` 直接用 `printf`"的回退。
+2. **不要**用 `chcp 65001` 解决：那改的是**共享的控制台状态**（程序被 kill 就
+   回不去、同控制台的其它进程跟着遭殃），还要求控制台字体有 CJK 字形。
+   本工程改成"按接收端的约定发字节"，不改环境。
+
+**为什么 `--json` 也走同一条路**：`--json` 里可能有中文（错误消息）。重定向时它
+是 UTF-8（机器读没问题），打在屏幕上时按控制台代码页显示（人读没问题）。
 
 ---
 
@@ -69,7 +122,8 @@ chcp 65001
 | `--duration S` | 运行时长，`0` = 直到 Ctrl-C |
 | `--yes` | 确认执行写/动类命令 |
 | `--hold S` | `mit` 的持续时间（1..60 秒，**必需**） |
-| `--csv FILE` | `mon` 同时写 CSV |
+| `--csv` | `mon` 用 **CSV** 而不是 NDJSON/表格（写 stdout） |
+| `--csv-file FILE` | `mon` **额外**把同一份 CSV 写到文件（与 `--csv` 同列，可只写文件） |
 | `--filter P` | `ep-list` 的过滤：**子串**匹配；以 `*` 结尾则按前缀 |
 | `--pos --vel --kp --kd --tau --stiffness` | `mit` 的目标量 |
 | `-v` / `-q` | 日志级别 |
@@ -104,7 +158,7 @@ chcp 65001
 | `scan` | 节点发现：被动听心跳 200 ms + 主动 `QUERY_STATUS` 探测 1..`--probe`。**不下载描述符**（省 41 KB 流量） |
 | `info` | `QUERY_DEVICE_INFO(0x46)`：hw / fw / serial |
 | `health` | 健康快照：模式、轴状态、错误码、心跳标志、温度、母线、`age_ms`、链路统计 |
-| `mon` | 周期监控；`--csv` 同时落文件 |
+| `mon` | 周期监控；`--csv` 换格式，`--csv-file` 同时落文件 |
 | `read <path>` | 按名读参数（类型随描述符） |
 | `batch-read <path>...` | 批量读：FD 下打包成单帧，Classic 下自动逐条 |
 | `dump-config` | 关键配置快照（`gear_ratio` / `mit_max_*` / `torque_constant` / `node_id` / `break_timeout_ms`…） |
@@ -116,6 +170,24 @@ chcp 65001
 | `desc-export <file>` | 导出描述符缓存 |
 | `desc-import <file>` | 导入描述符缓存（**不下载**，导入后直接可用） |
 
+> **只读命令的前置条件（真机联调后修正）**：命令按“需要多少前置”分三档 ——
+> ① `scan` / `info` / `err` / `hb-dump` / `estop`：**连描述符都不下载**（省流量）；
+> ② `read` / `batch-read` / `desc-*` / `ep-*` / `write` / `watchdog` /
+> `save` / `set-node-id` / `reset`：需要描述符，**不需要标定**（`jsdk_joint_param_get()`
+> 本来就没有标定门槛）；
+> ③ `health` / **`dump-config`** / `mon` / `set-zero` / `calibrate` / `home` / `mit`：完整配置（含标定）。
+> 另外只有**跑循环**的命令（`mon`/`calibrate`/`home`/`mit`）会设控制周期，因此
+> “周期必须小于设备 `break_timeout`”这条校验**不会**挡住单次请求类命令。
+> 细节与踩坑记录见 `docs/BACKLOG.zh-CN.md` §2.4。
+>
+> ⚠ `dump-config` 打印的是**标定后的快照**（`gear_ratio` / `mit_max_*` / `torque_constant` /
+> `heartbeat_rate_ms`），所以它属于第③档。放在第②档时它只能打出一堆 0 与 `valid=0`，
+> 看上去像“设备没配好” —— 实际上只是那一次调用没跑标定。
+>
+> ⚠ **参数值在线上是小端**（`read`/`batch-read` 打印的数值已由 SDK 正确解码，但若要
+> 自己解析 `--json` 的裸字节或 SDO 缓冲区，必须知道这一点）：见
+> `docs/PROTOCOL_NOTES.zh-CN.md` §3.1。
+
 ### 3.2 写（需要 `--yes`）
 
 | 命令 | 说明 |
@@ -123,7 +195,7 @@ chcp 65001
 | `write <path> <value>` | 参数写。值按端点**真实类型/位宽**解析，超范围**直接拒绝**（不静默截断） |
 | `save` | `CONFIG_SAVE(0x22)`，写后读回校验 |
 | `set-node-id N` | 改节点地址（含冲突检查、验证新地址有应答，可持久化） |
-| `watchdog MS` | 写 `can.config.break_timeout`。⚠ 固件把 `0` 解释为 **100 ms**，`0` ≠ 关闭 |
+| `watchdog MS` | 写 `can.config.break_timeout`。**`0` = 关闭**设备侧协议级超时检测（最新固件语义；旧固件把 0 当 100 ms）。⚠ 真机上该端点读回恒为 0（F28），所以输出里 `device_reports_ms` 是**独立再读**的结果，`verified:false` 表示“没确认到” |
 | `set-zero` | `SET_ZERO(0x61)`（当前位置设为零点，不落 Flash） |
 | `reset` | `RESET_DEVICE(0x64)` |
 
@@ -233,7 +305,7 @@ jsdk-cli --if socketcan --channel can0 dump-config
 
 # 5) 采 10 秒数据（CSV 供后续画图）
 jsdk-cli --if socketcan --channel can0 --duration 10 --rate-hz 50 \
-         --csv run1.csv mon
+         --csv-file run1.csv mon
 
 # 6) 危险动作：显式确认 + 自限时
 jsdk-cli --if socketcan --channel can0 --node 1 --yes --hold 3 \
@@ -248,15 +320,106 @@ jsdk-cli --if virtual scan --json
 
 ---
 
-## 8. 已知限制（不隐藏）
+## 8. 自检：怎么确认"链路是好的"（而不是"跑了一次看到成功"）
+
+**为什么不能只跑一次**：本项目踩过两次"开发机跑通、现场报错"，两次都不是幻觉 ——
+
+1. **slcan 适配器打开端口后的头几帧会丢**（实测约 **1/10 次进程**），单跑一次很容易
+   恰好成功 → 于是"已真机验证"的结论掩盖了 10% 的失败率。症状是
+   `configure() 失败：timeout` / `descriptor download ... (0/0 bytes)`，**再敲一次就好了**；
+2. **参数值字节序错时 `read` 依然"成功返回"**（只是数值是垃圾，如 `8.9e-41`）——
+   只看退出码永远发现不了。
+
+所以自检的规矩是：**每层独立起进程 + 重复 N 轮 + 对数值做交叉校验**。
+
+```bash
+# 真机（默认 slcan + COM3 + node 1，跑 3 轮）
+./tools/hw_verify.sh --channel COM3 --node 1 --runs 5 \
+    --expect axis0.config.can.node_id=1 \
+    --expect axis0.config.can.heartbeat_rate_ms=100 \
+    --expect axis0.motor.config.gear_ratio=7.75
+
+# 连**写路径**一起验（会真的写：先把读到的原值原样回写，再改一下数值并恢复）
+./tools/hw_verify.sh --channel COM3 --node 1 --runs 3 --write-probe
+
+# 没有硬件时自检脚本本身（走虚拟后端；L8/L8b 会显式跳过）
+./tools/hw_verify.sh --if virtual --runs 1
+```
+
+脚本的输出（真机示例，5 轮；这是**只读**的 8 层。加 `--write-probe` 会多出 L8/L8b 两行）：
+
+```
+=== 汇总（5 轮）===
+  层            通过 失败
+  L1-scan             5      0
+  L2-info             5      0
+  L3-desc             5      0
+  L4-hb               5      0
+  L5-read            20      0
+  L6-batch           20      0
+  L6b-expect         15      0
+  L7-health           5      0
+
+结论：全部通过（80 项检查）
+```
+
+### 8.1 层次含义（失败在哪一层，就说明哪一层的问题）
+
+| 层 | 命令 | 判据 | 失败说明 |
+|---|---|---|---|
+| L1 | `scan` | 报出目标节点 | 适配器/端口/波特率/接线 |
+| L2 | `info` | `fw_version > 0` | 单请求收发不通（0x46 不通） |
+| L3 | `desc-info` | `complete=true` 且 `bytes_scanned==total_len` | 38 KB 流式下载失败 —— **最常暴露"首帧丢失"** |
+| L4 | `hb-dump` | 2 s 内收到心跳 | **只收不发**：它失败 = 通道层面（CRX 没打开/终端电阻/bitrate/上电） |
+| L5 | `read` ×4 | 退出码 0 + 数值在合理范围 | 值荒谬 = 字节序/类型解析（见 `PROTOCOL_NOTES` §3.1） |
+| L6 | `batch-read` | **与 L5 的同一个参数完全一致** | 两条解析路径不一致，说明其中一条错 |
+| L6b | `--expect` | 与设备真值相符 | 你已知真值时用它钉死（换设备后记得更新） |
+| L7 | `health` | `online=true` 且 `fault=false` | 标定/配置问题，看 stderr 第一条原因 |
+| L8 | `read` + `write` + `read` | 原值回写后读回必须相符 | 写路径：请求打包 / 设备拒绝 / 值不对（**顺带验证写方向的字节序**） |
+| L8b | 同上 + `--write-probe` | 写原值+Δ 后读回 = 新值，**且已恢复原值** | 先看是不是“恢复失败”（那种要手动 `--yes write` 回写） |
+
+⚠ **L8/L8b 在虚拟后端会显式跳过**：每个 CLI 进程都是一条新仿真总线，写入不会跨进程保留，
+在仿真上跑这两层只会给出“通过”的假象。它们的真值在真机上 —— 实测 `100 → 150 → 恢复 100`，
+这同时证明了**写方向的字节序也对**（若按大端写，设备会把 150 存成 `0x96000000`）。
+
+**关键判读**：`L3` 失败而 `L4` 通过 ⇒ 链路是通的、**只是请求没到达设备**（首帧丢失类）；
+`L3` 与 `L4` 同时失败 ⇒ 通道层面，与"请求"无关。
+
+### 8.2 命令行逐条手敲也可以
+
+```bash
+./build/jsdk-cli --if slcan --channel COM3 scan                 # ① 有没有节点
+./build/jsdk-cli --if slcan --channel COM3 hb-dump              # ② 收到了什么（只收不发）
+./build/jsdk-cli --if slcan --channel COM3 --json desc-info     # ③ 描述符
+./build/jsdk-cli --if slcan --channel COM3 --json \
+        read axis0.motor.config.gear_ratio                      # ④ 数值是否荒谬
+./build/jsdk-cli --if slcan --channel COM3 --json health        # ⑤ 完整配置 + 健康
+```
+
+⚠ 每次都加 `--json`：纯文本在 Windows 控制台上可能被编码问题干扰，而 JSON 是 ASCII
+键名 + 稳定字段（见 §5）。
+
+### 8.3 已知的"会自愈"的失败
+
+| 现象 | 原因 | 现在的处理 |
+|---|---|---|
+| 第一次跑 `configure()/desc-info` 超时，再跑一次就好 | 适配器打开端口后头几帧被丢 | ① `hal_slcan` 的 `C`/`Y<n>`/`O` **等适配器 ACK，没 ACK 就重发**；② 描述符请求按 **0.25/0.6/1.2 s** 递增间隔**重发 3 次**（设备对 `0x24` 幂等）。修后实测：`desc-info` **20/20**、`health` **12/12**（修前约 1/10 失败） |
+| 超时信息里有 `0/0 bytes, 0 frames received` | 通道层面：一帧都没收到 | 这是**明确诊断**，不是"设备慢"：查端口/终端电阻/bitrate/上电 |
+| 超时信息里有 `0/0 bytes, N frames received`（N>0） | 通道是通的，但请求没到达设备 | 重发已用尽：查适配器固件、或设备是否在过滤该 MsgType |
+
+---
+
+## 9. 已知限制（不隐藏）
 
 | 限制 | 说明 |
 |---|---|
-| 真机收发未进 CI | `tests/test_cli.c` 在 `virtual` 后端断言全部子命令与安全闸；真机需人工冒烟（见 `PORTING.zh-CN.md` §7.5.3） |
-| `dump-config` 的 `heartbeat_rate_ms` 目前为 0 | 配置快照暂未包含该字段（P1） |
+| 真机收发未进 CI | `tests/test_cli.c` 在 `virtual` 后端断言全部子命令与安全闸；真机需人工冒烟（见 `PORTING.zh-CN.md` §7.5.3），**已脚本化**：`tools/hw_verify.sh`（L1~L8b 分层，含写路径） |
+| `watchdog` 的读回校验 | 真机上 `can.config.break_timeout` **读回恒为 0**（写 250 立刻读也是 0，而 `0` 的含义是**禁用**，见 `FIRMWARE_ISSUES` **F28**）→ 写后判定分三类：相等（含 `0 == 0`，即真的关上了）= 通过；**读回 0 而写入非 0 = “已接受但无法校验”**（保留写入值 + `verified:false`，退出码仍是 0）；其它值 = `PROTOCOL` |
+| 另一个入口 | `python -m jsdk_can` 是**同一份契约**的 Python 实现：**24 个子命令**、同款安全闸（`--yes` / `mit` 的 `--hold` / `estop` 免确认）、同款退出码 0/1/2/3、同款 JSON 字段（有对拍用例）。已知差异：C 版 `mon` 在**虚拟后端**不受墙钟约束（虚拟时钟由循环驱动），Python 版用墙钟 |
 | 读参数 | 标量端点（≤ 8 字节，含 `u64`/`double`）都读得到：FD 一次请求，**Classic 自动分两块**。`object`/`json`/`endpoint_ref` 这类非标量端点没有标量尺寸，`read` 会明确报 `UNSUPPORTED`（不做“读一半”） |
 | `mon` 的实时性 | 墙钟节奏 + 非实时线程，抖动取决于操作系统。硬实时请写自己的 C 循环 |
 | Windows 控制台中文 | 见 §1（`chcp 65001` 或 `--json`） |
 | slcan 吞吐 | 约 100~500 fps（ASCII 展开 + USB 帧调度），不适合高频控制 |
 | slcan 数据段速率 | 只有 `2000000`（`Y2`）与 `5000000`（`Y5`）有公认命令码；表外值报 `UNSUPPORTED`，传 `--data-bitrate 0` 则不碰适配器配置 |
 | `hb-dump` 的留存深度 | 只保留**本次调用**收到的最近 16 帧（进程级，不跨调用） |
+| `--csv` / `--csv-file` | `--csv` 是**格式开关**（写 stdout），`--csv-file F` 才落盘。以前 `--csv` 要一个文件名，于是 `mon --csv --duration 1` 会把 `--duration` 当文件名、**静默写出一个叫 `--duration` 的 CSV**（真发生过）—— 现在取值以 `-` 开头会**当场报用法错**（rc=2）。⚠ 两版 CLI 的 CSV 表头（17 列）与数值格式**逐字节一致**，有对拍用例 |

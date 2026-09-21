@@ -143,34 +143,55 @@ int cb_desc_frame_len_valid(size_t len)
  * 帧处理
  * ======================================================================== */
 
-/** 元数据帧：解析 total_len / crc 并做全部合法性校验。 */
-static int take_metadata(cb_desc_fetch_t *f, const uint8_t *payload, size_t len)
+/**
+ * 校验（**不改状态**）：这一帧是不是本次传输的元数据帧？
+ *
+ * 与旧实现的区别：旧版把"校验 + 提交"写在一起，并且认为"请求之后的第一个
+ * 0x25 帧就是元数据帧" —— 真机上不成立（见 CB_DESC_MAX_SKIPPED 的说明）。
+ */
+static int check_metadata(const uint8_t *payload, size_t len, uint32_t *total_out,
+                          uint16_t *crc_out, const char **why)
 {
     uint32_t total;
 
     if (len < CB_DESC_META_MIN_LEN) {
-        return dfail(f, CB_DESC_ERR_FRAME_LEN, JSDK_ERR_PROTOCOL);
+        *why = CB_DESC_ERR_FRAME_LEN;
+        return JSDK_ERR_PROTOCOL;
     }
 
     /* 元数据帧的头两字节恒为 0 */
     if (payload[0] != 0u || payload[1] != 0u) {
-        return dfail(f, CB_DESC_ERR_META_EXPECTED, JSDK_ERR_PROTOCOL);
+        *why = CB_DESC_ERR_META_EXPECTED;
+        return JSDK_ERR_PROTOCOL;
     }
 
     /* 交叉校验：若第 3 字节是 JSON 起始符，说明这其实是 offset = 0 的数据帧，
-       即设备跳过了元数据帧。此时无法得知 total_len，只能整体失败。 */
-    if (payload[2] == CB_DESC_JSON_FIRST_BYTE) {
-        return dfail(f, CB_DESC_ERR_META_EXPECTED, JSDK_ERR_PROTOCOL);
+       即设备跳过了元数据帧（或这是上一次传输的残留）。
+       ⚠ 必须同时认 `{` 与 `[`：本固件的描述符是**数组**（`[{"name":...`），
+         只认 `{` 的话这个检查形同虚设 —— 真机上它把 offset=0 的数据帧放进来，
+         然后报出难懂的 "total_len must be 1..65535"（现场踩过）。 */
+    if (payload[2] == CB_DESC_JSON_FIRST_BYTE || payload[2] == CB_DESC_JSON_FIRST_ARR) {
+        *why = CB_DESC_ERR_META_EXPECTED;
+        return JSDK_ERR_PROTOCOL;
     }
 
     total = le32(payload + 2);
     if (total == 0u || total > CB_DESC_MAX_TOTAL_LEN) {
         /* ⚠ > 65535 必须硬拒绝：chunkOffset 只有 u16，固件会静默回绕 */
-        return dfail(f, CB_DESC_ERR_META_TOTAL, JSDK_ERR_PROTOCOL);
+        *why = CB_DESC_ERR_META_TOTAL;
+        return JSDK_ERR_PROTOCOL;
     }
 
+    *total_out = total;
+    *crc_out   = le16(payload + 6);
+    return JSDK_OK;
+}
+
+/** 校验通过 → 正式认领这一帧为元数据帧。 */
+static int take_metadata(cb_desc_fetch_t *f, uint32_t total, uint16_t crc)
+{
     f->total_len   = total;
-    f->crc         = le16(payload + 6);
+    f->crc         = crc;
     f->next_offset = 0u;
     f->started     = 1u;
     f->last_report = 0u;
@@ -271,7 +292,34 @@ int cb_desc_fetch_frame(cb_desc_fetch_t *f, const uint8_t *payload, size_t len)
     f->frames_rx++;
 
     if (!f->started) {
-        return take_metadata(f, payload, len);
+        uint32_t    total = 0u;
+        uint16_t    crc   = 0u;
+        const char *why   = CB_DESC_ERR_NONE;
+
+        if (check_metadata(payload, len, &total, &crc, &why) != JSDK_OK) {
+            /*
+             * 不是元数据帧 → **跳过**，继续等本次传输真正的元数据帧。
+             *
+             * 为什么不能直接失败：协议只保证"元数据帧是**本次传输**的第一帧"，
+             * 不保证"它是我们请求后看到的第一个 0x25 帧"。真机（slcan）实测：
+             * 上一条被中断的传输会让设备手里握着一帧待发，我们一打开适配器
+             * 它就涌出来 → 旧实现把它当元数据帧 → 报出看不懂的
+             * "total_len must be 1..65535" → 退出 → **又留下新的残留** →
+             * 自锁，现场表现是"刚才还能连，现在怎么都连不上"。
+             *
+             * 上限 CB_DESC_MAX_SKIPPED：不能无限等（那会把"设备根本没答"
+             * 变成"卡住"），超了就当"这条流不是给我的"。
+             */
+            if (f->skipped_rx >= CB_DESC_MAX_SKIPPED) {
+                /* 把最后一条被拒绝帧的具体原因留在 err_detail 里便于排障 */
+                if (why) f->err_detail = why;
+                return dfail(f, CB_DESC_ERR_META_SKIPPED, JSDK_ERR_PROTOCOL);
+            }
+            if (why) f->err_detail = why;   /* 跳过的也记下原因（排障用） */
+            f->skipped_rx++;
+            return JSDK_OK;
+        }
+        return take_metadata(f, total, crc);
     }
     if (len < CB_DESC_DATA_HDR_BYTES) {
         return dfail(f, CB_DESC_ERR_FRAME_LEN, JSDK_ERR_PROTOCOL);
@@ -286,6 +334,11 @@ int cb_desc_fetch_frame(cb_desc_fetch_t *f, const uint8_t *payload, size_t len)
 int cb_desc_fetch_is_done(const cb_desc_fetch_t *f)
 {
     return (f && f->done) ? 1 : 0;
+}
+
+int cb_desc_fetch_started(const cb_desc_fetch_t *f)
+{
+    return (f && f->started) ? 1 : 0;
 }
 
 int cb_desc_fetch_is_ok(const cb_desc_fetch_t *f)
