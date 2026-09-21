@@ -24,6 +24,19 @@
 #include <stdio.h>
 #include <math.h>
 
+/* ⚠⚠ 故意传 NaN/±Inf 的用例**不能**写成常量 `(float)(0.0 / 0.0)`、`(float)(1.0 / 0.0)`：
+   MSVC 在**编译期**就把它们判为 C2124（“被零除或对零求模”）而直接失败；
+   gcc/clang 只是给个警告，所以以前没暴露。一律走 C99 的 NAN / INFINITY；
+   万一某个老工具链没定义，再用运行期算的兼容写法。 */
+#ifndef NAN
+static float t_nan_(void) { volatile float z = 0.0f; return z / z; }
+#  define NAN (t_nan_())
+#endif
+#ifndef INFINITY
+static float t_inf_(void) { volatile float z = 0.0f; return 1.0f / z; }
+#  define INFINITY (t_inf_())
+#endif
+
 #include "data/golden_vectors.h"
 
 static int g_fail;
@@ -505,7 +518,7 @@ static void test_mit_hazard(void)
         r.pos_max = 12.5f; r.vel_max = 65.0f; r.kp_max = 500.0f;
         r.kd_max = 5.0f;   r.tau_max = 50.0f;
 
-        cb_mit_pack_command(bytes, &r, (float)(0.0 / 0.0), 0, 0, 0, 0, &cl);
+        cb_mit_pack_command(bytes, &r, NAN, 0, 0, 0, 0, &cl);
         CHECK((cl & CB_MIT_INVALID) != 0u);
         /* 分层语义：NaN 既置 INVALID（原因），也置该字段的 CLAMP（值被改过），
            这样 `if (flags != 0)` 的调用方不会漏掉 NaN 这种情况 */
@@ -522,7 +535,7 @@ static void test_mit_hazard(void)
         CHECK(fabsf(pos) <= 0.5f * pos_lsb + 1e-9f);
 
         cl = 0;
-        cb_mit_pack_command(bytes, &r, (float)(1.0 / 0.0), 0, 0, 0, 0, &cl);
+        cb_mit_pack_command(bytes, &r, INFINITY, 0, 0, 0, 0, &cl);
         CHECK((cl & CB_MIT_CLAMP_POS) != 0u);
         CHECK((cl & CB_MIT_INVALID) == 0u);      /* Inf 只算钳位，不是 NaN */
         cb_mit_unpack_command(bytes, &r, &pos, NULL, NULL, NULL, NULL);
@@ -530,7 +543,7 @@ static void test_mit_hazard(void)
 
         /* 负 Inf 同理 */
         cl = 0;
-        cb_mit_pack_command(bytes, &r, (float)(-1.0 / 0.0), 0, 0, 0, 0, &cl);
+        cb_mit_pack_command(bytes, &r, -INFINITY, 0, 0, 0, 0, &cl);
         CHECK((cl & CB_MIT_CLAMP_POS) != 0u);
         cb_mit_unpack_command(bytes, &r, &pos, NULL, NULL, NULL, NULL);
         CHECK_FEQ(pos, -12.5f);

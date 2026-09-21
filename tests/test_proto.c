@@ -33,6 +33,19 @@
 
 #include "data/golden_vectors_proto.h"
 
+/* ⚠⚠ 故意传 NaN/±Inf 的用例**不能**写成常量 `(float)(0.0 / 0.0)`、`(float)(1.0 / 0.0)`：
+   MSVC 在**编译期**就把它们判为 C2124（“被零除或对零求模”）而直接失败；
+   gcc/clang 只是给个警告，所以以前没暴露。一律走 C99 的 NAN / INFINITY；
+   万一某个老工具链没定义，再用运行期算的兼容写法。 */
+#ifndef NAN
+static float t_nan_(void) { volatile float z = 0.0f; return z / z; }
+#  define NAN (t_nan_())
+#endif
+#ifndef INFINITY
+static float t_inf_(void) { volatile float z = 0.0f; return 1.0f / z; }
+#  define INFINITY (t_inf_())
+#endif
+
 static int g_fail;
 static int g_checks;
 
@@ -203,24 +216,24 @@ static void test_ctrl_others(void)
     {
         uint8_t b[12];
         uint8_t f = 0u;
-        float pos = 1.0f;
-        cb_ctrl_pos_pack(b, 0, (float)(0.0 / 0.0), 0, 0, &f);
+        float   pos = 0.0f;
+        cb_ctrl_pos_pack(b, 0, NAN, 0, 0, &f);
         CHECK((f & CB_CTRL_F_INVALID) != 0u);
         CHECK((f & CB_CTRL_POS_F_POS) != 0u);
         cb_ctrl_pos_unpack(b, 12, 0, &pos, NULL, NULL);
         CHECK_FEQ(pos, 0.0f);
 
         f = 0u;
-        cb_ctrl_vel_pack(b, (float)(0.0 / 0.0), 0, &f);
+        cb_ctrl_vel_pack(b, NAN, 0, &f);
         CHECK((f & CB_CTRL_F_INVALID) != 0u);
         CHECK((f & CB_CTRL_VEL_F_VEL) != 0u);
 
         f = 0u;
-        cb_ctrl_torque_pack(b, (float)(0.0 / 0.0), &f);
+        cb_ctrl_torque_pack(b, NAN, &f);
         CHECK((f & CB_CTRL_F_INVALID) != 0u);
 
         f = 0u;
-        cb_ctrl_current_pack(b, (float)(0.0 / 0.0), &f);
+        cb_ctrl_current_pack(b, NAN, &f);
         CHECK((f & CB_CTRL_F_INVALID) != 0u);
     }
 
@@ -229,7 +242,7 @@ static void test_ctrl_others(void)
         uint8_t b[8];
         uint8_t f = 0u;
         float vel = 0.0f;
-        cb_ctrl_pos_pack(b, 1, 0.0f, (float)(1.0 / 0.0), (float)(-1.0 / 0.0), &f);
+        cb_ctrl_pos_pack(b, 1, 0.0f, INFINITY, -INFINITY, &f);
         CHECK((f & CB_CTRL_POS_F_VEL) != 0u);
         CHECK((f & CB_CTRL_POS_F_CUR) != 0u);
         CHECK((f & CB_CTRL_F_INVALID) == 0u);

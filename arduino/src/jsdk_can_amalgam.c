@@ -6018,7 +6018,9 @@ size_t cb_param_build_read_rsp(uint8_t *dst, size_t cap,
     if (!dst) return 0u;
     if (full_len > CB_PARAM_MAX_VALUE) return 0u;
 
-    resp_flags = (uint8_t)(req_flags & (uint8_t)~CB_PARAM_FLAG_MORE);
+    /* ⚠ MSVC 会把 `(uint8_t)~0x80u` 报成 C4310（“类型强制转换截断常量值”，
+       因为 `~0x80u` 是个 32 位常量）—— 先掩到 8 位再转，语义不变、两端都干净。 */
+    resp_flags = (uint8_t)(req_flags & (uint8_t)(0xFFu & ~(unsigned)CB_PARAM_FLAG_MORE));
 
     if (offset < (uint32_t)full_len) {
         uint32_t available = (uint32_t)full_len - offset;
@@ -11425,7 +11427,16 @@ uint32_t jsdk_abi_version(void)
  * 这正是我们想要的信号（ABI 变了）。
  * ------------------------------------------------------------------------ */
 
-/** 用"结构体里紧跟在 char 之后的成员偏移"求对齐（C99 可移植做法）。 */
+/** 用"结构体里紧跟在 char 之后的成员偏移"求对齐（C99 可移植做法）。
+ *
+ * ⚠ MSVC 对**宏里**的匿名结构体会报 C4116（“括号中的未命名类型定义”）。
+ *   这是 C11 允许的写法（`offsetof` 的第一个参数可以是类型定义），而且它
+ *   只在本文件里用 —— 所以就地抑制，不为了它改动公共写法。
+ *   （gcc/clang 对这个写法一言不发，所以以前没暴露过。） */
+#if defined(_MSC_VER)
+#  pragma warning(push)
+#  pragma warning(disable: 4116)
+#endif
 #define JSDK_ALIGNOF(T) ((uint32_t)offsetof(struct { char c; T t; }, t))
 
 static const jsdk_abi_type_t k_abi_types[] = {
@@ -11446,6 +11457,10 @@ static const jsdk_abi_type_t k_abi_types[] = {
     { "jsdk_group_target_t",  (uint32_t)sizeof(jsdk_group_target_t),  JSDK_ALIGNOF(jsdk_group_target_t) },
     { "jsdk_desc_info_t",     (uint32_t)sizeof(jsdk_desc_info_t),     JSDK_ALIGNOF(jsdk_desc_info_t) }
 };
+
+#if defined(_MSC_VER)
+#  pragma warning(pop)
+#endif
 
 const jsdk_abi_type_t *jsdk_abi_types(size_t *count_out)
 {

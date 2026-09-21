@@ -118,6 +118,17 @@ static void value_to_json(cli_json_t *j, const char *key, const jsdk_value_t *v)
 }
 
 /** 按端点类型把文本解析成 jsdk_value_t（`write` 用）。 */
+/**
+ * 把命令行文本按端点类型解析成值。
+ *
+ * @return 0 = 成功；
+ *         **-1 = 文本本身就不是合法的数/布尔字**（用法错 → 退出码 2）；
+ *         **-2 =  ！解析出来了，但超出该类型的值域**（运行期错 → 退出码 1）。
+ *
+ * ⚠ 两种错必须分开：Python 版把“不是数字”归在**参数层**（退出码 2），
+ *   把“超范围”留给 SDK（退出码 1）。真机实测曾经出现 C=1 / Py=2 的不一致，
+ *   而文档写的是“两版同一份退出码契约”。
+ */
 static int text_to_value(const char *text, jsdk_ep_type_t type, jsdk_value_t *v)
 {
     char *end = NULL;
@@ -143,29 +154,29 @@ static int text_to_value(const char *text, jsdk_ep_type_t type, jsdk_value_t *v)
         long long s = strtoll(text, &end, 0);
         if (!end || *end != '\0') return -1;
         switch (type) {
-        case JSDK_EP_I8:  if (s < -128LL   || s > 127LL)   return -1; v->v.i8  = (int8_t)s;  return 0;
-        case JSDK_EP_I16: if (s < -32768LL || s > 32767LL) return -1; v->v.i16 = (int16_t)s; return 0;
-        case JSDK_EP_I32: if (s < -2147483648LL || s > 2147483647LL) return -1;
+        case JSDK_EP_I8:  if (s < -128LL   || s > 127LL)   return -2; v->v.i8  = (int8_t)s;  return 0;
+        case JSDK_EP_I16: if (s < -32768LL || s > 32767LL) return -2; v->v.i16 = (int16_t)s; return 0;
+        case JSDK_EP_I32: if (s < -2147483648LL || s > 2147483647LL) return -2;
                           v->v.i32 = (int32_t)s; return 0;
         case JSDK_EP_I64: v->v.i64 = (int64_t)s; return 0;
         case JSDK_EP_U8: case JSDK_EP_U16: case JSDK_EP_U32: case JSDK_EP_U64:
-            return -1;                                  /* 无符号却给了负数 */
-        default: return -1;
+            return -2;                                  /* 无符号却给了负数 */
+        default: return -2;
         }
     } else {
         unsigned long long u = strtoull(text, &end, 0);
         if (!end || *end != '\0') return -1;
         switch (type) {
-        case JSDK_EP_U8:  if (u > 255ull)   return -1; v->v.u8  = (uint8_t)u;  return 0;
-        case JSDK_EP_U16: if (u > 65535ull) return -1; v->v.u16 = (uint16_t)u; return 0;
-        case JSDK_EP_U32: if (u > 4294967295ull) return -1; v->v.u32 = (uint32_t)u; return 0;
+        case JSDK_EP_U8:  if (u > 255ull)   return -2; v->v.u8  = (uint8_t)u;  return 0;
+        case JSDK_EP_U16: if (u > 65535ull) return -2; v->v.u16 = (uint16_t)u; return 0;
+        case JSDK_EP_U32: if (u > 4294967295ull) return -2; v->v.u32 = (uint32_t)u; return 0;
         case JSDK_EP_U64: v->v.u64 = (uint64_t)u; return 0;
-        case JSDK_EP_I8:  if (u > 127ull)   return -1; v->v.i8  = (int8_t)u;  return 0;
-        case JSDK_EP_I16: if (u > 32767ull) return -1; v->v.i16 = (int16_t)u; return 0;
-        case JSDK_EP_I32: if (u > 2147483647ull) return -1; v->v.i32 = (int32_t)u; return 0;
-        case JSDK_EP_I64: if (u > 9223372036854775807ull) return -1;
+        case JSDK_EP_I8:  if (u > 127ull)   return -2; v->v.i8  = (int8_t)u;  return 0;
+        case JSDK_EP_I16: if (u > 32767ull) return -2; v->v.i16 = (int16_t)u; return 0;
+        case JSDK_EP_I32: if (u > 2147483647ull) return -2; v->v.i32 = (int32_t)u; return 0;
+        case JSDK_EP_I64: if (u > 9223372036854775807ull) return -2;
                           v->v.i64 = (int64_t)u; return 0;
-        default: return -1;
+        default: return -2;
         }
     }
 }
@@ -1063,9 +1074,16 @@ static int cmd_write(cli_app_t *a)
                 (access & JSDK_EP_ACCESS_R) ? 'r' : '-', 'w');
         return CLI_EXIT_FAIL;
     }
-    if (text_to_value(a->o.args[1], type, &val) != 0) {
-        cli_fprintf(a->err, "jsdk-cli: 值 \"%s\" 不是合法的 %s（超范围也算非法，"
-                        "不静默截断）\n", a->o.args[1], jsdk_ep_type_string(type));
+    switch (text_to_value(a->o.args[1], type, &val)) {
+    case 0:
+        break;
+    case -1:      /* 文本就不是个数/布尔字 → 用法错（与 Python 版一致） */
+        cli_fprintf(a->err, "jsdk-cli: 值 \"%s\" 不是合法的 %s 文本\n",
+                    a->o.args[1], jsdk_ep_type_string(type));
+        return CLI_EXIT_USAGE;
+    default:      /* 解析出来了但超出该端点类型的值域 → 运行期错 */
+        cli_fprintf(a->err, "jsdk-cli: 值 \"%s\" 超出 %s 的值域（不静默截断）\n",
+                    a->o.args[1], jsdk_ep_type_string(type));
         return CLI_EXIT_FAIL;
     }
 

@@ -122,7 +122,9 @@ size_t cb_param_build_read_rsp(uint8_t *dst, size_t cap,
     if (!dst) return 0u;
     if (full_len > CB_PARAM_MAX_VALUE) return 0u;
 
-    resp_flags = (uint8_t)(req_flags & (uint8_t)~CB_PARAM_FLAG_MORE);
+    /* ⚠ MSVC 会把 `(uint8_t)~0x80u` 报成 C4310（“类型强制转换截断常量值”，
+       因为 `~0x80u` 是个 32 位常量）—— 先掩到 8 位再转，语义不变、两端都干净。 */
+    resp_flags = (uint8_t)(req_flags & (uint8_t)(0xFFu & ~(unsigned)CB_PARAM_FLAG_MORE));
 
     if (offset < (uint32_t)full_len) {
         uint32_t available = (uint32_t)full_len - offset;

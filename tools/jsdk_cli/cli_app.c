@@ -168,6 +168,13 @@ int cli_opts_parse(cli_opts_t *o, int argc, char **argv, FILE *err)
         const char *v = NULL;
         int         is_opt = (!no_more_opts && t[0] == '-' && t[1] != '\0');
 
+        /* ⚠ **负数是位置参数，不是选项**：`write axis0.controller.config.vel_limit -5.0`
+           以前会被当成"未知选项 -5.0"直接拒掉 —— 也就是**没法从 CLI 写任何负数**
+           （速度/力矩限值、力矩指令、有符号增益…）。Python 版（argparse）本来就认，
+           两版又对不上。判定规则与 argparse 的负数字面量一致：`-` 后面紧跟数字或 `.`。 */
+        if (is_opt && (t[1] >= '0' && t[1] <= '9')) is_opt = 0;
+        if (is_opt && t[1] == '.' && t[2] >= '0' && t[2] <= '9') is_opt = 0;
+
         if (is_opt && strcmp(t, "--") == 0) { no_more_opts = 1; continue; }
 
         if (!is_opt) {

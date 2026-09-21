@@ -448,6 +448,40 @@ $ python -m jsdk_can … --json --yes watchdog 250 → 与 C 版**逐字段一�
 
 ---
 
+### 2.9 MSVC 支持 + 两版 CLI 的四处契约偏差（用户提 README 改进时挖出，v0.26）
+
+**起因**：用户要求 README 把“各环境的编译选项/准备工作”写清。按本项目规矩，
+**写进文档的命令必须真跑过** —— 于是先试了一遍 Visual Studio 生成器，结果一连串问题。
+
+| # | 问题 | 症状 | 修法 |
+|---|---|---|---|
+| 1 | **MSVC 的 C 默认是 C89 + 扩展** | `cb_ctrl.c` 里 `if (classic) { int16_t vel_raw = …; }`（语句后声明）→ `error C2059: 语法错误:"if"`，整个库编不过 | CMake 的 MSVC 分支加 `/std:c11` |
+| 2 | 源码是 UTF-8（注释含中文），中文 Windows 代码页 936 | 逐文件 `warning C4819` | 加 `/utf-8` |
+| 3 | `JSDK_WERROR=ON` 在 MSVC 下**被静默忽略**（只加 `/W4`，没有 `/WX`） | “0 告警”在 VS 下不受约束 | 补 `/WX`，并把三类噪声处理掉：`C4996`（`fopen`/`strcpy`）→ `_CRT_SECURE_NO_WARNINGS`；`M_PI` 未定义 → `_USE_MATH_DEFINES`；`C4127`（`do{}while(0)` 宏误报）→ `/wd4127` 并注明理由 |
+| 4 | `JSDK_ALIGNOF` 用 `offsetof(struct { char c; T t; }, t)` 求对齐 | MSVC `C4116`（宏里的匿名结构体） | 就地 `#pragma warning(push/disable:4116)` + 注释（C11 允许的写法，只在本文件用） |
+| 5 | `(uint8_t)~CB_PARAM_FLAG_MORE` | MSVC `C4310`（截断常量）| 先掩到 8 位再转，语义不变 |
+| 6 | 测试里写常量 `0.0/0.0`、`1.0/0.0` 造 NaN/Inf | MSVC **编译期**直接 `error C2124` | 改用 C99 `NAN` / `INFINITY`（带运行期兜底宏） |
+| 7 | ⚠⚠ **静态库与 DLL 导入库同名**（都叫 `jsdk_can.lib`） | `-DJSDK_BUILD_SHARED=ON` 时两者互相覆盖 → 链接到导入库 → 内部符号全部 `LNK2019`（**只有 MSVC 会这样**：MinGW 的 `libjsdk_can.a` 与 `libjsdk_can.dll.a` 名字不同） | Windows 下给共享库的导入库改名 `jsdk_can_dll.lib`（Python 按路径加载 DLL，不依赖它） |
+
+**结果**：Windows + MSVC 19.44 / VS 2022 生成器 **ctest 21/21**（共享库配置 22/22），
+`/W4 /WX` **0 告警**；同一份 CMake 在 gcc 上的行为完全不变（MinGW 21/21 + 18→22/22）。
+
+**顺带查出的 CLI 契约偏差（都是“文档说两版一致，其实不一致”）**：
+
+| # | 问题 | 以前 | 现在 |
+|---|---|---|---|
+| 8 | `mon --csv` 的**语义**不同 | C：`--csv FILE`（同时落盘）；Python：`--csv` 是开关 | 统一 `--csv` = 开关（写 stdout）、`--csv-file FILE` = 落盘；且取值以 `-` 开头**当场报用法错**（以前 `mon --csv --duration 1` 会静默写出一个叫 `--duration` 的 CSV —— 在仓库根目录躺了几天才被发现） |
+| 9 | `mon --csv` 的**列数**不同 | C 17 列 / Python 12 列（文档却写“方便两边对着看”） | 统一 17 列 + 数值格式，两版输出**逐字节一致**（有对拍用例） |
+| 10 | `write` 的值错分类不同 | C：非数字与超范围**都是 1**；Python：2 / 1 | 统一为 非数字 = **2**、超范围 = **1**（有对拍用例） |
+| 11 | ⚠ **C 版写不了任何负数** | `write vel_limit -5.0` → “未知选项 -5.0”（`-` 开头一律当选项）| 负数按**位置参数**处理（判定规则同 argparse：`-` 后紧跟数字/`.`），并加回归用例 |
+
+**验证**：真机上把 README 里要写的命令逐条跑过（14 条只读 + 9 条安全闸 + 用法闸 + `estop`）；
+新增用例 `test_cli.c [9]/[10]` 与 `test_full_surface.py` 的两条对拍；变异/对拍逻辑见
+`§2.8` 的同款做法。
+
+---
+
+
 ## 3. 已知限制与记录缺失
 
 ### 3.1 已知限制（不是缺陷；**无法在本环境消除**，交付时要一并说明）

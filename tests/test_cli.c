@@ -616,6 +616,42 @@ static void test_mon_csv(void)
     expect_has(&r, "err", "另一个选项");
 }
 
+/**
+ * `write` 的**两种值错**必须分开（与 Python 版一致）：
+ *
+ *   - 文本就不是个数/布尔字  → **用法错（2）**（参数本身就写错了）
+ *   - 解析出来了但超端点值域  → **运行期错（1）**（要查描述符才知道位宽）
+ *
+ * ⚠ 以前两种都是 1，而 Python 版是 2/1 —— 文档却写“两版同一份退出码契约”。
+ *   真机实测抓出来的（`write … abc`：C=1 / Py=2）。
+ */
+static void test_write_value_exit_codes(void)
+{
+    run_t r;
+
+    printf("[10] write 的值错分类（用法错 vs 超范围）\n");
+
+    RUN_CLI(&r, VIF, "--yes", "write", "can.config.break_timeout", "abc");
+    CHECK(r.rc == 2);
+    expect_has(&r, "err", "不是合法");
+
+    RUN_CLI(&r, VIF, "--yes", "write", "can.config.break_timeout", "99999");
+    CHECK(r.rc == 1);
+    expect_has(&r, "err", "超出");
+
+    RUN_CLI(&r, VIF, "--yes", "write", "can.config.break_timeout", "-1");
+    CHECK(r.rc == 1);                 /* 无符号端点给负数 = 值域错 */
+
+    /* ⚠ 负数是**位置参数**，不能被当成选项（以前 `-5.0` 报"未知选项"，
+       于是 CLI 根本写不了任何负数；Python 版一直是好的）。 */
+    RUN_CLI(&r, VIF, "--yes", "write", "axis0.controller.config.vel_limit", "-5.0");
+    CHECK(r.rc == 0);
+    expect_has(&r, "out", "已写入");
+
+    RUN_CLI(&r, VIF, "--yes", "write", "axis0.config.can.node_id", "0x10");
+    CHECK(r.rc == 0);                 /* 0x 前缀仍是合法写法 */
+}
+
 /* ==========================================================================
  * main
  * ======================================================================== */
@@ -641,6 +677,8 @@ int main(void)
     test_system_cmds();
     printf("\n");
     test_mon_csv();
+    printf("\n");
+    test_write_value_exit_codes();
 
     printf("\n=== %u checks, %u failures ===\n", g_checks, g_fail);
     return (g_fail == 0u) ? 0 : 1;

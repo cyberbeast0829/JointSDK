@@ -57,7 +57,18 @@ option(JSDK_BUILD_SHARED  "Build jsdk_can as a SHARED library (needed by binding
 
 set(JSDK_WARN_FLAGS "")
 if(MSVC)
-  list(APPEND JSDK_WARN_FLAGS /W4)
+  # ⚠ MSVC 的 C 默认是 **C89 + 扩展**："声明必须在语句之前" 会被当成语法错误
+  #   （真在 `cb_ctrl.c` 的 `if (classic) { int16_t vel_raw = …; }` 上撞到：
+  #    `error C2059: 语法错误:"if"`）→ 必须显式 /std:c11。
+  # ⚠ `/utf-8`：源码是 UTF-8（注释里有中文），而中文 Windows 的默认代码页是 936，
+  #   不给它就会逐文件刷 C4819（"不能在当前代码页中表示的字符"）。
+  list(APPEND JSDK_WARN_FLAGS /W4 /std:c11 /utf-8)
+  # C4127“条件表达式是常量”：`do { … } while (0)` 宏（测试里的 CHECK 系列全是这种）
+  # 在 /W4 下必然误报，且是社区公认的假阳性（C11 后依然如此）→ 明确关闭。
+  list(APPEND JSDK_WARN_FLAGS /wd4127)
+  if(JSDK_WERROR)
+    list(APPEND JSDK_WARN_FLAGS /WX)
+  endif()
 else()
   list(APPEND JSDK_WARN_FLAGS -Wall -Wextra -Wpedantic -Wconversion -Wshadow
                               -Wstrict-prototypes -Wmissing-prototypes)
@@ -69,9 +80,21 @@ endif()
 # C++ 版本：去掉两个**只对 C 有意义**的告警，否则 g++ 会刷
 #   "command-line option '-Wstrict-prototypes' is valid for C/ObjC but not for C++"
 # 这类噪声（它不报错，但会让日志里混进 2 行永久警告）。
+# MSVC：C 运行时把 fopen/strcpy 等标为“不安全”（C4996）。本库是**纯 C99 可移植**代码，
+# 那些 `_s` 变体在 gcc/clang 上不存在，且用法都是定长缓冲，所以按社区通行做法关掉该提示。
+#
+# ⚠ `_USE_MATH_DEFINES`：MSVC 的 `<math.h>` **默认不定义 `M_PI`**，而 gcc/clang 有。
+#   不给它，测试里用 `M_PI` 的地方全部报 C2065（真撞过）。
+if(MSVC)
+  add_compile_definitions(_CRT_SECURE_NO_WARNINGS _USE_MATH_DEFINES)
+endif()
+
 set(JSDK_WARN_FLAGS_CXX "")
 if(MSVC)
-  list(APPEND JSDK_WARN_FLAGS_CXX /W4)
+  list(APPEND JSDK_WARN_FLAGS_CXX /W4 /utf-8)
+  if(JSDK_WERROR)
+    list(APPEND JSDK_WARN_FLAGS_CXX /WX)
+  endif()
 else()
   list(APPEND JSDK_WARN_FLAGS_CXX -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
   if(JSDK_WERROR)
@@ -220,6 +243,17 @@ if(JSDK_BUILD_SHARED)
     POSITION_INDEPENDENT_CODE ON
     VERSION   ${PROJECT_VERSION}
     SOVERSION ${PROJECT_VERSION_MAJOR})
+
+  # ⚠⚠ Windows 上**导入库与静态库会同名**：静态库是 `jsdk_can.lib`，
+  #   而 MSVC 给 DLL 生成的导入库默认也叫 `jsdk_can.lib` —— 两者落在同一个
+  #   输出目录里，谁后写谁覆盖谁。于是 `-DJSDK_BUILD_SHARED=ON` 时，测试/客户
+  #   链接到的其实是**导入库**，内部符号（`jsdk_jsondesc_*`、`jsdk_ep_store_*`…）
+  #   全部 LNK2019（真撞过：只有 MSVC 会这样，MinGW 的 `libjsdk_can.a` 与
+  #   `libjsdk_can.dll.a` 名字不同，所以一直没暴露）。
+  #   Python 绑定按**文件路径**加载 DLL，不依赖导入库名字，所以把导入库改名即可。
+  if(WIN32)
+    set_target_properties(jsdk_can_shared PROPERTIES ARCHIVE_OUTPUT_NAME jsdk_can_dll)
+  endif()
 
   # 构建完成时把共享库路径报出来：Python 侧要靠它（或 JSDK_LIB_PATH）找到库
   add_custom_command(TARGET jsdk_can_shared POST_BUILD

@@ -464,6 +464,31 @@ def test_mon_csv_file_value_must_not_be_an_option(lib_dir, tmp_path):
     assert "另一个选项" in cp.stderr
 
 
+def test_write_value_exit_codes_match_c_cli(lib_dir):
+    """`write` 的两种值错要**两版一致**：非数字 = 用法错(2)，超范围 = 运行期错误(1)。
+
+    ⚠ 这条是实测出来的偏差：修之前 C 版两种都返回 1，Python 版返回 2/1，
+       而文档写着“两版同一份退出码契约”。
+    """
+    r = run_module("--if", "virtual", "--node", "1", "--yes", "write",
+                   "can.config.break_timeout", "abc", lib_dir=lib_dir)
+    assert r.returncode == 2, r.stderr
+
+    r2 = run_module("--if", "virtual", "--node", "1", "--yes", "write",
+                    "can.config.break_timeout", "99999", lib_dir=lib_dir)
+    assert r2.returncode == 1, r2.stderr
+
+    if C_CLI is None:
+        return
+    for args, want in ((["write", "can.config.break_timeout", "abc"], 2),
+                       (["write", "can.config.break_timeout", "99999"], 1)):
+        cp = subprocess.run([str(C_CLI), "--if", "virtual", "--node", "1",
+                             "--yes", *args],
+                            capture_output=True, text=True, encoding="utf-8",
+                            errors="replace", timeout=60)
+        assert cp.returncode == want, (args, cp.returncode, cp.stderr)
+
+
 def test_cli_mit_requires_hold(lib_dir):
     """``mit`` 的两道闸：--yes 与 --hold（自限时）。"""
     r = run_module("--if", "virtual", "--node", "1", "--yes", "mit",
