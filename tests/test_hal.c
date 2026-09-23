@@ -592,6 +592,57 @@ static void test_handles(void)
     printf("      kind/close/error-code contract verified\n");
 }
 
+/**
+ * [5] slcan 打开失败必须**说清楚原因**。
+ *
+ * 现场（Ubuntu / CANable 2.0）：`sudo slcand -s8 /dev/ttyACM0` + `candump` 能收到心跳，
+ * 但 `jsdk-cli --if slcan --channel /dev/ttyACM0 scan`（**没加 sudo**）只报
+ * “打开 slcan(/dev/ttyACM0) 失败：invalid-argument” —— 分不清是权限、设备不存在
+ * 还是被占用，只能靠猜。这条用例钉住“原因必须带出来”。
+ */
+static void test_slcan_open_error_text(void)
+{
+    jsdk_can_hal_t hal;
+    jsdk_hal_handle_t *h = (jsdk_hal_handle_t *)(uintptr_t)0x1u;   /* 脏值 */
+    jsdk_status_t st;
+    const char *why;
+
+    printf("[5] slcan open failure explains itself\n");
+
+    memset(&hal, 0, sizeof hal);
+
+    /* 空名字：参数错，且不应留下“原因”（调用方没给任何信息可查） */
+    CHECK_EQ(jsdk_hal_slcan_open(&hal, &h, "", 115200u, 0u), JSDK_ERR_INVALID_ARG);
+    CHECK(h == NULL);
+
+    /* 不支持的 FD 速率：必须明确说“不在已知表里”（与 INVALID_ARG 分开） */
+    CHECK_EQ(jsdk_hal_slcan_open(&hal, &h, "COM_NOT_USED", 115200u, 123456u),
+             JSDK_ERR_UNSUPPORTED);
+    CHECK(strstr(jsdk_hal_slcan_last_open_error(), "123456") != NULL);
+    CHECK(h == NULL);
+
+    /* 不存在的端口：必须报 INVALID_ARG **并且**给出原因（含端口名） */
+#ifdef _WIN32
+    st = jsdk_hal_slcan_open(&hal, &h, "COM199", 115200u, 0u);
+#else
+    st = jsdk_hal_slcan_open(&hal, &h, "/dev/ttySDK_NOT_A_REAL_PORT", 115200u, 0u);
+#endif
+    CHECK_EQ(st, JSDK_ERR_INVALID_ARG);
+    CHECK(h == NULL);
+    why = jsdk_hal_slcan_last_open_error();
+    CHECK(why != NULL && why[0] != '\0');           /* 空了就等于没改 */
+#ifdef _WIN32
+    CHECK(strstr(why, "COM199") != NULL);
+#else
+    CHECK(strstr(why, "/dev/ttySDK_NOT_A_REAL_PORT") != NULL);
+    /* Linux 上应是 ENOENT 那条（“设备节点不存在”）—— 权限那条留给真机 */
+    CHECK(strstr(why, "errno=") != NULL);
+#endif
+    printf("      reason: %s\n", why);
+
+    printf("      unsupported-rate / bad-port both name the cause\n");
+}
+
 /* ==========================================================================
  * main
  * ======================================================================== */
@@ -607,6 +658,8 @@ int main(void)
     test_roundtrip();
     printf("\n");
     test_handles();
+    printf("\n");
+    test_slcan_open_error_text();
 
     printf("\n=== %u checks, %u failures ===\n", g_checks, g_fail);
     return (g_fail == 0u) ? 0 : 1;

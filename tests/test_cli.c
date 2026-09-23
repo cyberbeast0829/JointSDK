@@ -765,6 +765,75 @@ static void test_calibrate_timeout(void)
     printf("      --timeout-ms honoured / calibrate reports pre_calibrated flags\n");
 }
 
+/**
+ * [13] 对端是 Classic 而我们默认 FD 时，必须**自动改学并说出来**。
+ *
+ * 现场（Ubuntu + CyberBeast USB2CAN @ 1 Mbps）：`desc-info` 报
+ * `0/0 bytes, 198 frames received` —— 心跳收得到、我们的请求却没人应，
+ * 因为设备是 Classic 而 SDK 默认发 FD（协议没有运行时协商）。
+ * 现在 SDK 在收到本关节第一帧时对齐过去，CLI 负责提醒下次显式写对。
+ */
+static void test_framing_adopt(void)
+{
+    run_t r;
+    const char *ch_classic = "0:id=1,gear=16.5,hb=10,timeout=30000,classic";
+
+    printf("[13] peer framing (Classic vs FD) is learned and reported\n");
+
+    /* 对端 Classic + 我们 FD → 自动改学，命令照旧成功，并且有提示 */
+    RUN_CLI(&r, "--if", "virtual", "--channel", ch_classic,
+            "--json", "read", "axis0.motor.config.gear_ratio");
+    CHECK(r.rc == 0);
+    expect_has(&r, "err", "对端在发 Classic 帧");
+    expect_has(&r, "err", "--classic");
+
+    /* 对端 FD（与配置一致）→ 不该有那句提示 */
+    RUN_CLI(&r, VIF, "--json", "read", "axis0.motor.config.gear_ratio");
+    CHECK(r.rc == 0);
+    CHECK(strstr(r.err, "对端在发") == NULL);
+
+    /*
+     * ⚠⚠ 但**显式**指定过就不能“偷偷改”：只报“冲突”。理由：自动对齐只是猜错补救，
+     * 不能变成“你说了不算” —— 悄悄改掉会让调用者看到的 cfg 与实际发出的帧不一致
+     * （8 字节参数的分块读还依赖它）。
+     *
+     * ⚠ 两个方向的后果**不对称**（仿真与真机都验过）：
+     *   ① 对端 Classic + 我们显式 FD → 设备**收不到** FD 帧 ⇒ 命令失败，
+     *      而且要说清“改用 --classic”（仿真器的帧格式门限就是按真机复刻的）；
+     *   ② 对端 FD + 我们显式 --classic → FD 控制器收得下经典帧 ⇒ 命令**能过**，
+     *      但 8 字节参数退化成两次请求，所以只是提醒。
+     */
+    RUN_CLI(&r, "--if", "virtual", "--channel", ch_classic, "--json",
+            "--data-bitrate", "5000000",
+            "read", "axis0.motor.config.gear_ratio");
+    CHECK(r.rc != 0);
+    expect_has(&r, "err", "显式指定");
+    expect_has(&r, "err", "--classic");
+
+    RUN_CLI(&r, VIF, "--classic", "--json",
+            "read", "axis0.motor.config.gear_ratio");
+    CHECK(r.rc == 0);
+    expect_has(&r, "err", "显式指定");     /* 显式写错也要说出来（就这么过了） */
+    expect_has(&r, "err", "退化成两次请求");
+    CHECK(strstr(r.err, "已自动按") == NULL);   /* 不是“已自动改学”那条 */
+
+    /* 显式写对时：既不报警也不失联 */
+    RUN_CLI(&r, "--if", "virtual", "--channel", ch_classic, "--classic", "--json",
+            "read", "axis0.motor.config.gear_ratio");
+    CHECK(r.rc == 0);
+    CHECK(strstr(r.err, "对端在发") == NULL);
+    CHECK(strstr(r.err, "显式指定") == NULL);
+
+    /*
+     * ⚠ 上面那条“显式 FD 打 Classic 对端”**同时**钉住了另一件事：它的描述符
+     *   加载是失败的（0/0 字节、心跳正常），而警告照样出现在 stderr 里 ——
+     *   也就是“报告不会被提前 return 吃掉”。这正是最需要这句话的时候：
+     *   用户看到的否则只有一条超时。
+     */
+    printf("      Classic peer auto-adopted (+note) / FD peer silent"
+           " / explicit framing reported even when the load fails\n");
+}
+
 /* ==========================================================================
  * main
  * ======================================================================== */
@@ -796,6 +865,8 @@ int main(void)
     test_write_verify();
     printf("\n");
     test_calibrate_timeout();
+    printf("\n");
+    test_framing_adopt();
 
     printf("\n=== %u checks, %u failures ===\n", g_checks, g_fail);
     return (g_fail == 0u) ? 0 : 1;

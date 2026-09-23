@@ -250,6 +250,19 @@ class SlcanHal(Hal):
 
     # --- 诊断 -------------------------------------------------------------
 
+    def last_open_error(self) -> str:
+        """上一次 slcan 打开失败的**原因**（人可读，含 errno 与建议）。
+
+        ⚠ 打开失败时**没有句柄**可查（见 C 侧 `jsdk_hal_slcan_last_open_error()`
+        的说明）：所以它是静态缓冲、在每个后端实例上都能问：
+        “invalid-argument” 这三个字分不清**权限 / 设备不存在 / 被占用**
+        （Ubuntu 上忘了 sudo 就是 EACCES，现场为此查很久）。
+        """
+        fn = getattr(self._lib, "jsdk_hal_slcan_last_open_error", None) if self._lib else None
+        if fn is None:
+            return ""
+        return (fn() or b"").decode("utf-8", "replace")
+
     def fd_config(self) -> tuple[bool, int]:
         """``(是否已向适配器发过 Y<n>, 已设置的数据段速率)``。"""
         if not hasattr(self._lib, "jsdk_hal_slcan_fd_config"):

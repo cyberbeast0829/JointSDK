@@ -39,6 +39,9 @@ typedef struct {
                                   的串口波特率通常是 115200/1000000，而 CAN 段波特率
                                   由适配器自己按 CAN 帧速率跑。混用会收到乱码。 */
     int         classic;     /**< --classic */
+    int         fd_explicit; /**< 调用者**明确**指定了帧格式（`--classic` 或
+                                  `--data-bitrate`）。置 1 后 SDK 的自动对齐不会
+                                  覆盖它，两者冲突时只报告（`framing_learned() == 4`）。 */
     uint8_t     master_id;   /**< --master-id，默认 1 */
     uint8_t     node;        /**< --node，默认 1 */
     int         json;        /**< --json */

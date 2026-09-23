@@ -2265,7 +2265,11 @@ struct jsdk_context {
     cb_desc_fetch_t   fetch;
     int               fetch_active;   /**< cb_desc_fetch 已被 init（需避免二次 init） */
     uint32_t          fetch_deadline_ms;
+    uint32_t          fetch_bytes_seen; /**< 非阻塞路径的上一次进展字节数（静默预算用） */
     uint8_t           desc_present;   /**< 1 = 端点表可用（configure 不再下载） */
+    /** 对端帧格式的学习结果：0 = 未知，1 = 已改为 Classic，2 = 已改为 FD，
+        3 = 与配置一致（无需调整）。见 `jsdk_context_framing_learned()`。 */
+    uint8_t           framing_learned;
     jsdk_desc_info_t  desc;           /**< 对外元信息；crc/fw 同时是缓存键 */
 
     /**
@@ -2935,6 +2939,10 @@ typedef struct {
     size_t     n_nodes;
     uint32_t   now_ms;
     uint32_t   last_tick_ms;
+    /** 描述符流速率（帧/ms）；0 = 默认 `SIM_JSON_FRAMES_PER_CYCLE`。
+        用来复现“**流得很慢但一直在动**”（真机 Classic 就是 FD 的 10.4 倍帧数）——
+        那种情况下按“总时长”算的预算会误判成超时。 */
+    uint32_t   desc_rate;
 
     /* 出站帧队列（模型 → HAL → SDK 接收路径） */
     jsdk_can_frame_t txq[SIM_TX_QUEUE];
@@ -2947,6 +2955,10 @@ typedef struct {
     uint32_t rx_for_me;
     uint32_t tx_frames;
     uint32_t bad_len_drops;
+    /** 被“帧格式门限”丢掉的帧数：配成 **Classic** 的节点收到 FD 帧（真实控制器
+        解析不了 FD 帧，现场表现就是“心跳收得到、请求没人应”）。
+        有它才能让测试断言“请求**确实**被丢了”，而不是刚好被宽容地放过。 */
+    uint32_t fd_into_classic_drops;
     uint32_t unhandled;
 
     /* JSON 描述符（0x24 / 0x25） */
@@ -3056,6 +3068,9 @@ sim_node_t *sim_find_node(sim_bus_t *b, uint32_t node_id);
 
 /** 清空统计与故障注入（不清节点状态）。 */
 void sim_clear_stats(sim_bus_t *b);
+
+/** 设置描述符流速率（帧/ms）；0 = 恢复默认。用于“慢但持续”的流。 */
+void sim_set_desc_rate(sim_bus_t *b, uint32_t frames_per_ms);
 
 #ifdef __cplusplus
 }
@@ -7998,6 +8013,25 @@ size_t jsdk_context_joint_size(void) { return sizeof(jsdk_joint_t); }
  * ======================================================================== */
 
 /**
+ * 对端帧格式（Classic / FD）的学习结果。
+ *
+ * 协议**没有**运行时协商：设备用哪种格式完全由它自己的 `can.config.baud_rate`
+ * 决定。主站猜错时，发出去的帧设备**根本不收**，现场只表现为
+ * “收到一堆帧（心跳），但我的请求没人应”。所以 SDK 在第一次收到本关节的帧时
+ * 会把格式对齐过去（见 `jsdk_ctx_handle_frame()`），并把这个结果暴露出来
+ * 让 CLI / 客户如实报告“我改了你的格式”。
+ *
+ * @return 0 = 还没收到过本关节的帧；1 = 已从 FD 改为 **Classic**；
+ *         2 = 已从 Classic 改为 **FD**；3 = 与配置一致（无需调整）；
+ *         4 = **显式配置与对端冲突**（格式未改动）
+ */
+int jsdk_context_framing_learned(const jsdk_context_t *ctx)
+{
+    if (!ctx) return 0;
+    return (int)ctx->framing_learned;
+}
+
+/**
  * 处理一帧设备→主站的帧。
  *
  * @return 1 = 已消费；0 = 与本主站无关（丢弃）
@@ -8015,6 +8049,45 @@ int jsdk_ctx_handle_frame(jsdk_context_t *ctx, const jsdk_can_frame_t *f)
     ctx->bus.last_rx_age_ms = 0u;
     ctx->bus.link_up = 1u;
     ctx->last_rx_ms  = ctx->now_ms;
+
+    /*
+     * 学一次对端的**帧格式**（Classic vs FD）。
+     *
+     * 协议**没有**运行时协商：设备用哪种格式完全由它自己的 `can.config.baud_rate`
+     * 决定，主站猜错就是“发出去的帧它根本不收” —— 现场只表现为
+     * “收到一堆帧（心跳），但我的请求没人应”（真机实测：1 Mbps Classic 的设备 +
+     * 我们默认发 FD ⇒ `desc-info` 报 `0/0 bytes, 198 frames received`）。
+     *
+     * 所以在**第一次**收到本关节发来的帧时，把主站的格式对齐过去，并记下“已学习”
+     * （`jsdk_context_framing_learned()` 供 CLI / 客户报告，见 joint_sdk.h）。
+     * ⚠ 只学一次，而且只认**我们关节的 node_id**：总线上别人的帧不该改我们的格式。
+     *
+     * ⚠⚠ 但**显式配置优先**：`cfg.is_fd_explicit` 置位时（CLI `--classic` /
+     * `--data-bitrate`、Python `is_fd=`）绝不动调用者写的值，只报告“冲突”（返回 4）。
+     * 理由：自动对齐只是个“猜错补救”，不能变成“你说了不算”——
+     * 若悄悄改掉显式配置，调用者看到的 cfg 与实际发出的帧不一致，
+     * 而且 8 字节参数的分块读也依赖 `is_fd`（FD 一次 8 B / Classic 一次 4 B）。
+     */
+    if (ctx->framing_learned == 0u) {
+        unsigned k;
+
+        for (k = 0u; k < ctx->nj; ++k) {
+            if (ctx->joints[k].cfg.node_id == src) {
+                uint8_t peer_fd = (f->flags & JSDK_FRAME_FD) ? 1u : 0u;
+                uint8_t cfg_fd  = ctx->cfg.is_fd ? 1u : 0u;
+
+                if (peer_fd == cfg_fd) {
+                    ctx->framing_learned = 3u;                  /* 3 = 与配置一致 */
+                } else if (ctx->cfg.is_fd_explicit) {
+                    ctx->framing_learned = 4u;   /* 4 = 冲突：保留调用者的选择 */
+                } else {
+                    ctx->cfg.is_fd       = peer_fd;
+                    ctx->framing_learned = peer_fd ? 2u : 1u;   /* 1 = 改学 Classic */
+                }
+                break;
+            }
+        }
+    }
 
     /* 寻址：设备只会以 dest = master_id 单播回复；广播告警除外 */
     if (dst != ctx->cfg.master_id && !(cb_id_is_broadcast(f->id) && dst == CB_ADDR_BROADCAST)) {
@@ -8270,6 +8343,15 @@ static uint32_t desc_frames_needed(uint32_t total_len, int is_fd)
     return 1u + (total_len + ppf - 1u) / ppf;
 }
 
+/**
+ * 整条下载的**总时长兜底**（ms）。
+ *
+ * 真正的判据是“静默了多久”（`cb_desc_timeout_ms()`，可被 `desc.timeout_ms` /
+ * CLI 的 `--timeout` 覆盖）；这条只是防止“每帧都慢、但一直在动”的病态流
+ * 把配置阶段挂死。取值宽松：Classic 实测整条流 ~3.5 s。
+ */
+#define JSDK_DESC_TOTAL_MAX_MS 120000u
+
 static void store_init(jsdk_context_t *ctx)
 {
     memset(&ctx->store, 0, sizeof ctx->store);
@@ -8383,6 +8465,8 @@ static jsdk_status_t desc_fetch_from(jsdk_context_t *ctx, uint8_t node)
     {
         uint32_t t0 = ctx->cfg.hal.now_ms(ctx->cfg.hal.user);
         uint32_t req_at = t0;      /* 上一次发请求的时刻（用于重试判定） */
+        uint32_t last_progress = t0;   /* 上一次**有新字节**的时刻（静默预算的起点） */
+        uint32_t bytes_prev = 0u;
         unsigned retries = 0u;     /* 已重发次数（见下面的递增间隔） */
 
         while (!cb_desc_fetch_is_done(&ctx->fetch)) {
@@ -8404,6 +8488,21 @@ static jsdk_status_t desc_fetch_from(jsdk_context_t *ctx, uint8_t node)
             }
 
             ctx->now_ms = ctx->cfg.hal.now_ms(ctx->cfg.hal.user);
+
+            /*
+             * ⚠⚠ 预算算的是“**多久没有新字节**”，不是“总共多久”。
+             *
+             * 描述符是**流式**的：同一个 38433 字节的描述符，FD 是 1+662 帧，
+             * 而 **Classic 是 1+6906 帧（10.4 倍）**。真机实测（CyberBeast USB2CAN
+             * / 1 Mbps Classic）：连续有进展时整条流只要 ~3.5 s；但按“总预算
+             * 3000 ms”算就会在 85% 处被掐断 —— 报出来的却是
+             * `timed out after 3000 ms (32982/38433 bytes, 6057 frames received)`，
+             * 看上去像设备或线缆有问题（实际上是量纲错了）。
+             */
+            if (ctx->fetch.bytes_scanned != bytes_prev) {
+                bytes_prev    = ctx->fetch.bytes_scanned;
+                last_progress = ctx->now_ms;
+            }
 
             /*
              * 请求重发（最多 3 次，共 4 次尝试）。
@@ -8430,15 +8529,28 @@ static jsdk_status_t desc_fetch_from(jsdk_context_t *ctx, uint8_t node)
                 }
             }
 
-            if (jsdk_elapsed(ctx->now_ms, t0) >= deadline) {
+            if (jsdk_elapsed(ctx->now_ms, last_progress) >= deadline) {
                 /* `rx` = 一共收到过多少帧：区分两种完全不同的故障
-                   （通道没开 → 0；请求丢了但心跳在流 → >0）。 */
-                jsdk_ctx_seterr(ctx, "descriptor download from node %u timed out "
-                                     "after %u ms (%u/%u bytes, %u frames received)",
+                   （通道没开 → 0；请求丢了但心跳在流 → >0）。
+                   ⚠ 把“静默了多久”“已经收了多久”都写出来：否则用户分不清
+                     “设备卡住”与“预算量纲写错”（后者真发生过，见上面的注释）。 */
+                jsdk_ctx_seterr(ctx, "descriptor download from node %u stalled: "
+                                     "no new bytes for %u ms "
+                                     "(%u/%u bytes, %u frames received, total %u ms)",
                                 (unsigned)node, (unsigned)deadline,
                                 (unsigned)ctx->fetch.bytes_scanned,
                                 (unsigned)ctx->fetch.total_len,
-                                (unsigned)ctx->bus.rx_frames);
+                                (unsigned)ctx->bus.rx_frames,
+                                (unsigned)jsdk_elapsed(ctx->now_ms, t0));
+                return JSDK_ERR_TIMEOUT;
+            }
+            /* 总时长兜底：防“每帧都慢但一直在动”的病态流把这里挂死 */
+            if (jsdk_elapsed(ctx->now_ms, t0) >= JSDK_DESC_TOTAL_MAX_MS) {
+                jsdk_ctx_seterr(ctx, "descriptor download from node %u exceeded the "
+                                     "overall cap of %u ms (%u/%u bytes)",
+                                (unsigned)node, (unsigned)JSDK_DESC_TOTAL_MAX_MS,
+                                (unsigned)ctx->fetch.bytes_scanned,
+                                (unsigned)ctx->fetch.total_len);
                 return JSDK_ERR_TIMEOUT;
             }
             /*
@@ -8675,6 +8787,7 @@ jsdk_status_t jsdk_context_desc_poll(jsdk_context_t *ctx, uint64_t app_time_ns)
             return JSDK_ERR_TRANSPORT;
         }
         ctx->tx_seq = cb_seq_next(ctx->tx_seq);
+        ctx->fetch_bytes_seen  = 0u;
         ctx->fetch_deadline_ms = ctx->cfg.hal.now_ms(ctx->cfg.hal.user)
                                + cb_desc_timeout_ms(&ctx->cfg.desc);
         return JSDK_ERR_BUSY;
@@ -8697,9 +8810,19 @@ jsdk_status_t jsdk_context_desc_poll(jsdk_context_t *ctx, uint64_t app_time_ns)
 
     ctx->now_ms = ctx->cfg.hal.now_ms(ctx->cfg.hal.user);
     if (!cb_desc_fetch_is_done(&ctx->fetch)) {
+        /* 与阻塞路径同一套语义：**有新字节就续命**（静默预算，不是总预算）。
+           Classic 的描述符是 6906 帧（FD 的 10.4 倍），按总预算算必被误判。 */
+        if (ctx->fetch.bytes_scanned != ctx->fetch_bytes_seen) {
+            ctx->fetch_bytes_seen  = ctx->fetch.bytes_scanned;
+            ctx->fetch_deadline_ms = ctx->now_ms + cb_desc_timeout_ms(&ctx->cfg.desc);
+        }
         if ((int32_t)(ctx->now_ms - ctx->fetch_deadline_ms) >= 0) {
             ctx->fetch_active = 0;
-            jsdk_ctx_seterr(ctx, "descriptor poll timed out");
+            jsdk_ctx_seterr(ctx, "descriptor poll stalled: no new bytes for %u ms "
+                                 "(%u/%u bytes)",
+                            (unsigned)cb_desc_timeout_ms(&ctx->cfg.desc),
+                            (unsigned)ctx->fetch.bytes_scanned,
+                            (unsigned)ctx->fetch.total_len);
             return JSDK_ERR_TIMEOUT;
         }
         return JSDK_ERR_BUSY;

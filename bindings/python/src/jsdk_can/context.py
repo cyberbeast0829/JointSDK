@@ -146,8 +146,11 @@ class Context:
         :class:`~jsdk_can.hal.SocketCanHal` / ...）。默认用虚拟后端 —— 没有硬件
         也能把全部流程跑通。
     :param master_id: 主站源地址（1..254）。**禁止 0**：设备会完全不回复。
-    :param is_fd: 1 = CAN FD（默认，1M/5M BRS）；0 = Classic。必须与设备
-        ``can.config.baud_rate`` 一致（协议无运行时协商）。
+    :param is_fd: 帧格式。``True`` = CAN FD（1M/5M BRS）、``False`` = Classic，
+        **显式给定后 SDK 不会自动改它**；``None``（默认）= 先按 FD 试，
+        收到本关节第一帧时自动对齐到对端的实际格式并报告
+        （见 :attr:`framing_learned`）。“设备是 Classic 还是 FD”协议无法协商，
+        真机上报 ``desc-info`` 超时（`0/0 bytes, N frames received`）多半就是它。
     :param desc_retain: 端点保留策略。桌面用 ``ALL``；MCU 用 ``FILTERED``。
     :param desc_filter: ``FILTERED`` 时的路径过滤器（精确 / ``前缀*`` / ``段前缀.`` / ``*``）。
     :param arena_size: 描述符解析区大小；``None`` 用 C 侧推荐值。
@@ -157,7 +160,7 @@ class Context:
 
     def __init__(self, hal: Hal | None = None, *,
                  master_id: int = 1,
-                 is_fd: bool = True,
+                 is_fd: bool | None = None,
                  desc_retain: DescRetain | int = DescRetain.ALL,
                  desc_filter: list[str] | None = None,
                  desc_mode: DescMode | int = DescMode.DYNAMIC,
@@ -185,7 +188,10 @@ class Context:
         self._lib.jsdk_context_config_default(ctypes.byref(self.cfg))
         self.cfg.hal = self.hal.hal
         self.cfg.master_id = int(master_id)
-        self.cfg.is_fd = 1 if is_fd else 0
+        self.cfg.is_fd = 1 if (is_fd is None or is_fd) else 0
+        # None = “没指定，猜 FD”，允许 SDK 自动对齐；给定值 = 明确要求，不许被改
+        # （见 joint_sdk.h 的 is_fd_explicit：改掉显式配置会连带弄错 8 字节参数的分块读）
+        self.cfg.is_fd_explicit = 0 if is_fd is None else 1
         self.cfg.period_ns = int(period_ns)
         # 等状态序列跑完的预算（calibrate/home）：0 = SDK 内置默认（标定 120 s / 回零 5 s）
         self.cfg.state_timeout_ms = int(state_timeout_ms)
@@ -312,6 +318,19 @@ class Context:
         self.close()
 
     # --- 控制回路 ---------------------------------------------------------
+
+    @property
+    def framing_learned(self) -> int:
+        """对端帧格式的学习结果（0 未知 / 1 已改 Classic / 2 已改 FD / 3 一致 / 4 冲突）。
+
+        ⚠ 协议没有运行时协商：设备用 Classic 还是 FD 由它自己的配置决定。
+        我们在收到本关节的第一帧时会把发送格式对齐过去 —— 否则发出去的帧
+        它根本不收，现场只看到“有心跳、但我的请求没人应”。
+
+        ⚠ 构造时**显式**传了 ``is_fd=`` 的话，自动对齐不会覆盖它；
+        对端与它不同时返回 **4**（“你写的与对端冲突”），此时命令很可能无人应答。
+        """
+        return int(self._lib.jsdk_context_framing_learned(self._ctx_ptr))
 
     def cycle_begin(self, app_time_ns: int = 0) -> int:
         """周期开始：接收并解码全部待处理帧。**RT 安全**。"""

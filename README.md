@@ -175,12 +175,19 @@ for (;;) {                                /* 控制循环：RT 安全 */
 > 下面每一条都在**真机上实跑过**：CANable（slcan）+ 一台关节（`node 1`，`fw 1545`，FD）。
 > 跑之前只需确认三件事：**后端（`--if`）→ 通道（`--channel`）→ 节点（`--node`）**。
 > 任何命令都能叠 `--json`（机器可读，字段是契约）和 `-v` / `-q`（日志级别）。
+>
+> ⚠ 还有第四件事：**设备是 Classic 还是 FD**（`can.config.baud_rate`）——协议**没有**
+> 运行时协商，猜错的现场表现就是“心跳收得到、但我的请求没人应”
+> （`desc-info` 报 `0/0 bytes, N frames received`）。同一台 CyberBeast USB2CAN 在不同的
+> 适配器/固件配置下可以是 **1 Mbps Classic**，所以：**不确定就别传** `--classic` /
+> `--data-bitrate` —— SDK 会按对端第一帧自动对齐并打一行提示；传了就是明确指定，
+> 冲突时只会警告（不会偷偷改你的值）。
 
 ### 0. 通道怎么填
 
 | 硬件 | `--if` | `--channel` | 还要给什么 |
 |---|---|---|---|
-| CANable / 串口（slcan） | `slcan` | `COM3`（Win）/ `/dev/ttyACM0`（Linux） | `--baud 115200`（**串口**速率，不是 CAN 速率）；FD 数据段速率用 `--data-bitrate 2000000\|5000000`，或 `--classic` 强制 Classic |
+| CANable / 串口（slcan） | `slcan` | `COM3`（Win）/ `/dev/ttyACM0`（Linux） | `--baud 115200`（**串口**速率，不是 CAN 速率）；FD 数据段速率用 `--data-bitrate 2000000\|5000000`，或 `--classic` 强制 Classic。⚠ Linux 下 `/dev/ttyACM0` 属 `root:dialout`，用户不在 `dialout` 组里会报 `invalid-argument` + 权限原因提示（`--channel` 前加 `sudo` 或 `usermod -aG dialout`）|
 | PEAK PCAN | `pcan` | `PCAN_USBBUS1` | 运行期加载 PCAN-Basic，无需链接 `.lib` |
 | Linux SocketCAN | `socketcan` | `can0` | 链路速率用 `ip link` 设，SDK 不碰 |
 | 无硬件自检 | `virtual` | 可省；或 `"0:id=1,timeout=30000,fd"` | 内置驱动器模型（自带描述符） |

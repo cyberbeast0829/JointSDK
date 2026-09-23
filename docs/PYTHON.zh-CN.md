@@ -72,7 +72,8 @@ from jsdk_can import Context, VirtualHal, SocketCanHal, DescRetain
 ctx = Context(
     hal=VirtualHal(),            # 或 SocketCanHal("can0") / PcanHal("PCAN_USBBUS1") / SlcanHal("COM3")
     master_id=1,                 # 主站源地址
-    is_fd=True,                  # False = 强制 Classic（描述符下载会从 662 帧涨到 6839 帧）
+    is_fd=None,                  # None（默认）= 先按 FD 试、收到本关节第一帧时自动对齐并在 stderr 说明；
+                                 # True/False = **明确指定**，冲突时不改（`ctx.framing_learned == 4`）
     desc_retain=DescRetain.ALL,  # 保留全部端点（约 24.9 KB RAM）；只留关键路径可降到 <1 KB
     desc_filter=["axis0.motor.config.gear_ratio", "axis0.config.can.node_id"],
     period_ns=1_000_000,         # 期望周期（keepalive 与超时判定用）

@@ -196,7 +196,7 @@ int cli_opts_parse(cli_opts_t *o, int argc, char **argv, FILE *err)
 
         /* --- 布尔 --- */
         if (strcmp(t, "--json") == 0) { o->json = 1; continue; }
-        if (strcmp(t, "--classic") == 0) { o->classic = 1; o->data_bitrate = 0u; continue; }
+        if (strcmp(t, "--classic") == 0) { o->classic = 1; o->fd_explicit = 1; o->data_bitrate = 0u; continue; }
         if (strcmp(t, "--yes") == 0) { o->yes = 1; continue; }
         /* ⚠ `--csv` 是**格式开关**（与 Python 版 `python -m jsdk_can` 一致）。
            它以前是“要一个文件名”，于是 `mon --csv --duration 1` 会把 `--duration`
@@ -244,7 +244,9 @@ int cli_opts_parse(cli_opts_t *o, int argc, char **argv, FILE *err)
                 case 0:  o->ifname = v; break;
                 case 1:  o->channel = v; break;
                 case 2:  if (parse_u32(v, &o->bitrate) != 0) CLI_BAD_VALUE(); break;
-                case 3:  if (parse_u32(v, &o->data_bitrate) != 0) CLI_BAD_VALUE(); break;
+                case 3:  if (parse_u32(v, &o->data_bitrate) != 0) CLI_BAD_VALUE();
+                         o->fd_explicit = 1;   /* 写了数据段波特率 = 明确要 FD */
+                         break;
                 case 4:
                     /* 主站 0 → 设备完全不回复：这不是"高级用法"，是配错了 */
                     if (parse_u32(v, &u) != 0 || u == 0u || u > 254u) CLI_BAD_VALUE();
@@ -532,6 +534,14 @@ int cli_open(cli_app_t *a)
     if (st != JSDK_OK) {
         cli_fprintf(a->err, "jsdk-cli: 打开 %s(%s) 失败：%s\n",
                 ifname, chan ? chan : "", jsdk_status_string(st));
+        /* ⚠ slcan 的 `invalid-argument` **什么也没说**：真因可能是权限、设备不存在、
+           被占用……而返回码只能是一个。把后端记下的原因（含 errno 与建议）打出来 ——
+           现场为了分辨这几种情况花的时间，比写这段代码多得多。 */
+        if (strcmp(ifname, "slcan") == 0) {
+            const char *why = jsdk_hal_slcan_last_open_error();
+
+            if (why && why[0]) cli_fprintf(a->err, "  原因：%s\n", why);
+        }
         return 1;
     }
 
@@ -581,6 +591,8 @@ static int cli_init_ctx(cli_app_t *a)
     cfg->hal       = a->sdk_hal;
     cfg->master_id = a->o.master_id;
     cfg->is_fd     = (uint8_t)a->fd;
+    /* 显式指定的格式优先：只写 --if/--channel 时保持“可自动对齐”（见 joint_sdk.h） */
+    cfg->is_fd_explicit = (uint8_t)(a->o.fd_explicit ? 1u : 0u);
     /* `period_ns` 是 **uint32_t**（ns 计，上限 ~4.29 s）；
        这里不要多此一举地转成 uint64_t —— `-Wconversion` 会正确地报
        "long unsigned → uint32_t 可能丢值"（rate_hz 已校验 1..1000）。

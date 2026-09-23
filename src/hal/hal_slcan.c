@@ -46,9 +46,41 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>          /* snprintf/vsnprintf：打开失败的**原因**要能说清楚 */
+#include <stdarg.h>
 
 #include "hal_handle.h"
 #include "hal_slcan_codec.h"
+
+/* --------------------------------------------------------------------------
+ * 打开失败的诊断（两个平台共用）
+ * ------------------------------------------------------------------------ */
+
+/**
+ * 上一次打开失败的**原因**（人可读，含 errno 与建议）。
+ *
+ * 为什么用文件级静态缓冲：`jsdk_hal_slcan_open()` 失败时**没有句柄**可挂诊断
+ * 信息（句柄刚被 free），而返回码只有一个 `JSDK_ERR_INVALID_ARG`。
+ * 现场（Ubuntu，忘了 sudo → EACCES）只能看到 “invalid-argument”，根本不知道
+ * 是权限、设备不存在，还是被占用 —— 这条就是为此加的。
+ * ⚠ 非线程安全（诊断用）；成功打开后清空。
+ */
+static char g_open_err[256];
+
+static void sl_open_err_set(const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    (void)vsnprintf(g_open_err, sizeof g_open_err, fmt, ap);
+    va_end(ap);
+    g_open_err[sizeof g_open_err - 1u] = '\0';
+}
+
+const char *jsdk_hal_slcan_last_open_error(void)
+{
+    return g_open_err;
+}
 
 /* --------------------------------------------------------------------------
  * 平台头与串口原语
@@ -57,6 +89,17 @@
 #ifdef _WIN32
 
 #include <windows.h>
+
+/** 把 `GetLastError()` 翻译成“下一步该做什么”（现场排查的时间都花在这里）。 */
+static const char *sl_errno_hint(int e)
+{
+    switch (e) {
+    case ERROR_FILE_NOT_FOUND:
+    case ERROR_PATH_NOT_FOUND: return "串口不存在（在设备管理器里看实际端口号）";
+    case ERROR_ACCESS_DENIED:  return "被占用或权限不足（关掉串口工具/CAN 助手再试）";
+    default: return "";
+    }
+}
 
 typedef struct {
     HANDLE h;
@@ -84,13 +127,24 @@ static int sl_port_open(sl_port_t *p, const char *name, uint32_t baud)
     p->h = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL,
                        OPEN_EXISTING, 0, NULL);
     if (p->h == INVALID_HANDLE_VALUE) {
+        DWORD e = GetLastError();
+
         p->h = NULL;
+        sl_open_err_set("CreateFile(%s) 失败：错误码 %lu%s%s", path,
+                        (unsigned long)e,
+                        sl_errno_hint((int)e)[0] ? "，" : "",
+                        sl_errno_hint((int)e));
         return -1;
     }
 
     memset(&dcb, 0, sizeof dcb);
     dcb.DCBlength = (DWORD)sizeof dcb;
-    if (!GetCommState(p->h, &dcb)) { sl_port_close(p); return -1; }
+    if (!GetCommState(p->h, &dcb)) {
+        sl_open_err_set("%s：GetCommState 失败（错误码 %lu）—— 端口存在但拿不到状态，"
+                        "常被别的程序占着", name, (unsigned long)GetLastError());
+        sl_port_close(p);
+        return -1;
+    }
     dcb.BaudRate = (DWORD)baud;
     dcb.ByteSize = 8;
     dcb.Parity   = NOPARITY;
@@ -103,7 +157,12 @@ static int sl_port_open(sl_port_t *p, const char *name, uint32_t baud)
     dcb.fRtsControl  = RTS_CONTROL_ENABLE;
     dcb.fOutX = FALSE;
     dcb.fInX  = FALSE;
-    if (!SetCommState(p->h, &dcb)) { sl_port_close(p); return -1; }
+    if (!SetCommState(p->h, &dcb)) {
+        sl_open_err_set("%s：SetCommState(%lu baud) 失败（错误码 %lu）",
+                        name, (unsigned long)baud, (unsigned long)GetLastError());
+        sl_port_close(p);
+        return -1;
+    }
 
     /* 读超时全 0 → ReadFile 立即返回"当前已有字节数"（0 也是合法结果） */
     memset(&to, 0, sizeof to);
@@ -112,7 +171,12 @@ static int sl_port_open(sl_port_t *p, const char *name, uint32_t baud)
     to.ReadTotalTimeoutConstant    = 0;
     to.WriteTotalTimeoutMultiplier = 0;
     to.WriteTotalTimeoutConstant   = 500;
-    if (!SetCommTimeouts(p->h, &to)) { sl_port_close(p); return -1; }
+    if (!SetCommTimeouts(p->h, &to)) {
+        sl_open_err_set("%s：SetCommTimeouts 失败（错误码 %lu）",
+                        name, (unsigned long)GetLastError());
+        sl_port_close(p);
+        return -1;
+    }
 
     PurgeComm(p->h, PURGE_RXCLEAR | PURGE_TXCLEAR);
     return 0;
@@ -163,6 +227,23 @@ static uint32_t sl_now_ms(void)
 #include <time.h>          /* clock_gettime / CLOCK_MONOTONIC */
 #include <unistd.h>
 
+/** 把 `errno` 翻译成“下一步该做什么”（Linux 上最常见的就是权限）。 */
+static const char *sl_errno_hint(int e)
+{
+    switch (e) {
+    case EACCES:
+    case EPERM:
+        return "权限不足：把当前用户加入 dialout 组（sudo usermod -aG dialout $USER，"
+               "重新登录生效），或本次用 sudo 运行";
+    case ENOENT:  return "设备节点不存在（插拔后可能变成 ttyACM1，用 ls /dev/ttyACM* 确认）";
+    case EBUSY:   return "被占用：先停掉占用它的进程（sudo pkill slcand / candump）";
+    case ENOTTY:  return "不是串口设备：CANable 2.0 的 slcan 固件通常是 /dev/ttyACM0";
+    case ENXIO:
+    case EIO:     return "设备已断开（重新插拔一次）";
+    default: return "";
+    }
+}
+
 #include <sys/select.h>
 #include <sys/time.h>
 
@@ -202,16 +283,41 @@ static speed_t sl_baud_to_speed(uint32_t baud)
 
 static int sl_port_open(sl_port_t *p, const char *name, uint32_t baud)
 {
-    struct termios tio;
     speed_t sp = sl_baud_to_speed(baud);
+#ifdef _WIN32
+    char path[64];
+#else
+    struct termios tio;
+    int saved_errno;
+#endif
 
-    if (sp == (speed_t)0) return -1;      /* 不支持的波特率：明确失败 */
+    if (sp == (speed_t)0) {
+        /* ⚠ 这是最容易混的一对：**串口**波特率（适配器通常 115200，CDC 下甚至
+           被忽略）≠ **CAN** 波特率（由适配器自己配）。 */
+        sl_open_err_set("不支持的串口波特率 %lu（适配器通常是 115200；"
+                        "CAN 波特率由适配器自己配，与本参数无关）",
+                        (unsigned long)baud);
+        return -1;
+    }
 
     /* O_NONBLOCK：recv() 契约要求非阻塞 */
     p->fd = open(name, O_RDWR | O_NOCTTY | O_NONBLOCK);
-    if (p->fd < 0) return -1;
+    if (p->fd < 0) {
+        saved_errno = errno;
+        sl_open_err_set("open(%s, O_RDWR) 失败：%s (errno=%d)%s%s", name,
+                        strerror(saved_errno), saved_errno,
+                        sl_errno_hint(saved_errno)[0] ? "，" : "",
+                        sl_errno_hint(saved_errno));
+        return -1;
+    }
 
-    if (tcgetattr(p->fd, &tio) != 0) { sl_port_close(p); return -1; }
+    if (tcgetattr(p->fd, &tio) != 0) {
+        saved_errno = errno;
+        sl_open_err_set("%s：tcgetattr 失败（%s）—— 它可能不是 tty 设备",
+                        name, strerror(saved_errno));
+        sl_port_close(p);
+        return -1;
+    }
 
     /* raw 模式：8N1、无流控、无回显、无字符转换 */
     tio.c_iflag &= (tcflag_t)~(IGNBRK | BRKINT | PARMRK | ISTRIP
@@ -224,10 +330,17 @@ static int sl_port_open(sl_port_t *p, const char *name, uint32_t baud)
     tio.c_cc[VTIME] = 0;
 
     if (cfsetispeed(&tio, sp) != 0 || cfsetospeed(&tio, sp) != 0) {
+        sl_open_err_set("%s：cfset[i/o]speed(%lu) 失败", name, (unsigned long)baud);
         sl_port_close(p);
         return -1;
     }
-    if (tcsetattr(p->fd, TCSANOW, &tio) != 0) { sl_port_close(p); return -1; }
+    if (tcsetattr(p->fd, TCSANOW, &tio) != 0) {
+        saved_errno = errno;
+        sl_open_err_set("%s：tcsetattr(%lu baud) 失败：%s", name,
+                        (unsigned long)baud, strerror(saved_errno));
+        sl_port_close(p);
+        return -1;
+    }
 
     tcflush(p->fd, TCIOFLUSH);
     return 0;
@@ -587,8 +700,14 @@ jsdk_status_t jsdk_hal_slcan_open(jsdk_can_hal_t *hal, jsdk_hal_handle_t **out,
     const char *fd_cmd = NULL;
     unsigned    i;
 
-    if (!hal || !out || !port || !port[0]) return JSDK_ERR_INVALID_ARG;
+    /* ⚠ 先把 `*out` 置 NULL（API 承诺：失败时调用方拿到 NULL，才能安全地
+       “失败也 close 一下”）。以前这两行写在端口名校验之后，于是**空端口名**
+       这条最早返回的路径会把调用方的脏指针留下 —— 用例里直接断言到。 */
+    if (!hal || !out) return JSDK_ERR_INVALID_ARG;
     *out = NULL;
+    g_open_err[0] = '\0';          /* 每次调用都重置，免得报上一次的原因 */
+
+    if (!port || !port[0]) return JSDK_ERR_INVALID_ARG;
 
     if (baud == 0u) baud = 115200u;
 
@@ -605,7 +724,12 @@ jsdk_status_t jsdk_hal_slcan_open(jsdk_can_hal_t *hal, jsdk_hal_handle_t **out,
                 break;
             }
         }
-        if (!fd_cmd) return JSDK_ERR_UNSUPPORTED;   /* 表外的速率：明确说不支持 */
+        if (!fd_cmd) {
+            sl_open_err_set("FD 数据段速率 %lu 不在已知表里（只有 2000000 / 5000000；"
+                            "其它速率请先用厂家工具配好，再传 --data-bitrate 0）",
+                            (unsigned long)data_bitrate);
+            return JSDK_ERR_UNSUPPORTED;   /* 表外的速率：明确说不支持 */
+        }
     }
 
     h = (sl_handle_t *)calloc(1u, sizeof *h);
@@ -654,6 +778,7 @@ jsdk_status_t jsdk_hal_slcan_open(jsdk_can_hal_t *hal, jsdk_hal_handle_t **out,
     hal->on_error   = NULL;
     hal->bus_status = sl_bus_status;
 
+    g_open_err[0] = '\0';          /* 打开成功：没有原因可说 */
     *out = &h->base;
     return JSDK_OK;
 }

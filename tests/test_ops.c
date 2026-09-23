@@ -1338,7 +1338,7 @@ static void test_lost_first_request(void)
         CHECK_EQ(fx.dropped, 4u);                      /* 1 次 + 3 次重发 */
         CHECK_EQ(fx.desc_reqs_on_bus, 0u);
         CHECK(strstr(jsdk_context_last_error(fx.ctx),
-                     "descriptor download from node 1 timed out") != NULL);
+                     "stalled: no new bytes") != NULL);
         CHECK(strstr(jsdk_context_last_error(fx.ctx), "frames received") != NULL);
         printf("      all 4 attempts dropped -> %s\n",
                jsdk_context_last_error(fx.ctx));
@@ -1747,6 +1747,145 @@ static void test_robustness(void)
     fx_close(&fx);
 }
 
+/**
+ * [12] 描述符的预算算的是“**静默多久**”，不是“总共多久”。
+ *
+ * 真机实测（CyberBeast USB2CAN / 1 Mbps Classic）：同一个 38433 字节描述符
+ * 在 Classic 下是 1+6906 帧（FD 的 10.4 倍），连续有进展时整条流 ~3.5 s；
+ * 而当时按“总预算”算，于是在 85% 处被截断，报的却是
+ * `timed out after 3000 ms (32982/38433 bytes, 6057 frames received)` ——
+ * 看上去像设备/线缆有问题，实际是预算量纲写错了。
+ *
+ * 本用例把流**放慢**（1 帧/ms，总时长远超预算）但让它一直有进展：必须成功。
+ * ⚠ 必须走 `jsdk_context_desc_fetch()`：超时逻辑在那一层；直接喂
+ *   `cb_desc_fetch_frame()` 测不到（试过，变异不红 —— 那条用例已删）。
+ */
+static void test_desc_stall_budget(void)
+{
+    fix_t fx;
+    unsigned i;
+    const uint32_t budget = 200u;   /* 故意很小：总时长会远超它 */
+
+    printf("[12] descriptor budget is a STALL budget (slow stream must succeed)\n");
+
+    if (fx_open(&fx, "0:id=1,hb=10,timeout=30000,fd", 1u) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+    if (sim_set_desc(fx.sim, g_json, (uint32_t)g_json_len, 0x1234u) != 0) {
+        g_fail++; g_checks++; fx_close(&fx); return;
+    }
+    sim_set_desc_rate(fx.sim, 1u);          /* 1 帧/ms：慢，但一直在动 */
+
+    /* 预算只能通过**初始化时**的 cfg 生效（`jsdk_context_init` 会拷贝一份），
+       所以这里重来一次：destroy → 改 cfg → init。 */
+    jsdk_context_destroy(fx.ctx);
+    memset(&fx.store, 0, sizeof fx.store);
+    fx.cfg.desc.timeout_ms = budget;
+    CHECK_EQ(jsdk_context_init((jsdk_context_t *)&fx.store, &fx.cfg), JSDK_OK);
+    fx.ctx = (jsdk_context_t *)&fx.store;
+    for (i = 0u; i < 1u; ++i) {
+        CHECK_EQ(jsdk_context_add_joint(fx.ctx, &fx.jc[i], &fx.j), JSDK_OK);
+    }
+    fx.j = &fx.ctx->joints[0];
+
+    if (jsdk_context_desc_fetch(fx.ctx) != JSDK_OK) {
+        printf("      desc_fetch -> %s\n", jsdk_context_last_error(fx.ctx));
+        g_fail++; g_checks++;
+    } else {
+        /* FD 下 ~663 帧 × 1 帧/ms ⇒ 总时长 ~663 ms ≫ 200 ms 预算 */
+        printf("      %u frames at 1/ms (~%u ms total) with a %u ms budget -> OK, complete=%u\n",
+               (unsigned)fx.ctx->desc.frames_rx, (unsigned)fx.ctx->desc.frames_rx,
+               (unsigned)budget, (unsigned)fx.ctx->desc.complete);
+        CHECK(fx.ctx->desc.complete == 1u);
+    }
+    sim_set_desc_rate(fx.sim, 0u);
+    fx_close(&fx);
+}
+
+/**
+ * [14] 帧格式（Classic / FD）：自动对齐的语义 + 仿真器的格式门限。
+ *
+ * 现场（Ubuntu + CyberBeast USB2CAN @ 1 Mbps）：设备是 **Classic**，SDK 默认发
+ * **FD** ⇒ `desc-info` 报 `0/0 bytes, 198 frames received`（心跳收得到、请求没人应）。
+ * 协议**没有**运行时协商，所以这条用例钉住三件事：
+ *   ① 仿真器必须按真机挡住 FD→Classic（否则测试会在“格式猜错”时照样通过）；
+ *   ② 默认（未显式指定）时 SDK 自动对齐过去并报告；
+ *   ③ **显式**指定过就不许被偷偷改掉，只报 `framing_learned() == 4`。
+ */
+static void test_framing_semantics(void)
+{
+    fix_t    fx;
+    unsigned i;
+    uint32_t drops0;
+
+    printf("[14] framing: FD->Classic is refused; auto-align only when not explicit\n");
+
+    if (fx_open_flags(&fx, "0:id=1,hb=10,timeout=30000,classic", 1u, 1) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+    CHECK_EQ(jsdk_context_framing_learned(fx.ctx), 0);   /* 还没收到过帧 */
+
+    /* ---- ① 门限：同一帧，FD 版被丢，Classic 版被收 ---- */
+    {
+        jsdk_can_frame_t f;
+        uint8_t          req[4] = { 0u, 0u, 0u, 0u };
+
+        drops0 = fx.sim->fd_into_classic_drops;
+        memset(&f, 0, sizeof f);
+        f.id    = cb_make_id(CB_PRI_CONFIG, CB_MSG_JSON_DESC_READ, 1u, 1u, 0u);
+        f.len   = 4u;
+        f.flags = (uint8_t)(JSDK_FRAME_EXT | JSDK_FRAME_FD);
+        memcpy(f.data, req, sizeof req);
+        sim_rx(fx.sim, &f);
+        CHECK_EQ(fx.sim->fd_into_classic_drops, drops0 + 1u);   /* 被挡住 */
+        CHECK_EQ(fx.sim->desc.active, 0);                       /* 设备根本没开工 */
+
+        f.flags = JSDK_FRAME_EXT;                               /* 反方向：真允许 */
+        sim_rx(fx.sim, &f);
+        CHECK_EQ(fx.sim->fd_into_classic_drops, drops0 + 1u);
+        CHECK_EQ(fx.sim->desc.active, 1);         /* 这次设备真的开始发流了 */
+        fx.sim->desc.active = 0;                  /* 别让它插进后面的下载 */
+        fx.sim->desc.metadata_sent = 0;
+        fx.sim->desc.offset = 0u;
+    }
+
+    /* ---- ② 默认（未显式指定）→ 自动对齐到对端 ---- */
+    for (i = 0u; i < 40u && jsdk_context_framing_learned(fx.ctx) == 0; ++i) {
+        (void)jsdk_context_cycle_begin(fx.ctx, 0u);
+        (void)jsdk_context_cycle_end(fx.ctx);
+    }
+    CHECK_EQ(jsdk_context_framing_learned(fx.ctx), 1);   /* 1 = 已改学 Classic */
+    CHECK_EQ(fx.ctx->cfg.is_fd, 0u);                     /* 格式真的改过去了 */
+    CHECK_EQ(jsdk_context_desc_fetch(fx.ctx), JSDK_OK);  /* 改学之后就能下完 */
+    fx_close(&fx);
+
+    /* ---- ③ 显式指定过 → 冲突时不改调用者的值，只报告 ---- */
+    if (fx_open_flags(&fx, "0:id=1,hb=10,timeout=30000,classic", 1u, 1) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+    jsdk_context_destroy(fx.ctx);
+    memset(&fx.store, 0, sizeof fx.store);
+    fx.cfg.is_fd          = 1u;      /* 显式要 FD */
+    fx.cfg.is_fd_explicit = 1u;
+    fx.cfg.desc.timeout_ms = 500u;   /* 小预算：失败路径别拖时间 */
+    CHECK_EQ(jsdk_context_init((jsdk_context_t *)&fx.store, &fx.cfg), JSDK_OK);
+    fx.ctx = (jsdk_context_t *)&fx.store;
+    CHECK_EQ(jsdk_context_add_joint(fx.ctx, &fx.jc[0], &fx.j), JSDK_OK);
+    fx.j = &fx.ctx->joints[0];
+
+    for (i = 0u; i < 40u && jsdk_context_framing_learned(fx.ctx) == 0; ++i) {
+        (void)jsdk_context_cycle_begin(fx.ctx, 0u);
+        (void)jsdk_context_cycle_end(fx.ctx);
+    }
+    CHECK_EQ(jsdk_context_framing_learned(fx.ctx), 4);   /* 4 = 显式配置与对端冲突 */
+    CHECK_EQ(fx.ctx->cfg.is_fd, 1u);                     /* 一个字节都不许被改 */
+    CHECK(jsdk_context_desc_fetch(fx.ctx) != JSDK_OK);   /* 设备收不到 FD 帧 ⇒ 必失败 */
+    printf("      default -> learned=%d is_fd=%u (aligned); explicit -> learned=%d is_fd=%u (kept)\n",
+           (int)1, (unsigned)0,
+           jsdk_context_framing_learned(fx.ctx), (unsigned)fx.ctx->cfg.is_fd);
+    fx_close(&fx);
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -1769,6 +1908,8 @@ int main(void)
     test_watchdog_readback(); printf("\n");
     test_watchdog_disabled(); printf("\n");
     test_write_short_values(); printf("\n");
+    test_desc_stall_budget(); printf("\n");
+    test_framing_semantics(); printf("\n");
     test_robustness();   printf("\n");
 
     free(g_json);

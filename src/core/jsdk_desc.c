@@ -30,6 +30,15 @@ static uint32_t desc_frames_needed(uint32_t total_len, int is_fd)
     return 1u + (total_len + ppf - 1u) / ppf;
 }
 
+/**
+ * 整条下载的**总时长兜底**（ms）。
+ *
+ * 真正的判据是“静默了多久”（`cb_desc_timeout_ms()`，可被 `desc.timeout_ms` /
+ * CLI 的 `--timeout` 覆盖）；这条只是防止“每帧都慢、但一直在动”的病态流
+ * 把配置阶段挂死。取值宽松：Classic 实测整条流 ~3.5 s。
+ */
+#define JSDK_DESC_TOTAL_MAX_MS 120000u
+
 static void store_init(jsdk_context_t *ctx)
 {
     memset(&ctx->store, 0, sizeof ctx->store);
@@ -143,6 +152,8 @@ static jsdk_status_t desc_fetch_from(jsdk_context_t *ctx, uint8_t node)
     {
         uint32_t t0 = ctx->cfg.hal.now_ms(ctx->cfg.hal.user);
         uint32_t req_at = t0;      /* 上一次发请求的时刻（用于重试判定） */
+        uint32_t last_progress = t0;   /* 上一次**有新字节**的时刻（静默预算的起点） */
+        uint32_t bytes_prev = 0u;
         unsigned retries = 0u;     /* 已重发次数（见下面的递增间隔） */
 
         while (!cb_desc_fetch_is_done(&ctx->fetch)) {
@@ -164,6 +175,21 @@ static jsdk_status_t desc_fetch_from(jsdk_context_t *ctx, uint8_t node)
             }
 
             ctx->now_ms = ctx->cfg.hal.now_ms(ctx->cfg.hal.user);
+
+            /*
+             * ⚠⚠ 预算算的是“**多久没有新字节**”，不是“总共多久”。
+             *
+             * 描述符是**流式**的：同一个 38433 字节的描述符，FD 是 1+662 帧，
+             * 而 **Classic 是 1+6906 帧（10.4 倍）**。真机实测（CyberBeast USB2CAN
+             * / 1 Mbps Classic）：连续有进展时整条流只要 ~3.5 s；但按“总预算
+             * 3000 ms”算就会在 85% 处被掐断 —— 报出来的却是
+             * `timed out after 3000 ms (32982/38433 bytes, 6057 frames received)`，
+             * 看上去像设备或线缆有问题（实际上是量纲错了）。
+             */
+            if (ctx->fetch.bytes_scanned != bytes_prev) {
+                bytes_prev    = ctx->fetch.bytes_scanned;
+                last_progress = ctx->now_ms;
+            }
 
             /*
              * 请求重发（最多 3 次，共 4 次尝试）。
@@ -190,15 +216,28 @@ static jsdk_status_t desc_fetch_from(jsdk_context_t *ctx, uint8_t node)
                 }
             }
 
-            if (jsdk_elapsed(ctx->now_ms, t0) >= deadline) {
+            if (jsdk_elapsed(ctx->now_ms, last_progress) >= deadline) {
                 /* `rx` = 一共收到过多少帧：区分两种完全不同的故障
-                   （通道没开 → 0；请求丢了但心跳在流 → >0）。 */
-                jsdk_ctx_seterr(ctx, "descriptor download from node %u timed out "
-                                     "after %u ms (%u/%u bytes, %u frames received)",
+                   （通道没开 → 0；请求丢了但心跳在流 → >0）。
+                   ⚠ 把“静默了多久”“已经收了多久”都写出来：否则用户分不清
+                     “设备卡住”与“预算量纲写错”（后者真发生过，见上面的注释）。 */
+                jsdk_ctx_seterr(ctx, "descriptor download from node %u stalled: "
+                                     "no new bytes for %u ms "
+                                     "(%u/%u bytes, %u frames received, total %u ms)",
                                 (unsigned)node, (unsigned)deadline,
                                 (unsigned)ctx->fetch.bytes_scanned,
                                 (unsigned)ctx->fetch.total_len,
-                                (unsigned)ctx->bus.rx_frames);
+                                (unsigned)ctx->bus.rx_frames,
+                                (unsigned)jsdk_elapsed(ctx->now_ms, t0));
+                return JSDK_ERR_TIMEOUT;
+            }
+            /* 总时长兜底：防“每帧都慢但一直在动”的病态流把这里挂死 */
+            if (jsdk_elapsed(ctx->now_ms, t0) >= JSDK_DESC_TOTAL_MAX_MS) {
+                jsdk_ctx_seterr(ctx, "descriptor download from node %u exceeded the "
+                                     "overall cap of %u ms (%u/%u bytes)",
+                                (unsigned)node, (unsigned)JSDK_DESC_TOTAL_MAX_MS,
+                                (unsigned)ctx->fetch.bytes_scanned,
+                                (unsigned)ctx->fetch.total_len);
                 return JSDK_ERR_TIMEOUT;
             }
             /*
@@ -435,6 +474,7 @@ jsdk_status_t jsdk_context_desc_poll(jsdk_context_t *ctx, uint64_t app_time_ns)
             return JSDK_ERR_TRANSPORT;
         }
         ctx->tx_seq = cb_seq_next(ctx->tx_seq);
+        ctx->fetch_bytes_seen  = 0u;
         ctx->fetch_deadline_ms = ctx->cfg.hal.now_ms(ctx->cfg.hal.user)
                                + cb_desc_timeout_ms(&ctx->cfg.desc);
         return JSDK_ERR_BUSY;
@@ -457,9 +497,19 @@ jsdk_status_t jsdk_context_desc_poll(jsdk_context_t *ctx, uint64_t app_time_ns)
 
     ctx->now_ms = ctx->cfg.hal.now_ms(ctx->cfg.hal.user);
     if (!cb_desc_fetch_is_done(&ctx->fetch)) {
+        /* 与阻塞路径同一套语义：**有新字节就续命**（静默预算，不是总预算）。
+           Classic 的描述符是 6906 帧（FD 的 10.4 倍），按总预算算必被误判。 */
+        if (ctx->fetch.bytes_scanned != ctx->fetch_bytes_seen) {
+            ctx->fetch_bytes_seen  = ctx->fetch.bytes_scanned;
+            ctx->fetch_deadline_ms = ctx->now_ms + cb_desc_timeout_ms(&ctx->cfg.desc);
+        }
         if ((int32_t)(ctx->now_ms - ctx->fetch_deadline_ms) >= 0) {
             ctx->fetch_active = 0;
-            jsdk_ctx_seterr(ctx, "descriptor poll timed out");
+            jsdk_ctx_seterr(ctx, "descriptor poll stalled: no new bytes for %u ms "
+                                 "(%u/%u bytes)",
+                            (unsigned)cb_desc_timeout_ms(&ctx->cfg.desc),
+                            (unsigned)ctx->fetch.bytes_scanned,
+                            (unsigned)ctx->fetch.total_len);
             return JSDK_ERR_TIMEOUT;
         }
         return JSDK_ERR_BUSY;

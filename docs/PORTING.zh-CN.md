@@ -816,6 +816,62 @@ MCU 客户**看不到**这一节：他们按 §1 自己实现 `jsdk_can_hal_t`�
   线接反 / 无终端电阻 / 波特率不符。
 - `jsdk_hal_slcan_fd_frames()`：`rx_fd == 0` 而 `tx_fd > 0` 通常说明**对端在按
   Classic 回**或适配器没进 FD 模式 —— 比“反馈解析不出来”早一步指出现场问题。
+- **打开失败要说清楚原因**：失败时没有句柄可挂诊断信息，所以原因记在
+  `jsdk_hal_slcan_last_open_error()`（静态缓冲，每次 `open()` 重置）。`jsdk-cli`
+  失败时会多打一行 `原因：…`，例如 Linux 上忘了 `sudo`：
+
+  ```console
+  $ ./build/jsdk-cli --if slcan --channel /dev/ttyACM0 scan
+  jsdk-cli: 打开 slcan(/dev/ttyACM0) 失败：invalid-argument
+    原因：open(/dev/ttyACM0, O_RDWR) 失败：Permission denied (errno=13)，
+          权限不足：把当前用户加入 dialout 组（sudo usermod -aG dialout $USER，
+          重新登录生效），或本次用 sudo 运行
+  ```
+
+  常见 errno 都已配好“下一步该做什么”：`EACCES/EPERM`（权限）、`ENOENT`（节点不在，
+  插拔后可能变成 `ttyACM1`）、`EBUSY`（被 `slcand`/`candump` 占着）、`ENOTTY`
+  （不是串口）、`ENXIO/EIO`（已断开）。
+
+#### Linux 上从 `slcand` 换到 SDK 直连 slcan
+
+`slcand` 与 SDK 是**两种互斥的用法**：前者把适配器接管成 SocketCAN 的 `can0`
+（内核拥有它），后者由 SDK 直接读那个串口。切换顺序不能少：
+
+```bash
+sudo ip link set down can0        # 1) 先停接口
+sudo pkill slcand                 # 2) 再放掉串口（不放掉会 EBUSY）
+ls -l /dev/ttyACM0                # 3) 看一眼权限：通常是 root:dialout 660
+./build/jsdk-cli --if slcan --channel /dev/ttyACM0 scan
+```
+
+要点：
+
+- **权限**：`/dev/ttyACM0` 一般属于 `dialout` 组。把自己加进去
+  （`sudo usermod -aG dialout $USER`，**重新登录**生效）或本次用 `sudo` 跑。
+  用 `slcand` 时是 `sudo` 开的，很容易忘记 SDK 这条也需要。
+- **CAN 段波特率由适配器自己持有**，SDK 打开时只发 `C`（关闭态）→ [`Y<n>`] → `O`
+  （打开通道），**不设置** CAN 段速率。之前用 `slcand -s8` 配过 1 Mbps 就会留在
+  适配器里；要改成别的速率请用厂家工具（或再跑一次 `slcand -s<n>`）配好。
+- `--baud` 是**串口**速率（适配器通常 115200，CDC 下甚至被忽略），**不是** CAN 速率；
+  `--bitrate` 对 slcan 无意义（CLI 会提示）。
+- 要跑 **CAN FD** 再加 `--data-bitrate 5000000`（或 `0` = 不碰适配器配置）。
+- ⚠⚠ **Classic 还是 FD 由设备自己决定，协议没有运行时协商**（`can.config.baud_rate`）。
+  现场真实例子：一套 **CyberBeast USB2CAN（`/dev/ttyACM0`）+ 1 Mbps Classic** 的设备，
+  主机默认按 **FD** 发帧 ⇒ 设备“根本不收”，`desc-info` 报
+  `0/0 bytes, 198 frames received`（心跳收得到、请求没人应，看着特像线缆问题）。
+  现在 SDK 会在收到本关节第一帧时**自动对齐**过去，并打一行提示
+  （`jsdk_context_framing_learned()` 返回 0 未学 / 1 改学 Classic / 2 改学 FD /
+  3 一致 / **4 与显式配置冲突**）。注意那是“猜错补救”，不是“你说了不算”：
+  `cfg.is_fd_explicit = 1`（CLI 的 `--classic` / `--data-bitrate`、Python 传 `is_fd=`）时
+  自动对齐**不会**动你写的值，冲突只报 4 —— 否则调用者看到的 cfg 与实际发出的帧不一致，
+  而且 8 字节参数的分块读（FD 一次 ≤8 B / Classic 一次 ≤4 B）就是靠 `is_fd` 的。
+  两个方向的后果**不对称**：对端 Classic + 我们发 FD ⇒ 设备**收不到**（必失败）；
+  对端 FD + 我们发 Classic ⇒ FD 控制器收得下经典帧（命令能跑，但退化成两次请求）。
+- 描述符下载在 Classic 下是 **1+6906 帧**（FD 是 1+662，10.4 倍）。`--timeout` 是
+  “**多久没有新字节**”的静默预算（不是总时长），默认 5 s/CLI 3 s 都够；实现见
+  `jsdk_desc.c` 的 `desc_fetch_from()`（外加 120 s 总时长兜底）。
+- 用 `socketcan` 后端（即保留 `slcand`、`can0` 那套）也可以：`--if socketcan
+  --channel can0` —— 那是“内核管链路”的路线，与本文这条二选一。
 
 ### 7.5.3 真链路冒烟：自动能跑的部分 + 必须人工的部分
 
@@ -977,7 +1033,8 @@ say(stdout, jsdk_context_last_error(ctx));               /* 替代 printf("%s", 
 | 1 | `send`/`recv`/`now_ms` 三个必要回调已实现，且 `send`/`recv` 非阻塞 | |
 | 2 | 29-bit **扩展帧**已正确设置（`id` 不含 EFF 标志位，硬件 EFF 已开） | |
 | 3 | FD 的 `DataLength` 使用了 **DLC 编码**而非字节数 | |
-| 4 | `is_fd` 与设备 `can.config.baud_rate` 一致（Classic ≤1 Mbps） | |
+| 4 | `is_fd` 与设备 `can.config.baud_rate` 一致（Classic ≤1 Mbps）。⚠ 不确定就**不要**置 `cfg.is_fd_explicit`：留 0 时 SDK 会按对端帧自动对齐；置 1 且写错就是必失败（设备不收 FD 帧） | |
+| 4b | 仿真 / HIL 后端：配成 Classic 的节点必须**真的丢掉 FD 帧**（别比真机宽容），否则“帧格式猜错”这类测试会碰巧通过 | |
 | 5 | RX 环形队列 ≥128（FD）/ ≥256（Classic），溢出丢最旧帧并计数 | |
 | 6 | `now_ms` 单调，`uint32_t` 回绕安全 | |
 | 7 | `master_id` ≠ 0 | |

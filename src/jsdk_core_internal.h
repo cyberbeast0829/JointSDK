@@ -249,7 +249,11 @@ struct jsdk_context {
     cb_desc_fetch_t   fetch;
     int               fetch_active;   /**< cb_desc_fetch 已被 init（需避免二次 init） */
     uint32_t          fetch_deadline_ms;
+    uint32_t          fetch_bytes_seen; /**< 非阻塞路径的上一次进展字节数（静默预算用） */
     uint8_t           desc_present;   /**< 1 = 端点表可用（configure 不再下载） */
+    /** 对端帧格式的学习结果：0 = 未知，1 = 已改为 Classic，2 = 已改为 FD，
+        3 = 与配置一致（无需调整）。见 `jsdk_context_framing_learned()`。 */
+    uint8_t           framing_learned;
     jsdk_desc_info_t  desc;           /**< 对外元信息；crc/fw 同时是缓存键 */
 
     /**

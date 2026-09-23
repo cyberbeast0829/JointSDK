@@ -148,6 +148,26 @@ JSDK_API jsdk_status_t jsdk_hal_slcan_open(jsdk_can_hal_t *hal, jsdk_hal_handle_
 JSDK_API int jsdk_hal_slcan_supports_fd(void);
 
 /**
+ * 上一次 `jsdk_hal_slcan_open()` 失败的**原因**（人可读，含 errno/错误码与建议）。
+ *
+ * @return 以 NUL 结尾的字符串；从未失败（或刚成功打开）时为空串 `""`
+ *
+ * 为什么需要它：打开失败时**没有句柄**可挂诊断信息（句柄已释放），返回码只有
+ * `JSDK_ERR_INVALID_ARG` —— 现场（Ubuntu 上忘了 `sudo` → `EACCES`）只能看到
+ * “invalid-argument”，分不清**权限不足 / 设备不存在 / 被占用**。
+ * 这条把 `strerror()` 与“下一步该做什么”一起带出来，例如：
+ *
+ * ```
+ * open(/dev/ttyACM0, O_RDWR) 失败：Permission denied (errno=13)，
+ * 权限不足：把当前用户加入 dialout 组（sudo usermod -aG dialout $USER，
+ * 重新登录生效），或本次用 sudo 运行
+ * ```
+ *
+ * @note 非线程安全（文件级缓冲，诊断用）；每次 `open()` 开头重置。
+ */
+JSDK_API const char *jsdk_hal_slcan_last_open_error(void);
+
+/**
  * 取当前 FD 速率配置。
  * @param enabled 输出：是否已向适配器发过 `Y<n>`（0 = 没碰过适配器配置）
  * @param bitrate 输出：已设置的数据段速率（bps）；`enabled=0` 时为 0

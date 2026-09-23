@@ -896,6 +896,25 @@ static void handle_frame_for_node(sim_bus_t *b, sim_node_t *n,
     int classic = !(f->flags & JSDK_FRAME_FD);
     int is_ctrl;
 
+    /*
+     * ⚠ **帧格式门限**：仿真器不能比真机宽容。
+     *
+     * 配成 Classic 的节点**收不到 FD 帧** —— 真实 CAN 控制器解析不了 FD 帧
+     * （收到就是总线错误），现场症状正是“心跳收得到、但我的请求没人应”
+     * （真机：1 Mbps Classic 设备 + SDK 默认发 FD ⇒ `desc-info` 报
+     * `0/0 bytes, 198 frames received`）。主站靠**自动对齐**自救，见
+     * `jsdk_context_framing_learned()`。
+     * 若这里放行，测试就会在“帧格式猜错”的情况下依然通过 —— 那正是把最早那轮
+     * 排查拖长的原因（“仿真器必须复刻固件的门限”）。
+     *
+     * 反方向（FD 节点收经典帧）是**真的允许**的：CAN FD 控制器兼容经典帧，
+     * 所以只拦 FD → Classic 这一个方向。
+     */
+    if (!n->is_fd && (f->flags & JSDK_FRAME_FD)) {
+        b->fd_into_classic_drops++;
+        return;
+    }
+
     n->last_control_msgtype = msgtype;
 
     /* `is_ctrl`：与固件一致，只含 0x00~0x03 与 0x80~0x83 */
@@ -1178,7 +1197,7 @@ void sim_tick(sim_bus_t *b, uint32_t now_ms)
         b->now_ms = t;
 
         /* 描述符传输优先于心跳（与固件 service_stack 的次序一致） */
-        desc_pump(b, SIM_JSON_FRAMES_PER_CYCLE);
+        desc_pump(b, b->desc_rate ? b->desc_rate : SIM_JSON_FRAMES_PER_CYCLE);
 
         for (i = 0u; i < b->n_nodes; ++i) {
             sim_node_t *n = &b->nodes[i];
@@ -1481,6 +1500,11 @@ sim_node_t *sim_find_node(sim_bus_t *b, uint32_t node_id)
         if (b->nodes[i].node_id == node_id) return &b->nodes[i];
     }
     return NULL;
+}
+
+void sim_set_desc_rate(sim_bus_t *b, uint32_t frames_per_ms)
+{
+    if (b) b->desc_rate = frames_per_ms;
 }
 
 void sim_clear_stats(sim_bus_t *b)

@@ -112,11 +112,11 @@ python -c "d=open('gbk.bin','rb').read();print(d[:4].hex(' '), d.decode('gbk')[:
 | `--bitrate N` | CAN **仲裁段**波特率（默认 1000000，仅用于校验/初始化） |
 | `--data-bitrate N` | CAN FD **数据段**波特率（默认 5000000；写 `0` 或加 `--classic` 用 Classic） |
 | `--baud N` | **串口**波特率（**仅 slcan**，默认 115200）。与 `--bitrate` 不是同一个量 |
-| `--classic` | 强制 Classic CAN |
+| `--classic` | 强制 Classic CAN。⚠ 传了它就是**明确指定**：SDK 的自动对齐（见下行）**不会**再改你的选择，两者冲突时只打一行警告；不传则先按 FD 试、收到本关节第一帧时对齐到对端 |
 | `--master-id N` | 主站源地址（默认 1；**禁止 0** —— 设备完全不回复） |
 | `--node N` | 目标节点 ID（默认 1） |
 | `--probe N` | `scan` 的主动探测上限（默认 16，`0` = 仅被动听心跳） |
-| `--timeout MS` | 单次操作超时（默认 3000） |
+| `--timeout MS` | 单次操作超时（默认 3000）。⚠ 对**描述符下载**而言它是“**多久没有新字节**”的**静默预算**，不是总时长 —— 描述符是流式的，Classic 下是 6906 帧（FD 的 10.4 倍），按总时长算会把一条一直在推进的流误判成超时 |
 | `--json` | 机器可读输出（字段名见 §5，Python 绑定与 CI 依赖它们） |
 | `--rate-hz N` | `mon` 的采样率（默认 10） |
 | `--duration S` | 运行时长，`0` = 直到 Ctrl-C |
@@ -432,9 +432,12 @@ jsdk-cli --if virtual scan --json
 
 | 现象 | 原因 | 现在的处理 |
 |---|---|---|
+| **Linux**：`打开 slcan(/dev/ttyACM0) 失败：invalid-argument` | 一个字面信息都没有的返回码，真因通常是**权限**（`/dev/ttyACM0` 属 `dialout`，而 `slcand` 是 `sudo` 起的，容易忘了 SDK 这条也要）、设备不存在、或**被 `slcand`/`candump` 占着** | 失败时多打一行 `原因：…`（`jsdk_hal_slcan_last_open_error()` 带着 errno 与建议）：`EACCES → 加进 dialout 组或用 sudo`、`ENOENT → ls /dev/ttyACM*`、`EBUSY → 先 pkill slcand`。切换步骤见 `PORTING.zh-CN.md` §7.5.2 |
 | 第一次跑 `configure()/desc-info` 超时，再跑一次就好 | 适配器打开端口后头几帧被丢 | ① `hal_slcan` 的 `C`/`Y<n>`/`O` **等适配器 ACK，没 ACK 就重发**；② 描述符请求按 **0.25/0.6/1.2 s** 递增间隔**重发 3 次**（设备对 `0x24` 幂等）。修后实测：`desc-info` **20/20**、`health` **12/12**（修前约 1/10 失败） |
 | 超时信息里有 `0/0 bytes, 0 frames received` | 通道层面：一帧都没收到 | 这是**明确诊断**，不是"设备慢"：查端口/终端电阻/bitrate/上电 |
 | 超时信息里有 `0/0 bytes, N frames received`（N>0） | 通道是通的，但请求没到达设备 | 重发已用尽：查适配器固件、或设备是否在过滤该 MsgType |
+| **Linux/Classic 设备**：`desc-info` 报 `0/0 bytes, 198 frames received`，而 `candump` 能看到心跳 | **对端是 Classic，而我们默认发 FD**（协议没有运行时协商，设备用哪种 格式由它自己的 `can.config.baud_rate` 决定） | SDK 现在会**自动对齐**到对端格式并在 stderr 提醒（`jsdk_context_framing_learned()`：1 = 改学 Classic / 2 = 改学 FD / 3 = 一致 / 4 = 你显式指定的与对端冲突）。**不传** `--classic`/`--data-bitrate` 时才会自动对齐；显式写错只警告不改（你说了算） |
+| 显式 `--classic` 打 FD 设备（或反过来） | 自动对齐**不允许**改显式配置（否则你看到的 cfg 与实际发出的帧不一致；8 字节参数的分块读就靠 `is_fd`） | FD 对端 + `--classic`：命令能跑（FD 控制器收得下经典帧），但 8 字节参数退化成两次请求；Classic 对端 + `--data-bitrate`：**必失败**（设备收不到 FD 帧，且**描述符加载失败时警告照样会打**） |
 
 ---
 

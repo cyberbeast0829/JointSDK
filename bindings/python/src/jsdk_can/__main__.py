@@ -841,10 +841,48 @@ def _force_utf8_when_redirected() -> None:
             pass
 
 
+def _warn_framing(ctx: Context, args) -> None:
+    """对端帧格式与我们的配置不一致时，**说出来**（与 C 版 jsdk-cli 同一句）。
+
+    协议没有运行时协商：设备是 Classic 还是 FD 由它自己配。猜错的后果是
+    “收得到心跳、但请求没人应”（现场为此查了很久），所以 SDK 会对齐过去，
+    这里负责把“我改了你的格式 + 下次请显式写对”报出来。
+
+    ⚠ ``got == 4`` 是另一回事：你**显式**指定了格式（``--classic`` /
+      ``--data-bitrate``），SDK 不允许偷偷改掉它，于是命令很可能失败 ——
+      这种情形必须告诉用户改哪个选项，否则依旧只能看到“请求没人应”。
+    """
+    got = ctx.framing_learned
+    if got in (1, 2):
+        what = "Classic" if got == 1 else "CAN FD"
+        flag = "--classic" if got == 1 else "--data-bitrate 5000000"
+        print(f"jsdk_can: [注意] 对端在发 {what} 帧，已自动按 {what} 发送"
+              f"（本次 cfg.is_fd 猜错了）。下次请显式传 {flag}。", file=sys.stderr)
+    elif got == 4:
+        # 显式指定的格式与对端冲突。两个方向都得说（与 C 版 jsdk-cli 同一句话）：
+        #   ① 对端 Classic、我们发 FD → 设备收不到我们的帧，命令必失败；
+        #   ② 对端 FD、我们发 Classic → FD 控制器收得下 8 B 经典帧，命令能过，
+        #      但 8 字节参数退化成两次请求（且白丢 FD 带宽）。
+        ours_fd = not args.classic and args.data_bitrate != 0
+        if ours_fd:
+            print("jsdk_can: [警告] 对端在发 Classic 帧，而你**显式指定**了 CAN FD"
+                  "（--data-bitrate）：设备收不到我们的帧，本次请求会全部超时。"
+                  "请改用 --classic。", file=sys.stderr)
+        else:
+            print("jsdk_can: [警告] 对端在发 CAN FD 帧，而你**显式指定**了 --classic："
+                  "命令能跑，但 8 字节参数会退化成两次请求（白丢 FD 带宽）。"
+                  "若非本意，去掉 --classic 让 SDK 自动对齐。", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     """``python -m jsdk_can`` 的入口。返回进程退出码（与 ``jsdk-cli`` 一致）。"""
     _force_utf8_when_redirected()
-    args = _apply_defaults(_parser().parse_args(argv))
+    ns = _parser().parse_args(argv)
+    # ⚠ 必须在 `_apply_defaults()` **之前**看一眼“用户到底写没写帧格式”：
+    #   补完默认值以后 `--data-bitrate` 就“总是有值”了，分不出“默认 FD”
+    #   与“用户明确要 FD”（两者对自动对齐的语义不同，见 joint_sdk.h）。
+    fd_explicit = bool(getattr(ns, "classic", False)) or hasattr(ns, "data_bitrate")
+    args = _apply_defaults(ns)
 
     # --- 安全闸：**在碰总线之前**判完 ---
     # 顺序很重要：不满足闸门时不能打开后端（否则“被拒绝”的命令还是会碰设备）。
@@ -867,18 +905,29 @@ def main(argv: list[str] | None = None) -> int:
     period_ns = int(1e9 / max(1, args.rate_hz)) if args.cmd in LOOP_CMDS else 0
 
     try:
-        with Context(hal, master_id=args.master_id, is_fd=is_fd,
+        with Context(hal, master_id=args.master_id,
+                     is_fd=(is_fd if fd_explicit else None),
                      period_ns=period_ns,
                      state_timeout_ms=int(getattr(args, "state_timeout_ms", 0))) as ctx:
             ctx.add_joint(args.node, mode=Mode.MIT)
-            # 三档前置（与 jsdk-cli 一致）：
-            #   ① 不下载描述符 ② 只下描述符（不标定）③ 完整配置（含标定）
-            if args.cmd not in NO_DESC_CMDS:
-                if args.cmd in DESC_ONLY_CMDS:
-                    ctx.desc_fetch()
-                else:
-                    ctx.configure()
-            return _HANDLERS[args.cmd](ctx, args)
+            # ⚠ 帧格式报告要**在描述符加载之后、异常处理之前**打：
+            #   “格式猜错”正是“下载 0 字节但心跳正常”的头号原因，而这个分支
+            #   恰恰是最需要那句提示的时候（早先只在成功路径上打，于是用户
+            #   只能看到一条超时）。与 C 版 jsdk-cli 同一句。
+            try:
+                # 三档前置（与 jsdk-cli 一致）：
+                #   ① 不下载描述符 ② 只下描述符（不标定）③ 完整配置（含标定）
+                if args.cmd not in NO_DESC_CMDS:
+                    if args.cmd in DESC_ONLY_CMDS:
+                        ctx.desc_fetch()
+                    else:
+                        ctx.configure()
+                rc = _HANDLERS[args.cmd](ctx, args)
+            except JsdkError as exc:
+                _warn_framing(ctx, args)
+                raise exc
+            _warn_framing(ctx, args)
+            return rc
     except JsdkError as exc:
         if args.json:
             print(json.dumps({"error": {"op": exc.op, "status": exc.name(),
@@ -886,6 +935,13 @@ def main(argv: list[str] | None = None) -> int:
                                         "message": exc.detail}},
                              ensure_ascii=False))
         print(f"jsdk_can: {exc}", file=sys.stderr)
+        # slcan 的 "invalid-argument" 什么也没说（权限 / 设备不存在 / 被占用都会
+        # 落到同一个返回码）→ 把后端记下的原因补上去，与 C 版 jsdk-cli 一致。
+        if getattr(args, "iface", "") == "slcan":
+            hal = locals().get("hal")
+            why = getattr(hal, "last_open_error", lambda: "")() if hal else ""
+            if why:
+                print(f"  原因：{why}", file=sys.stderr)
         return EXIT_RUNTIME
 
 

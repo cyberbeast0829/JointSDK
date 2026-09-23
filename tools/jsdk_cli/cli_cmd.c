@@ -1808,16 +1808,62 @@ int jsdk_cli_run(int argc, char **argv, FILE *out, FILE *err)
      * 端点表：
      *   FULL → configure()（描述符 + 标定）；
      *   ONLY → 只下描述符（标定失败也能看端点表）。
+     *
+     * ⚠⚠ 描述符加载失败时**也得**走到下面的“帧格式报告”（所以这里只记 rc，
+     *   不提前 return）。帧格式猜错正是“下载 0 字节但心跳正常”的头号原因，
+     *   而这个分支恰恰是最需要把那句话打出来的时候 —— 早先直接 return，
+     *   于是用户只能看到一条超时，而那正是一整轮排查被拖长的原因。
      */
     {
         int dm = c->desc_mode;
         if (dm != CLI_DESC_NONE && cli_load_desc(&a, dm == CLI_DESC_FULL) != 0) {
-            cli_close(&a);
-            return CLI_EXIT_FAIL;
+            rc = CLI_EXIT_FAIL;
+        } else {
+            rc = c->fn(&a);
         }
     }
 
-    rc = c->fn(&a);
+    /*
+     * ⚠ 对端帧格式与我们的配置不一致时要**说出来**（协议没有运行时协商）：
+     *   猜错的后果是“收得到心跳、但请求没人应”（真机实测：1 Mbps Classic 的设备
+     *   + 默认发 FD ⇒ `desc-info` 报 `0/0 bytes, 198 frames received`，
+     *   非常像线缆/波特率问题）。SDK 已经对齐过去，这里负责报告 + 告知下次怎么写。
+     *
+     * ⚠⚠ 但**显式指定过格式**时（`--classic` / `--data-bitrate`）SDK 不会改它
+     *   （改掉就成了“你说了不算”），此时报的是 got == 4：“你写的与对端冲突” ——
+     *   这种情形命令照样可能失败，所以必须说清楚该删/该加哪个选项。
+     */
+    {
+        int got = a.ctx ? jsdk_context_framing_learned(a.ctx) : 0;
+
+        if (got == 1 || got == 2) {
+            cli_fprintf(err,
+                "jsdk-cli: [注意] 对端在发 %s 帧，已自动按 %s 发送"
+                "（本次的 is_fd 猜错了）。下次请显式传 %s。\n",
+                got == 1 ? "Classic" : "CAN FD",
+                got == 1 ? "Classic" : "CAN FD",
+                got == 1 ? "--classic" : "--data-bitrate 5000000");
+        } else if (got == 4) {
+            /*
+             * 显式指定的格式与对端**冲突**。两个方向都得说（真机 + 仿真都验过）：
+             *   ① 对端 Classic、我们发 FD → 设备**收不到**我们的帧，命令必失败；
+             *   ② 对端 FD、我们发 Classic → FD 控制器（及适配器）收得下 8 B 经典帧，
+             *      命令**能过**，但 8 字节参数退化成两次请求，且白丢 FD 的带宽。
+             * 所以这里不说“必定失败”，只说清事实 + 该删/该改成什么。
+             */
+            if (a.fd) {
+                cli_fprintf(err,
+                    "jsdk-cli: [警告] 对端在发 Classic 帧，而你**显式指定**了 CAN FD"
+                    "（--data-bitrate）：设备收不到我们的帧，本次请求会全部超时。"
+                    "请改用 --classic。\n");
+            } else {
+                cli_fprintf(err,
+                    "jsdk-cli: [警告] 对端在发 CAN FD 帧，而你**显式指定**了 --classic："
+                    "命令能跑，但 8 字节参数会退化成两次请求（白丢 FD 带宽）。"
+                    "若非本意，去掉 --classic 让 SDK 自动对齐。\n");
+            }
+        }
+    }
 
     cli_close(&a);
     return rc;

@@ -219,6 +219,10 @@ typedef struct {
     size_t     n_nodes;
     uint32_t   now_ms;
     uint32_t   last_tick_ms;
+    /** 描述符流速率（帧/ms）；0 = 默认 `SIM_JSON_FRAMES_PER_CYCLE`。
+        用来复现“**流得很慢但一直在动**”（真机 Classic 就是 FD 的 10.4 倍帧数）——
+        那种情况下按“总时长”算的预算会误判成超时。 */
+    uint32_t   desc_rate;
 
     /* 出站帧队列（模型 → HAL → SDK 接收路径） */
     jsdk_can_frame_t txq[SIM_TX_QUEUE];
@@ -231,6 +235,10 @@ typedef struct {
     uint32_t rx_for_me;
     uint32_t tx_frames;
     uint32_t bad_len_drops;
+    /** 被“帧格式门限”丢掉的帧数：配成 **Classic** 的节点收到 FD 帧（真实控制器
+        解析不了 FD 帧，现场表现就是“心跳收得到、请求没人应”）。
+        有它才能让测试断言“请求**确实**被丢了”，而不是刚好被宽容地放过。 */
+    uint32_t fd_into_classic_drops;
     uint32_t unhandled;
 
     /* JSON 描述符（0x24 / 0x25） */
@@ -340,6 +348,9 @@ sim_node_t *sim_find_node(sim_bus_t *b, uint32_t node_id);
 
 /** 清空统计与故障注入（不清节点状态）。 */
 void sim_clear_stats(sim_bus_t *b);
+
+/** 设置描述符流速率（帧/ms）；0 = 恢复默认。用于“慢但持续”的流。 */
+void sim_set_desc_rate(sim_bus_t *b, uint32_t frames_per_ms);
 
 #ifdef __cplusplus
 }

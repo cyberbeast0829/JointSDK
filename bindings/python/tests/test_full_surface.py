@@ -697,3 +697,65 @@ def test_every_subcommand_runs_on_virtual_c_cli(args, tmp_path):
                         capture_output=True, text=True, encoding="utf-8",
                         errors="replace", timeout=120)
     assert cp.returncode == 0, f"C 版 {' '.join(args)} 失败：{cp.stderr}"
+
+
+def test_cli_learns_peer_framing(lib_dir):
+    """对端是 Classic 而我们默认 FD 时，要**自动改学并说出来**。
+
+    现场（Ubuntu + CyberBeast USB2CAN @ 1 Mbps）：`desc-info` 报
+    `0/0 bytes, 198 frames received` —— 心跳收得到、我们的请求却没人应，
+    因为设备是 Classic 而 SDK 默认发 FD（协议**没有**运行时协商）。
+    """
+    ch_classic = "0:id=1,gear=16.5,hb=10,timeout=30000,classic"
+    r = run_module("--if", "virtual", "--channel", ch_classic, "--json",
+                   "read", "axis0.motor.config.gear_ratio", lib_dir=lib_dir)
+    assert r.returncode == 0, r.stderr
+    assert "对端在发 Classic 帧" in r.stderr
+    assert "--classic" in r.stderr
+
+    # 与配置一致时不该有那句提示
+    r = run_module("--if", "virtual", "--json", "--channel",
+                   "0:id=1,gear=16.5,hb=10,timeout=30000,fd",
+                   "read", "axis0.motor.config.gear_ratio", lib_dir=lib_dir)
+    assert r.returncode == 0, r.stderr
+    assert "对端在发" not in r.stderr
+
+
+def test_explicit_framing_is_not_silently_overridden(lib_dir):
+    """**显式**指定帧格式不能用“自动学”偷偷改掉，否则必须报警。
+
+    背景：自动对齐只是“猜错补救”。若它默默覆盖了调用者显式写的值，
+    调用者看到的 cfg 与实际发出的帧就不一致了 —— 而 8 字节参数的分块读
+    正是**依赖** `is_fd` 的（FD 一次 8 B / Classic 一次 4 B）。
+
+    ⚠ 两个方向的后果**不对称**（仿真与真机都验过）：
+      * 对端 Classic + 我们显式 FD → 设备**收不到** FD 帧，命令必失败；
+      * 对端 FD + 我们显式 --classic → FD 控制器收得下经典帧，命令**能过**，
+        但 8 字节参数退化成两次请求 —— 所以只是提醒，不是失败。
+    """
+    ch_classic = "0:id=1,gear=16.5,hb=10,timeout=30000,classic"
+    ch_fd = "0:id=1,gear=16.5,hb=10,timeout=30000,fd"
+
+    # 对端 Classic + 我们显式 FD → 失败，而且要说清“收不到”
+    r = run_module("--if", "virtual", "--data-bitrate", "5000000", "--json",
+                   "--channel", ch_classic,
+                   "read", "axis0.motor.config.gear_ratio", lib_dir=lib_dir)
+    assert r.returncode != 0, "对端根本不收 FD 帧，本就该失败"
+    assert "显式指定" in r.stderr, r.stderr
+    assert "--classic" in r.stderr, r.stderr
+
+    # 对端 FD + 我们显式 --classic → 能过，但要有提示
+    r = run_module("--if", "virtual", "--classic", "--json", "--channel", ch_fd,
+                   "read", "axis0.motor.config.gear_ratio", lib_dir=lib_dir)
+    assert r.returncode == 0, r.stderr
+    assert "显式指定" in r.stderr, r.stderr
+    assert "退化成两次请求" in r.stderr, r.stderr
+
+
+def test_explicit_framing_that_matches_is_quiet(lib_dir):
+    """显式写对时既不报警也不失联（与自动学的结果一致性）。"""
+    r = run_module("--if", "virtual", "--classic", "--json", "--channel",
+                   "0:id=1,gear=16.5,hb=10,timeout=30000,classic",
+                   "read", "axis0.motor.config.gear_ratio", lib_dir=lib_dir)
+    assert r.returncode == 0, r.stderr
+    assert "对端在发" not in r.stderr and "显式指定" not in r.stderr

@@ -326,6 +326,25 @@ size_t jsdk_context_joint_size(void) { return sizeof(jsdk_joint_t); }
  * ======================================================================== */
 
 /**
+ * 对端帧格式（Classic / FD）的学习结果。
+ *
+ * 协议**没有**运行时协商：设备用哪种格式完全由它自己的 `can.config.baud_rate`
+ * 决定。主站猜错时，发出去的帧设备**根本不收**，现场只表现为
+ * “收到一堆帧（心跳），但我的请求没人应”。所以 SDK 在第一次收到本关节的帧时
+ * 会把格式对齐过去（见 `jsdk_ctx_handle_frame()`），并把这个结果暴露出来
+ * 让 CLI / 客户如实报告“我改了你的格式”。
+ *
+ * @return 0 = 还没收到过本关节的帧；1 = 已从 FD 改为 **Classic**；
+ *         2 = 已从 Classic 改为 **FD**；3 = 与配置一致（无需调整）；
+ *         4 = **显式配置与对端冲突**（格式未改动）
+ */
+int jsdk_context_framing_learned(const jsdk_context_t *ctx)
+{
+    if (!ctx) return 0;
+    return (int)ctx->framing_learned;
+}
+
+/**
  * 处理一帧设备→主站的帧。
  *
  * @return 1 = 已消费；0 = 与本主站无关（丢弃）
@@ -343,6 +362,45 @@ int jsdk_ctx_handle_frame(jsdk_context_t *ctx, const jsdk_can_frame_t *f)
     ctx->bus.last_rx_age_ms = 0u;
     ctx->bus.link_up = 1u;
     ctx->last_rx_ms  = ctx->now_ms;
+
+    /*
+     * 学一次对端的**帧格式**（Classic vs FD）。
+     *
+     * 协议**没有**运行时协商：设备用哪种格式完全由它自己的 `can.config.baud_rate`
+     * 决定，主站猜错就是“发出去的帧它根本不收” —— 现场只表现为
+     * “收到一堆帧（心跳），但我的请求没人应”（真机实测：1 Mbps Classic 的设备 +
+     * 我们默认发 FD ⇒ `desc-info` 报 `0/0 bytes, 198 frames received`）。
+     *
+     * 所以在**第一次**收到本关节发来的帧时，把主站的格式对齐过去，并记下“已学习”
+     * （`jsdk_context_framing_learned()` 供 CLI / 客户报告，见 joint_sdk.h）。
+     * ⚠ 只学一次，而且只认**我们关节的 node_id**：总线上别人的帧不该改我们的格式。
+     *
+     * ⚠⚠ 但**显式配置优先**：`cfg.is_fd_explicit` 置位时（CLI `--classic` /
+     * `--data-bitrate`、Python `is_fd=`）绝不动调用者写的值，只报告“冲突”（返回 4）。
+     * 理由：自动对齐只是个“猜错补救”，不能变成“你说了不算”——
+     * 若悄悄改掉显式配置，调用者看到的 cfg 与实际发出的帧不一致，
+     * 而且 8 字节参数的分块读也依赖 `is_fd`（FD 一次 8 B / Classic 一次 4 B）。
+     */
+    if (ctx->framing_learned == 0u) {
+        unsigned k;
+
+        for (k = 0u; k < ctx->nj; ++k) {
+            if (ctx->joints[k].cfg.node_id == src) {
+                uint8_t peer_fd = (f->flags & JSDK_FRAME_FD) ? 1u : 0u;
+                uint8_t cfg_fd  = ctx->cfg.is_fd ? 1u : 0u;
+
+                if (peer_fd == cfg_fd) {
+                    ctx->framing_learned = 3u;                  /* 3 = 与配置一致 */
+                } else if (ctx->cfg.is_fd_explicit) {
+                    ctx->framing_learned = 4u;   /* 4 = 冲突：保留调用者的选择 */
+                } else {
+                    ctx->cfg.is_fd       = peer_fd;
+                    ctx->framing_learned = peer_fd ? 2u : 1u;   /* 1 = 改学 Classic */
+                }
+                break;
+            }
+        }
+    }
 
     /* 寻址：设备只会以 dest = master_id 单播回复；广播告警除外 */
     if (dst != ctx->cfg.master_id && !(cb_id_is_broadcast(f->id) && dst == CB_ADDR_BROADCAST)) {

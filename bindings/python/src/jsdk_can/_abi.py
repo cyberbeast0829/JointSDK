@@ -135,6 +135,7 @@ class ContextConfig(ctypes.Structure):
         ("hal", CanHal),
         ("master_id", c_uint8),
         ("is_fd", c_uint8),
+        ("is_fd_explicit", c_uint8),
         ("period_ns", c_uint32),
         ("state_timeout_ms", c_uint32),
         ("auto_keepalive", c_uint8),
@@ -539,6 +540,7 @@ _FUNCS: dict[str, tuple[list, object]] = {
     "jsdk_hal_slcan_open": ([POINTER(CanHal), POINTER(c_void_p), c_char_p,
                              c_uint32, c_uint32], c_int),
     "jsdk_hal_slcan_supports_fd": ([], c_int),
+    "jsdk_hal_slcan_last_open_error": ([], c_char_p),
     "jsdk_hal_slcan_fd_config": ([c_void_p, POINTER(c_int),
                                   POINTER(c_uint32)], None),
     "jsdk_hal_slcan_fd_frames": ([c_void_p, POINTER(c_uint32),
@@ -562,6 +564,7 @@ _FUNCS: dict[str, tuple[list, object]] = {
     "jsdk_context_cycle_begin": ([c_void_p, c_uint64], c_int),
     "jsdk_context_cycle_end": ([c_void_p], c_int),
     "jsdk_context_poll": ([c_void_p, c_uint64], c_int),
+    "jsdk_context_framing_learned": ([c_void_p], c_int),
     # --- 总线 ---
     "jsdk_context_discover": ([c_void_p, POINTER(c_uint8), c_int,
                                POINTER(c_int), c_uint8], c_int),

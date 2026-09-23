@@ -398,7 +398,13 @@ typedef struct {
                                         实际是否启用见 cb_desc_fetch_result_t.stop_allowed */
     uint16_t max_endpoints;        /**< 解析上限（防异常固件），0 = 2048 */
     uint16_t max_path_len;         /**< 单条路径长度上限（含 '\0'），0 = 128 */
-    uint32_t timeout_ms;           /**< 下载 + 解析总超时，0 = 5000 */
+    uint32_t timeout_ms;           /**< **静默（卡死）预算**：多久没有新字节就算失败，0 = 5000。
+                                        ⚠ 不是“总时长”：描述符是**流式**的，同一个
+                                        38433 B 的描述符 FD 是 1+662 帧、**Classic 是
+                                        1+6906 帧（10.4 倍）**；按总时长算会在 Classic
+                                        下把一条一直在推进的流误判成超时（真机实测：
+                                        85% 处被 3000 ms 预算截断）。另有一条
+                                        `JSDK_DESC_TOTAL_MAX_MS`(120 s) 总时长兜底。 */
     const char *const *filter_paths; /**< RETAIN_FILTERED 时必须提供 */
     unsigned filter_count;
     void    *arena;                /**< 解析区，**必需**：本 SDK 不做堆分配。
@@ -459,8 +465,13 @@ typedef struct {
     jsdk_can_hal_t hal;             /**< 必需。会在 init 时被复制。 */
 
     uint8_t  master_id;             /**< 主站源地址 1..254。**禁止 0**（设备将完全不回复）。 */
-    uint8_t  is_fd;                 /**< 1 = CAN FD（默认，1M/5M BRS）；0 = Classic。必须与设备
-                                         can.config.baud_rate 匹配，协议无运行时协商。 */
+    uint8_t  is_fd;                 /**< 1 = CAN FD（默认，1M/5M BRS）；0 = Classic。*/
+    uint8_t  is_fd_explicit;        /**< 1 = 调用者**明确**指定了 `is_fd`（CLI 的 `--classic` /
+                                         `--data-bitrate`、Python 的 `is_fd=` 会置 1）。
+                                         此时自动对齐**不会覆盖**它：与对端冲突只报告
+                                         （`jsdk_context_framing_learned()` 返回 4）。
+                                         0（默认）= `is_fd` 只是猜测，允许 SDK 在收到本
+                                         关节第一帧时自动对齐到对端格式。 */
     uint32_t period_ns;             /**< 期望控制周期（ns），用于 keepalive 与超时判定。0 = 自动。 */
 
     /** 等“状态序列跑完”的预算（ms）：`jsdk_joint_calibrate()` / `jsdk_joint_home()`
@@ -650,6 +661,32 @@ JSDK_API jsdk_status_t jsdk_context_cycle_end(jsdk_context_t *ctx);
 
 /** 裸机 MCU 便利入口：等价于 cycle_begin() + cycle_end()。 */
 JSDK_API jsdk_status_t jsdk_context_poll(jsdk_context_t *ctx, uint64_t app_time_ns);
+
+/**
+ * 对端 CAN 帧格式（Classic / FD）的**学习结果**。
+ *
+ * 协议**没有**运行时协商：设备用哪种格式由它自己的 `can.config.baud_rate` 决定，
+ * 而 `jsdk_context_config_t.is_fd` 只是主站的**猜测**。猜错时发出去的帧设备
+ * **根本不收**，现场只表现为“收得到心跳、但我的请求没人应”。
+ *
+ * 因此 SDK 在**第一次收到本关节发来的帧**时，会把发送格式对齐成对端的格式
+ * （只学一次，且只认自己的 node_id），并通过本函数如实报告。
+ *
+ * ⚠ 若调用者**明确**指定了格式（`cfg.is_fd_explicit = 1`），自动对齐不会覆盖它 ——
+ *   那属于“你写错了”，本函数返回 4 让你报出来（否则你会継续看着
+ *   “心跳收得到、请求没人应”而无从下手）。
+ *
+ * @return 0 = 还没收到过本关节的帧（未学习）；
+ *         1 = 已改为 **Classic**（配置是 FD，对端在发 Classic 帧）；
+ *         2 = 已改为 **FD**（配置是 Classic，对端在发 FD 帧）；
+ *         3 = 与配置一致，无需调整；
+ *         4 = **你明确指定的格式与对端不一致**（帧格式未改动 —— 请改配置）
+ *
+ * @note 客户若显式知道对端格式（例如产线固定 1 Mbps Classic），
+ *       应在 `cfg.is_fd` 里写对（并置 `is_fd_explicit`），把本函数返回的 1/2/4
+ *       当成**配置提醒**打印出来。
+ */
+JSDK_API int jsdk_context_framing_learned(const jsdk_context_t *ctx);
 
 /* ==========================================================================
  * 9. 总线级操作
@@ -1417,6 +1454,26 @@ JSDK_API jsdk_status_t jsdk_hal_slcan_open(jsdk_can_hal_t *hal, jsdk_hal_handle_
  * （客户不必记住哪个后端支持什么）。
  */
 JSDK_API int jsdk_hal_slcan_supports_fd(void);
+
+/**
+ * 上一次 `jsdk_hal_slcan_open()` 失败的**原因**（人可读，含 errno/错误码与建议）。
+ *
+ * @return 以 NUL 结尾的字符串；从未失败（或刚成功打开）时为空串 `""`
+ *
+ * 为什么需要它：打开失败时**没有句柄**可挂诊断信息（句柄已释放），返回码只有
+ * `JSDK_ERR_INVALID_ARG` —— 现场（Ubuntu 上忘了 `sudo` → `EACCES`）只能看到
+ * “invalid-argument”，分不清**权限不足 / 设备不存在 / 被占用**。
+ * 这条把 `strerror()` 与“下一步该做什么”一起带出来，例如：
+ *
+ * ```
+ * open(/dev/ttyACM0, O_RDWR) 失败：Permission denied (errno=13)，
+ * 权限不足：把当前用户加入 dialout 组（sudo usermod -aG dialout $USER，
+ * 重新登录生效），或本次用 sudo 运行
+ * ```
+ *
+ * @note 非线程安全（文件级缓冲，诊断用）；每次 `open()` 开头重置。
+ */
+JSDK_API const char *jsdk_hal_slcan_last_open_error(void);
 
 /**
  * 取当前 FD 速率配置。
