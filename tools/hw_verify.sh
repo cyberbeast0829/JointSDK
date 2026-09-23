@@ -35,7 +35,18 @@
 # 退出码：0 = 所有轮次所有层都通过；1 = 有失败（并打印各层失败详情）；2 = 环境/用法问题
 set -uo pipefail
 
-CLI="${JSDK_CLI:-build/jsdk-cli.exe}"
+: "${JSDK_CLI:=}"
+if [ -n "$JSDK_CLI" ]; then
+    CLI="$JSDK_CLI"
+else
+    # ⚠ 后端名要按平台挑：写死 `build/jsdk-cli.exe` 时，**Linux 上第一次跑必然
+    #   报“找不到可执行文件”**（真机 Ubuntu 实测），而那正是最需要这个脚本的地方。
+    for cand in build/jsdk-cli build/jsdk-cli.exe build/Release/jsdk-cli.exe \
+                build-msvc/Release/jsdk-cli.exe; do
+        if [ -x "$cand" ]; then CLI="$cand"; break; fi
+    done
+    : "${CLI:=build/jsdk-cli}"
+fi
 IFACE="slcan"
 CHANNEL="COM3"
 NODE="1"
@@ -68,8 +79,8 @@ done
 
 if [ ! -x "$CLI" ]; then
     echo "找不到可执行文件：$CLI"
-    echo "先构建：cmake -S . -B build -G \"MinGW Makefiles\" -DJSDK_WERROR=ON -DJSDK_ENABLE_HEAP=ON && cmake --build build"
-    echo "（或用 JSDK_CLI=/path/to/jsdk-cli 指定）"
+    echo "先构建：cmake -S . -B build -DJSDK_WERROR=ON -DJSDK_ENABLE_HEAP=ON && cmake --build build"
+    echo "（Win + MinGW 时产物是 build/jsdk-cli.exe；用 JSDK_CLI=/path/to/jsdk-cli 可指定任意位置）"
     exit 2
 fi
 
