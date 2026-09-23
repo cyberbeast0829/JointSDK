@@ -151,6 +151,10 @@ class Context:
         收到本关节第一帧时自动对齐到对端的实际格式并报告
         （见 :attr:`framing_learned`）。“设备是 Classic 还是 FD”协议无法协商，
         真机上报 ``desc-info`` 超时（`0/0 bytes, N frames received`）多半就是它。
+    :param is_fd_explicit: 高级用法：单独控制“写的格式能不能被自动对齐覆盖”。
+        ``None``（默认）= 按上一条推断。想“**先按 Classic 起步、听准了再对齐**”
+        （推荐做法：FD 控制器也收经典帧，反之不成立）就传 ``is_fd=False,
+        is_fd_explicit=False`` —— 两个 CLI 的自动模式就是这么干的。
     :param desc_retain: 端点保留策略。桌面用 ``ALL``；MCU 用 ``FILTERED``。
     :param desc_filter: ``FILTERED`` 时的路径过滤器（精确 / ``前缀*`` / ``段前缀.`` / ``*``）。
     :param arena_size: 描述符解析区大小；``None`` 用 C 侧推荐值。
@@ -161,6 +165,7 @@ class Context:
     def __init__(self, hal: Hal | None = None, *,
                  master_id: int = 1,
                  is_fd: bool | None = None,
+                 is_fd_explicit: bool | None = None,
                  desc_retain: DescRetain | int = DescRetain.ALL,
                  desc_filter: list[str] | None = None,
                  desc_mode: DescMode | int = DescMode.DYNAMIC,
@@ -192,6 +197,8 @@ class Context:
         # None = “没指定，猜 FD”，允许 SDK 自动对齐；给定值 = 明确要求，不许被改
         # （见 joint_sdk.h 的 is_fd_explicit：改掉显式配置会连带弄错 8 字节参数的分块读）
         self.cfg.is_fd_explicit = 0 if is_fd is None else 1
+        if is_fd_explicit is not None:      # 高级用法：单独控制“能不能被自动对齐覆盖”
+            self.cfg.is_fd_explicit = 1 if is_fd_explicit else 0
         self.cfg.period_ns = int(period_ns)
         # 等状态序列跑完的预算（calibrate/home）：0 = SDK 内置默认（标定 120 s / 回零 5 s）
         self.cfg.state_timeout_ms = int(state_timeout_ms)

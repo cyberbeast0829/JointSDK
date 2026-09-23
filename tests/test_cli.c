@@ -766,30 +766,36 @@ static void test_calibrate_timeout(void)
 }
 
 /**
- * [13] 对端是 Classic 而我们默认 FD 时，必须**自动改学并说出来**。
+ * [13] 帧格式：**没显式指定时，发帧前先听一耳朵**（并且听准了再决定）。
  *
  * 现场（Ubuntu + CyberBeast USB2CAN @ 1 Mbps）：`desc-info` 报
- * `0/0 bytes, 198 frames received` —— 心跳收得到、我们的请求却没人应，
- * 因为设备是 Classic 而 SDK 默认发 FD（协议没有运行时协商）。
- * 现在 SDK 在收到本关节第一帧时对齐过去，CLI 负责提醒下次显式写对。
+ * `0/0 bytes, 198 frames received` —— 心跳收得到、我们的请求却没人应。
+ * 真因不止“格式猜错”：默认发 FD 还会把适配器按 FD 配（slcan 的 `Y5`），
+ * 于是即使随后改学对了，帧也已经发不出去（末尾还提示“已自动按 Classic 发送”）。
+ * 现在的做法：自动模式下**先按 Classic 起步**（FD 控制器兼容经典帧，反之不成立）
+ * → 发帧前只收不发地探测 → 对端是 FD 才重开为 FD。
  */
 static void test_framing_adopt(void)
 {
     run_t r;
     const char *ch_classic = "0:id=1,gear=16.5,hb=10,timeout=30000,classic";
 
-    printf("[13] peer framing (Classic vs FD) is learned and reported\n");
+    printf("[13] peer framing (Classic vs FD) is probed before the first frame\n");
 
-    /* 对端 Classic + 我们 FD → 自动改学，命令照旧成功，并且有提示 */
-    RUN_CLI(&r, "--if", "virtual", "--channel", ch_classic,
+    /* 对端 Classic、我们什么都没写：探测得到 Classic → 全程经典帧，且无警告可用报 */
+    RUN_CLI(&r, "--if", "virtual", "--channel", ch_classic, "-v",
             "--json", "read", "axis0.motor.config.gear_ratio");
     CHECK(r.rc == 0);
-    expect_has(&r, "err", "对端在发 Classic 帧");
-    expect_has(&r, "err", "--classic");
+    expect_has(&r, "err", "(起步：待探测)");     /* 自动模式确实生效 */
+    expect_has(&r, "err", "帧格式：Classic（探测决定）");
+    /* ⚠ 真正的獟牙：**第一帧就是 Classic**（去掉探测就会变 FD → 本项变红） */
+    expect_has(&r, "err", "首发=Classic");
+    CHECK(strstr(r.err, "对端在发") == NULL);     /* 没错过 → 不需要提醒 */
 
-    /* 对端 FD（与配置一致）→ 不该有那句提示 */
-    RUN_CLI(&r, VIF, "--json", "read", "axis0.motor.config.gear_ratio");
+    /* 对端 FD（与默认一致）：探测到 FD → 切到 FD 发送（virtual 不用重开），也不再报 */
+    RUN_CLI(&r, VIF, "-v", "--json", "read", "axis0.motor.config.gear_ratio");
     CHECK(r.rc == 0);
+    expect_has(&r, "err", "探测到对端是 CAN FD");
     CHECK(strstr(r.err, "对端在发") == NULL);
 
     /*
@@ -810,6 +816,12 @@ static void test_framing_adopt(void)
     expect_has(&r, "err", "显式指定");
     expect_has(&r, "err", "--classic");
 
+    /* 显式写错时首发就是错的（对比上面自动模式的首发=Classic） */
+    RUN_CLI(&r, "--if", "virtual", "--channel", ch_classic, "-v", "--json",
+            "--data-bitrate", "5000000",
+            "read", "axis0.motor.config.gear_ratio");
+    expect_has(&r, "err", "首发=CAN FD");
+
     RUN_CLI(&r, VIF, "--classic", "--json",
             "read", "axis0.motor.config.gear_ratio");
     CHECK(r.rc == 0);
@@ -817,12 +829,13 @@ static void test_framing_adopt(void)
     expect_has(&r, "err", "退化成两次请求");
     CHECK(strstr(r.err, "已自动按") == NULL);   /* 不是“已自动改学”那条 */
 
-    /* 显式写对时：既不报警也不失联 */
-    RUN_CLI(&r, "--if", "virtual", "--channel", ch_classic, "--classic", "--json",
-            "read", "axis0.motor.config.gear_ratio");
+    /* 显式写对时：既不报警也不失联，也不探测 */
+    RUN_CLI(&r, "--if", "virtual", "--channel", ch_classic, "-v", "--classic",
+            "--json", "read", "axis0.motor.config.gear_ratio");
     CHECK(r.rc == 0);
+    expect_has(&r, "err", "(显式指定)");       /* 没走探测那条路 */
     CHECK(strstr(r.err, "对端在发") == NULL);
-    CHECK(strstr(r.err, "显式指定") == NULL);
+    CHECK(strstr(r.err, "[警告]") == NULL);
 
     /*
      * ⚠ 上面那条“显式 FD 打 Classic 对端”**同时**钉住了另一件事：它的描述符

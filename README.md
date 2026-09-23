@@ -177,11 +177,11 @@ for (;;) {                                /* 控制循环：RT 安全 */
 > 任何命令都能叠 `--json`（机器可读，字段是契约）和 `-v` / `-q`（日志级别）。
 >
 > ⚠ 还有第四件事：**设备是 Classic 还是 FD**（`can.config.baud_rate`）——协议**没有**
-> 运行时协商，猜错的现场表现就是“心跳收得到、但我的请求没人应”
-> （`desc-info` 报 `0/0 bytes, N frames received`）。同一台 CyberBeast USB2CAN 在不同的
-> 适配器/固件配置下可以是 **1 Mbps Classic**，所以：**不确定就别传** `--classic` /
-> `--data-bitrate` —— SDK 会按对端第一帧自动对齐并打一行提示；传了就是明确指定，
-> 冲突时只会警告（不会偷偷改你的值）。
+> 运行时协商。不传 `--classic` / `--data-bitrate` 时 CLI 会**自动探测**：先按 Classic 起步
+> （FD 控制器也收经典帧，反之不成立）→ **发帧前只收不发地听 500 ms** → 对端是 FD 才重开为 FD。
+> 传了就是明确指定（冲突只警告，不会偷偷改你的值）。同一台 CyberBeast USB2CAN 在不同
+> 适配器/固件配置下可以是 **1 Mbps Classic**，所以“不确定就别传”能避开一整类
+> “心跳收得到、但我的请求没人应”（`desc-info` 报 `0/0 bytes, N frames received`）。
 
 ### 0. 通道怎么填
 

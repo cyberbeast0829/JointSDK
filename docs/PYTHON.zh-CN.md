@@ -74,6 +74,9 @@ ctx = Context(
     master_id=1,                 # 主站源地址
     is_fd=None,                  # None（默认）= 先按 FD 试、收到本关节第一帧时自动对齐并在 stderr 说明；
                                  # True/False = **明确指定**，冲突时不改（`ctx.framing_learned == 4`）
+    is_fd_explicit=None,         # 高级用法：单独控制“能不能被自动对齐覆盖”。
+                                 #   想“先按 Classic 起步、听准了再对齐”：is_fd=False,
+                                 #   is_fd_explicit=False（两个 CLI 的自动模式就是这么干的）
     desc_retain=DescRetain.ALL,  # 保留全部端点（约 24.9 KB RAM）；只留关键路径可降到 <1 KB
     desc_filter=["axis0.motor.config.gear_ratio", "axis0.config.can.node_id"],
     period_ns=1_000_000,         # 期望周期（keepalive 与超时判定用）

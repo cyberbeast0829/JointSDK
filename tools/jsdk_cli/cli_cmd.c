@@ -1836,13 +1836,43 @@ int jsdk_cli_run(int argc, char **argv, FILE *out, FILE *err)
     {
         int got = a.ctx ? jsdk_context_framing_learned(a.ctx) : 0;
 
+        /* `-v`：把“怎么定的帧格式”和 slcan 的收发/回执计数一起说出来 ——
+           这两样是排“到底发出去了没有”最快的东西（真机上一整轮排查都卡在
+           看不出自己发的帧有没有上总线）。 */
+        if (a.o.verbose) {
+            cli_fprintf(err, "jsdk-cli: 帧格式：%s%s；framing_learned=%d；"
+                            "首发=%s（tx=%u rx=%u）\n",
+                    a.fd ? "CAN FD" : "Classic",
+                    a.fd_auto ? "（探测决定）" : "（显式/已定）", got,
+                    a.first_tx_fd < 0 ? "none"
+                                      : (a.first_tx_fd ? "CAN FD" : "Classic"),
+                    (unsigned)a.tx_frames, (unsigned)a.rx_frames);
+            if (a.hal && a.o.ifname && strcmp(a.o.ifname, "slcan") == 0) {
+                uint32_t tx = 0u, rx = 0u, bad = 0u, acks = 0u, nacks = 0u;
+
+                jsdk_hal_slcan_stats(a.hal, &tx, &rx, &bad, &acks, &nacks);
+                cli_fprintf(err, "jsdk-cli: slcan 统计 tx=%u rx=%u acks=%u "
+                                "nacks=%u malformed=%u\n",
+                        (unsigned)tx, (unsigned)rx, (unsigned)acks,
+                        (unsigned)nacks, (unsigned)bad);
+            }
+        }
+
         if (got == 1 || got == 2) {
-            cli_fprintf(err,
-                "jsdk-cli: [注意] 对端在发 %s 帧，已自动按 %s 发送"
-                "（本次的 is_fd 猜错了）。下次请显式传 %s。\n",
-                got == 1 ? "Classic" : "CAN FD",
-                got == 1 ? "Classic" : "CAN FD",
-                got == 1 ? "--classic" : "--data-bitrate 5000000");
+            /*
+             * ⚠ 只在**没探测过**时才报“猜错了、已改学”：自动模式下 CLI 会先听一耳朵
+             *   （见 cli_app.c 的 cli_probe_framing），帧格式是“探测决定”的，
+             *   再报一句“本次的 is_fd 猜错了”就是噪声（而且是假话）。
+             *   探测的结果在 `-v` 里如实打出来。
+             */
+            if (a.framing_probe == 0) {
+                cli_fprintf(err,
+                    "jsdk-cli: [注意] 对端在发 %s 帧，已自动按 %s 发送"
+                    "（本次的 is_fd 猜错了）。下次请显式传 %s。\n",
+                    got == 1 ? "Classic" : "CAN FD",
+                    got == 1 ? "Classic" : "CAN FD",
+                    got == 1 ? "--classic" : "--data-bitrate 5000000");
+            }
         } else if (got == 4) {
             /*
              * 显式指定的格式与对端**冲突**。两个方向都得说（真机 + 仿真都验过）：

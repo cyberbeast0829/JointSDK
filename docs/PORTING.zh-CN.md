@@ -861,8 +861,17 @@ ls -l /dev/ttyACM0                # 3) 看一眼权限：通常是 root:dialout 
   `0/0 bytes, 198 frames received`（心跳收得到、请求没人应，看着特像线缆问题）。
   现在 SDK 会在收到本关节第一帧时**自动对齐**过去，并打一行提示
   （`jsdk_context_framing_learned()` 返回 0 未学 / 1 改学 Classic / 2 改学 FD /
-  3 一致 / **4 与显式配置冲突**）。注意那是“猜错补救”，不是“你说了不算”：
-  `cfg.is_fd_explicit = 1`（CLI 的 `--classic` / `--data-bitrate`、Python 传 `is_fd=`）时
+  3 一致 / **4 与显式配置冲突**）。
+  ⚠⚠ **但“先发错一帧再补救”在真机上不够**：slcan 的 FD 数据段速率是**打开时**
+  发的（`C` → `Y<n>` → `O`），先按 FD 打开就再也回不去了 —— 实测（CyberBeast
+  USB2CAN @1 Mbps Classic）即使随后改学成 Classic，帧也**发不出去**，现场是
+  `0/0 bytes` + 心跳正常。两个 CLI 因此改成：**自动模式先按 Classic 起步
+  （FD 控制器也收经典帧，反之不成立）→ 发帧前只收不发地探测 500 ms → 对端是
+  FD 才重开一次**。客户自己实现发现逻辑时建议照抄这个顺序（
+  `cfg.is_fd = 0; cfg.is_fd_explicit = 0;` → 泵 `cycle_begin()` 直到
+  `jsdk_context_framing_learned() != 0` → 是 FD 就置 1 并重开传输层）。
+  注意自动对齐只是“猜错补救”，不是“你说了不算”：`cfg.is_fd_explicit = 1`
+  （CLI 的 `--classic` / `--data-bitrate`、Python 传 `is_fd=`）时
   自动对齐**不会**动你写的值，冲突只报 4 —— 否则调用者看到的 cfg 与实际发出的帧不一致，
   而且 8 字节参数的分块读（FD 一次 ≤8 B / Classic 一次 ≤4 B）就是靠 `is_fd` 的。
   两个方向的后果**不对称**：对端 Classic + 我们发 FD ⇒ 设备**收不到**（必失败）；

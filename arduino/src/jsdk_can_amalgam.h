@@ -471,7 +471,17 @@ typedef struct {
                                          此时自动对齐**不会覆盖**它：与对端冲突只报告
                                          （`jsdk_context_framing_learned()` 返回 4）。
                                          0（默认）= `is_fd` 只是猜测，允许 SDK 在收到本
-                                         关节第一帧时自动对齐到对端格式。 */
+                                         关节第一帧时自动对齐到对端格式。
+
+                                         ⚠⚠ **推荐组合**（两个 CLI 的自动模式）：
+                                         `is_fd = 0; is_fd_explicit = 0;` —— 先按
+                                         Classic 起步（FD 控制器也收经典帧，反之不成立），
+                                         然后只收不发地泵 `jsdk_context_cycle_begin()`
+                                         直到 `jsdk_context_framing_learned() != 0`，
+                                         再决定是否改成 FD。理由：协议没有运行时协商，
+                                         而“第一条帧就用错格式”不只是没人应 —— slcan 的
+                                         FD 数据段速率是打开时配的，先按 FD 打开就回不
+                                         去了（真机实测：之后改学也发不出去）。 */
     uint32_t period_ns;             /**< 期望控制周期（ns），用于 keepalive 与超时判定。0 = 自动。 */
 
     /** 等“状态序列跑完”的预算（ms）：`jsdk_joint_calibrate()` / `jsdk_joint_home()`

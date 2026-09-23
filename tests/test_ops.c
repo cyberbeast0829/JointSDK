@@ -1820,6 +1820,22 @@ static void test_framing_semantics(void)
 
     printf("[14] framing: FD->Classic is refused; auto-align only when not explicit\n");
 
+    /* ---- ⓪ “先只听一耳朵”（= CLI 的自动探测）：一帧 FD 都不该发出去 ----
+       这是真机现场那条修复的核心：默认发 FD 不只是“没人应”，它还会让适配器
+       按 FD 配置，于是事后改学也没用 ⇒ 必须**发帧前**就听准。 */
+    if (fx_open_flags(&fx, "0:id=1,hb=10,timeout=30000,classic", 1u, 0) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+    CHECK_EQ(jsdk_context_framing_learned(fx.ctx), 0);
+    for (i = 0u; i < 40u && jsdk_context_framing_learned(fx.ctx) == 0; ++i) {
+        (void)jsdk_context_cycle_begin(fx.ctx, 0u);   /* 只收不发 */
+    }
+    CHECK_EQ(jsdk_context_framing_learned(fx.ctx), 3);   /* 与“起步 Classic”一致 */
+    CHECK_EQ(fx.sim->fd_into_classic_drops, 0u);         /* 关键：没发过 FD 帧 */
+    CHECK_EQ(jsdk_context_desc_fetch(fx.ctx), JSDK_OK);  /* 探测之后一次就成 */
+    CHECK_EQ(fx.sim->fd_into_classic_drops, 0u);         /* 全程零 FD 帧 */
+    fx_close(&fx);
+
     if (fx_open_flags(&fx, "0:id=1,hb=10,timeout=30000,classic", 1u, 1) != 0) {
         printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
     }

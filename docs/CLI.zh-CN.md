@@ -112,7 +112,8 @@ python -c "d=open('gbk.bin','rb').read();print(d[:4].hex(' '), d.decode('gbk')[:
 | `--bitrate N` | CAN **仲裁段**波特率（默认 1000000，仅用于校验/初始化） |
 | `--data-bitrate N` | CAN FD **数据段**波特率（默认 5000000；写 `0` 或加 `--classic` 用 Classic） |
 | `--baud N` | **串口**波特率（**仅 slcan**，默认 115200）。与 `--bitrate` 不是同一个量 |
-| `--classic` | 强制 Classic CAN。⚠ 传了它就是**明确指定**：SDK 的自动对齐（见下行）**不会**再改你的选择，两者冲突时只打一行警告；不传则先按 FD 试、收到本关节第一帧时对齐到对端 |
+| `--classic` | 强制 Classic CAN。⚠ 传了它就是**明确指定**：SDK 的自动对齐（见下行）**不会**再改你的选择，两者冲突时只打一行警告；不传则走**自动探测**（见下条） |
+| （不传格式选项时）| **自动探测**：先按 **Classic 起步**（FD 控制器也收经典帧，反之不成立）→ **发帧前只收不发地听 500 ms**（`cycle_begin()` 不发帧）→ 对端是 FD 才重开为 FD。**每一次命令的第一帧就已经是对端的格式**，不会再有“先发错一帧再补救”（真机实测：默认发 FD 还会把适配器按 FD 配，之后改学也发不出去）。`estop` 例外：安全命令不探测，直接按 Classic 发（最兼容） |
 | `--master-id N` | 主站源地址（默认 1；**禁止 0** —— 设备完全不回复） |
 | `--node N` | 目标节点 ID（默认 1） |
 | `--probe N` | `scan` 的主动探测上限（默认 16，`0` = 仅被动听心跳） |
@@ -225,7 +226,8 @@ python -c "d=open('gbk.bin','rb').read();print(d[:4].hex(' '), d.decode('gbk')[:
 
 | 命令 | 说明 |
 |---|---|
-| `calibrate` | 写 `requested_state = 3` 并等待状态跳转（电机会动）。⚠ **真机全标定实测 29.5 s**（要转十几圈电气角），所以默认预算提到 **120 s**；可用 `--timeout-ms` 覆盖。跑完会**读回两个 `pre_calibrated` 标志**（状态跑完 ≠ 标定生效） |
+| `calibrate` | 写 `requested_state = 3` 并等待状态跳转（电机会动）。⚠ **真机全标定实测 29.5 s**（要转十几圈电气角），所以默认预算提到 **120 s**；可用 `--timeout-ms` 覆盖。跑完会**读回两个 `pre_calibrated` 标志**（状态跑完 ≠ 标定生效）|
+| ↳ 跑完 `pre_calibrated=false`？| ⚠ **这是正常的**（用户/固件侧确认）：设备**不会**因为跑完标定序列就自动置位，必须**人工写 1 并 `save` 到 Flash** 才生效：`write axis0.motor.config.pre_calibrated 1` + `write axis0.encoder.config.pre_calibrated 1` → `save`（两条都要，缺一条依然 `false`）|
 | `home` | 写 `requested_state = 11` 并等待 |
 | `estop` | 广播 `ESTOP(0xC0)`，最高仲裁优先级。**不需要 `--yes`** —— 拒绝执行反而更危险 |
 | `mit` | **唯一会驱动电机的命令**，见 §4 |
@@ -450,7 +452,7 @@ jsdk-cli --if virtual scan --json
 | 另一个入口 | `python -m jsdk_can` 是**同一份契约**的 Python 实现：**25 个子命令**、同款安全闸（`--yes` / `mit` 的 `--hold` / `estop` 免确认）、同款退出码 0/1/2/3、同款 JSON 字段（有对拍用例）。已知差异：C 版 `mon` 在**虚拟后端**不受墙钟约束（虚拟时钟由循环驱动），Python 版用墙钟 |
 | 读参数 | 标量端点（≤ 8 字节，含 `u64`/`double`）都读得到：FD 一次请求，**Classic 自动分两块**。`object`/`json`/`endpoint_ref` 这类非标量端点没有标量尺寸，`read` 会明确报 `UNSUPPORTED`（不做“读一半”） |
 | `mon` 的实时性 | 墙钟节奏 + 非实时线程，抖动取决于操作系统。硬实时请写自己的 C 循环 |
-| `calibrate` / `home` 的预算 | 默认标定 **120 s** / 回零 **5 s**（`--timeout-ms` 可覆盖）。真机全标定实测 **29.5 s**（子状态 4 → 7 → 1），所以旧的硬编码 20 s 会在**序列还在跑**时报超时 —— 那条提示已改为区分“从未启动（带故障位）”与“已启动但未跑完”。⚠ 本项刚修完后，真机跑完会报 `pre_calibrated=false`（电机/编码器两个标志都没落上）—— 那是**设备侧**的事（固件），CLI 负责把它如实报出来 |
+| `calibrate` / `home` 的预算 | 默认标定 **120 s** / 回零 **5 s**（`--timeout-ms` 可覆盖）。真机全标定实测 **29.5 s**（子状态 4 → 7 → 1），所以旧的硬编码 20 s 会在**序列还在跑**时报超时 —— 那条提示已改为区分“从未启动（带故障位）”与“已启动但未跑完”。⚠ 跑完报 `pre_calibrated=false` **是正常的**：设备不会自动置位，要人工 `write … 1` + `save`（见 §3 的 `calibrate` 行）|
 | Windows 控制台中文 | 见 §1（`chcp 65001` 或 `--json`） |
 | slcan 吞吐 | 约 100~500 fps（ASCII 展开 + USB 帧调度），不适合高频控制 |
 | slcan 数据段速率 | 只有 `2000000`（`Y2`）与 `5000000`（`Y5`）有公认命令码；表外值报 `UNSUPPORTED`，传 `--data-bitrate 0` 则不碰适配器配置 |

@@ -378,7 +378,13 @@ static int wrap_send(void *user, const jsdk_can_frame_t *f)
 {
     cli_app_t *a = (cli_app_t *)user;
     int rc = a->user_hal.send(a->user_hal.user, f);
-    if (rc == 0) a->tx_frames++;
+
+    if (rc == 0) {
+        if (a->tx_frames == 0u) {          /* 记录**首发**用的帧格式（排障和用例都要） */
+            a->first_tx_fd = (f->flags & JSDK_FRAME_FD) ? 1 : 0;
+        }
+        a->tx_frames++;
+    }
     return rc;
 }
 
@@ -475,10 +481,16 @@ static const char *default_channel(const char *ifname)
     "0:id=1,gear=16.5,pmax=12.5,vmax=65,tmax=50,kpmax=500,kdmax=5,"          \
     "hb=10,timeout=30000,fd"
 
-int cli_open(cli_app_t *a)
+#define CLI_FRAMING_PROBE_MS 500u
+
+/**
+ * 打开传输层 + 建上下文 + 加关节（**不发任何帧**）。
+ *
+ * 拆出来是为了“探测后重开”那条路：`fd_auto` 时先按 Classic 起步、听一耳朵，
+ * 对端是 FD 才重开一次（见 `cli_probe_framing()` / `cli_app.h` 的 `fd_auto`）。
+ */
+static int cli_bringup(cli_app_t *a, const char *ifname, const char *chan)
 {
-    const char *ifname = a->o.ifname ? a->o.ifname : default_ifname();
-    const char *chan   = a->o.channel ? a->o.channel : default_channel(ifname);
     jsdk_status_t st;
 
     memset(&a->user_hal, 0, sizeof a->user_hal);
@@ -509,14 +521,25 @@ int cli_open(cli_app_t *a)
            早先错传了 --bitrate（默认 1 000 000），串口会以 1 Mbaud 打开，
            而适配器通常在 115200 → 收到乱码，现场只表现为"什么都收不到"。
            第 5 个参数是 FD **数据段**速率（--data-bitrate）：非 0 时后端会主动
-           发 Y<n> 适配器命令，所以默认值也要说清楚。 */
-        st = jsdk_hal_slcan_open(&a->user_hal, &a->hal, chan, a->o.baud,
-                                 a->o.data_bitrate);
-        if (st == JSDK_ERR_UNSUPPORTED) {
-            cli_fprintf(a->err, "jsdk-cli: slcan 的数据段速率 %u 不在已知表里"
-                            "（仅支持 2000000 与 5000000；"
-                            "其它速率请先用厂家工具配好，再传 --data-bitrate 0）\n",
-                    (unsigned)a->o.data_bitrate);
+           发 Y<n> 适配器命令。
+
+           ⚠⚠ `fd_auto`（客户没写 --classic/--data-bitrate）时**传 0**：
+             先**不要**按 FD 配置适配器。真机实测（CyberBeast USB2CAN @1 Mbps
+             Classic）：默认发 Y5 之后，即便 SDK 随后按对端改学成 Classic，
+             那些帧也**已经发不出去了**（现场：`0/0 bytes` + 心跳正常 + 提示说
+             已按 Classic 发送 —— 自相矛盾）。改成“先只听、听准了再决定（必要时
+             重开）”后，同一条命令不传任何格式选项也能跑通。 */
+        {
+            uint32_t fd_rate = a->fd_auto ? 0u : a->o.data_bitrate;
+
+            st = jsdk_hal_slcan_open(&a->user_hal, &a->hal, chan, a->o.baud,
+                                     fd_rate);
+            if (st == JSDK_ERR_UNSUPPORTED) {
+                cli_fprintf(a->err, "jsdk-cli: slcan 的数据段速率 %u 不在已知表里"
+                                "（仅支持 2000000 与 5000000；"
+                                "其它速率请先用厂家工具配好，再传 --data-bitrate 0）\n",
+                        (unsigned)fd_rate);
+            }
         }
         if (a->o.bitrate != 1000000u) {
             cli_fprintf(a->err, "jsdk-cli: 提示：--bitrate 对 slcan 无意义"
@@ -554,17 +577,123 @@ int cli_open(cli_app_t *a)
     a->sdk_hal.on_error     = wrap_on_error;
     a->sdk_hal.bus_status   = wrap_bus_status;
 
-    a->fd = (a->o.data_bitrate != 0u) ? 1 : 0;
+    /* ⚠ `a->fd` / `a->fd_auto` 由 `cli_open()` 定（这里是“按现有决定建立连接”，
+       不再自己从 `--data-bitrate` 推导 —— 否则“探测后重开”那一步会被覆盖掉）。 */
 
     if (a->o.verbose) {
-        cli_fprintf(a->err, "jsdk-cli: %s(%s) bitrate=%u data=%u %s master=%u node=%u\n",
-                ifname, chan ? chan : "", a->o.bitrate, a->o.data_bitrate,
-                a->fd ? "FD" : "Classic", (unsigned)a->o.master_id,
+        cli_fprintf(a->err, "jsdk-cli: %s(%s) bitrate=%u data=%u %s%s master=%u node=%u\n",
+                ifname, chan ? chan : "", a->o.bitrate,
+                (unsigned)(a->fd_auto ? 0u : a->o.data_bitrate),
+                a->fd ? "FD" : "Classic",
+                a->fd_auto ? "(起步：待探测)" : "(显式指定)",
+                (unsigned)a->o.master_id,
                 (unsigned)a->o.node);
     }
 
     /* --- 上下文（不下载描述符：scan/estop 用不到那 41 KB） --- */
     return cli_init_ctx(a);
+}
+
+/**
+ * 重开传输层（并重建上下文），改用 `want_fd` 指定的帧格式。
+ *
+ * 为什么必须“重开”而不能只改 `cfg`：slcan 的 FD **数据段速率**只能在打开序列里
+ * 发（`C` → `Y<n>` → `O`），而“先按 Classic 打开、探测到对端是 FD 之后”已经没有
+ * 那个时机了。其它后端也有同样的“打开参数已定”问题，所以统一重开。
+ */
+static int cli_reopen_as(cli_app_t *a, const char *ifname, const char *chan,
+                         int want_fd)
+{
+    if (a->o.verbose) {
+        cli_fprintf(a->err, "jsdk-cli: 探测结果 %d → 重开为 %s\n",
+                a->framing_probe, want_fd ? "CAN FD" : "Classic");
+    }
+    cli_close(a);
+
+    a->fd_auto = 0;                          /* 已经定了：第二遍不再探测 */
+    a->fd      = want_fd;
+    if (want_fd && a->o.data_bitrate == 0u) a->o.data_bitrate = 5000000u;
+
+    return cli_bringup(a, ifname, chan);
+}
+
+/**
+ * **发帧前**只收不发地听一耳朵对端的帧格式（≤ `CLI_FRAMING_PROBE_MS`）。
+ *
+ * 为什么要有这一步（真机现场，2026-09）：协议没有运行时协商，而“第一条帧就用错
+ * 格式”的代价**不只是没人应** —— 默认发 FD 还会让适配器按 FD 去配（`Y5`），
+ * 于是一台 1 Mbps Classic 的设备即使随后被“自动改学”正确，请求也**发不出去**：
+ * 现场表现为 `0/0 bytes` + 心跳正常 + 末尾却提示“已自动按 Classic 发送”。
+ * 先只听（Classic 是更兼容的方向：FD 控制器也接受经典帧）就能彻底躲开这一整类。
+ *
+ * @return 0 = 探测完成（不管有没有听到）；非 0 = 重开失败（错误已打印）
+ */
+static int cli_probe_framing(cli_app_t *a, const char *ifname, const char *chan)
+{
+    uint32_t t0  = a->sdk_hal.now_ms(a->sdk_hal.user);
+    int      got = 0;
+
+    for (;;) {
+        /* `cycle_begin()` = 只收不发（发送在 `cycle_end()` 里）—— 正是这里要的。 */
+        (void)jsdk_context_cycle_begin(a->ctx, 0u);
+        got = jsdk_context_framing_learned(a->ctx);
+        if (got != 0) break;
+        if ((uint32_t)(a->sdk_hal.now_ms(a->sdk_hal.user) - t0) >= CLI_FRAMING_PROBE_MS) {
+            break;
+        }
+        (void)cli_sleep_ms(1u);
+    }
+    a->framing_probe = got;
+
+    if (got == 0) {
+        /* 一路静默：听不出对端是哪种格式。按客户给的值（默认 FD）走老路，
+           免得“设备只在被问时才开口”的现场从 FD 退化成 Classic。 */
+        if (a->o.data_bitrate != 0u && a->fd == 0) {
+            return cli_reopen_as(a, ifname, chan, 1);
+        }
+        return 0;
+    }
+
+    if (got == 2 && a->fd == 0) {
+        /* 对端是 FD、我们起步是 Classic：
+           slcan 必须重开（要补发 `Y<n>`）；其它后端的 FD 能力是打开时的
+           socket/句柄属性，不用重开 —— 而 SDK 的学习已经把 ctx 的格式对齐成 FD。 */
+        if (strcmp(ifname, "slcan") == 0) {
+            return cli_reopen_as(a, ifname, chan, 1);
+        }
+        if (a->o.verbose) {
+            cli_fprintf(a->err, "jsdk-cli: 探测到对端是 CAN FD，已切到 FD 发送\n");
+        }
+    }
+    return 0;
+}
+
+int cli_open(cli_app_t *a)
+{
+    const char *ifname = a->o.ifname ? a->o.ifname : default_ifname();
+    const char *chan   = a->o.channel ? a->o.channel : default_channel(ifname);
+    int         rc;
+
+    /*
+     * 帧格式：**没被显式指定**时先按 Classic 起步（见 cli_app.h 的 `fd_auto`）。
+     * FD 控制器兼容经典帧，反方向不兼容 —— 所以“先 Classic”是两者都安全的方向；
+     * 若对端是 FD，探测后会重开成 FD（拿到 FD 带宽与 8 字节整读）。
+     */
+    a->fd_auto = (a->o.fd_explicit == 0) ? 1 : 0;
+    a->fd      = a->fd_auto ? 0 : ((a->o.data_bitrate != 0u) ? 1 : 0);
+
+    rc = cli_bringup(a, ifname, chan);
+    if (rc != 0) return rc;
+
+    /*
+     * ⚠ `estop` 不做探测：它是安全命令，必须**立刻**发出去。按 Classic 发是安全的
+     *   选择（FD 控制器也接受经典帧，而 8 字节以内的载荷两种格式完全一样）；
+     *   顺带把“Classic 总线上 estop 静默发不出去”这个老问题也避开了。
+     */
+    if (a->fd_auto && (!a->o.sub || strcmp(a->o.sub, "estop") != 0)) {
+        rc = cli_probe_framing(a, ifname, chan);
+    }
+    return rc;
 }
 
 /**

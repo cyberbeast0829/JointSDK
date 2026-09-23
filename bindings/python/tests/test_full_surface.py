@@ -699,21 +699,22 @@ def test_every_subcommand_runs_on_virtual_c_cli(args, tmp_path):
     assert cp.returncode == 0, f"C 版 {' '.join(args)} 失败：{cp.stderr}"
 
 
-def test_cli_learns_peer_framing(lib_dir):
-    """对端是 Classic 而我们默认 FD 时，要**自动改学并说出来**。
+def test_cli_probes_peer_framing_before_sending(lib_dir):
+    """自动模式：**发帧前先听一耳朵**，因此 Classic 对端不需要任何选项就能跑通。
 
     现场（Ubuntu + CyberBeast USB2CAN @ 1 Mbps）：`desc-info` 报
-    `0/0 bytes, 198 frames received` —— 心跳收得到、我们的请求却没人应，
-    因为设备是 Classic 而 SDK 默认发 FD（协议**没有**运行时协商）。
+    `0/0 bytes, 198 frames received` —— 心跳收得到、我们的请求却没人应。
+    真因不止“格式猜错”：默认发 FD 还会把适配器按 FD 配（slcan 的 `Y5`），
+    于是即使随后改学对，帧也已经发不出去（与 C 版 `jsdk-cli` 同策略：
+    先按 Classic 起步 → 发帧前只收不发地探测 → 对端是 FD 才重开为 FD）。
     """
     ch_classic = "0:id=1,gear=16.5,hb=10,timeout=30000,classic"
     r = run_module("--if", "virtual", "--channel", ch_classic, "--json",
                    "read", "axis0.motor.config.gear_ratio", lib_dir=lib_dir)
     assert r.returncode == 0, r.stderr
-    assert "对端在发 Classic 帧" in r.stderr
-    assert "--classic" in r.stderr
+    assert "对端在发" not in r.stderr      # 没错过 → 不需要提醒
 
-    # 与配置一致时不该有那句提示
+    # 对端 FD（与默认一致）→ 也能跑通，同样没有“猜错了”的噪声
     r = run_module("--if", "virtual", "--json", "--channel",
                    "0:id=1,gear=16.5,hb=10,timeout=30000,fd",
                    "read", "axis0.motor.config.gear_ratio", lib_dir=lib_dir)

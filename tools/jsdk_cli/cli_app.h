@@ -103,12 +103,24 @@ typedef struct {
     /* 包装层的计数与最近帧 */
     uint32_t tx_frames;
     uint32_t rx_frames;
+    /** **第一帧**发出去时用的帧格式（-1 = 还没发过）。
+        它把“探测到底生效了没”变成可观测的：自动模式下应为 0（Classic）。 */
+    int      first_tx_fd;
     jsdk_can_frame_t rx_ring[CLI_RX_RING];
     unsigned rx_ring_n;
 
     uint32_t virt_ms;            /**< 虚拟时钟（仅 virtual 后端） */
     int      is_virtual;
     int      fd;                 /**< 生效的 FD 标志 */
+    /** 1 = 帧格式**没被显式指定**（`--classic` / `--data-bitrate` 都没给）。
+        此时 `cli_open()` 会：先按 **Classic** 起步（最兼容的方向：FD 控制器也收经典帧，
+        反之不成立）→ **发帧前只收不发地探测**对端实际格式 → 必要时重开为 FD。
+        理由：协议没有运行时协商，而“第一条帧就用错格式”的代价不只是没人应 ——
+        真机上还会把适配器按 FD 配（slcan 的 `Y<n>`）而设备是 Classic，
+        之后即使我们自己改学对了，那些帧也已经发不出去了。 */
+    int      fd_auto;
+    /** 探测结果：0 = 窗口内没听到；否则 = `jsdk_context_framing_learned()` 的值。 */
+    int      framing_probe;
 } cli_app_t;
 
 /* --------------------------------------------------------------------------

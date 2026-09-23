@@ -73,16 +73,47 @@ EXIT_USAGE = 2
 EXIT_GATE = 3
 
 
-def _build_hal(args: argparse.Namespace):
+#: 自动模式（没写 `--classic`/`--data-bitrate`）下，**发帧前**只收不发地探测对端帧
+#: 格式的上限（ms）。没听懂就按客户给的值（默认 FD）走老路。
+_PROBE_MS = 500
+
+
+def _build_hal(args: argparse.Namespace, data_bitrate: int | None = None):
+    """建传输后端。`data_bitrate` 为 None 时用 `--data-bitrate`。
+
+    ⚠ 自动模式下 slcan 要传 **0**（= 先不要按 FD 配适配器）：真机实测
+      （CyberBeast USB2CAN @1 Mbps Classic），默认发 `Y5` 之后即使随后改学成
+      Classic，帧也**发不出去** —— 现场是 `0/0 bytes` + 心跳正常。
+    """
+    db = args.data_bitrate if data_bitrate is None else data_bitrate
+
     if args.iface == "virtual":
         return VirtualHal(args.channel or None)
     if args.iface == "socketcan":
-        return SocketCanHal(args.channel or "can0", args.bitrate, args.data_bitrate)
+        return SocketCanHal(args.channel or "can0", args.bitrate, db)
     if args.iface == "pcan":
-        return PcanHal(args.channel or "PCAN_USBBUS1", args.bitrate, args.data_bitrate)
+        return PcanHal(args.channel or "PCAN_USBBUS1", args.bitrate, db)
     if args.iface == "slcan":
-        return SlcanHal(args.channel or "COM3", args.baud, args.data_bitrate)
+        return SlcanHal(args.channel or "COM3", args.baud, db)
     raise SystemExit(f"未知后端：{args.iface}")
+
+
+def _probe_framing(ctx, ms: int = _PROBE_MS) -> int:
+    """**发帧前**只收不发地听一耳朵对端帧格式。
+
+    `cycle_begin()` 只收不发（发送在 `cycle_end()` 里）—— 正是这里要的。
+    与 C 版 `jsdk-cli` 同策略：协议没有运行时协商，而“第一条帧就用错格式”的
+    代价不只是没人应（真机上还会把适配器按 FD 配，之后改学也发不出去）。
+
+    :return: ``framing_learned()`` 的值（0 = 窗口内没听到）。
+    """
+    t0 = time.monotonic()
+    while True:
+        ctx.cycle_begin()
+        got = ctx.framing_learned
+        if got or (time.monotonic() - t0) * 1000.0 >= ms:
+            return got
+        time.sleep(0.001)
 
 
 #: 全局选项的默认值。parent parser 用 SUPPRESS，解析完再统一补齐。
@@ -841,7 +872,7 @@ def _force_utf8_when_redirected() -> None:
             pass
 
 
-def _warn_framing(ctx: Context, args) -> None:
+def _warn_framing(ctx: Context, args, probe: int = 0) -> None:
     """对端帧格式与我们的配置不一致时，**说出来**（与 C 版 jsdk-cli 同一句）。
 
     协议没有运行时协商：设备是 Classic 还是 FD 由它自己配。猜错的后果是
@@ -853,7 +884,9 @@ def _warn_framing(ctx: Context, args) -> None:
       这种情形必须告诉用户改哪个选项，否则依旧只能看到“请求没人应”。
     """
     got = ctx.framing_learned
-    if got in (1, 2):
+    if got in (1, 2) and probe == 0:
+        # ⚠ 只在**没探测过**时才报“猜错了、已改学”：自动模式下会先听一耳朵，
+        #   帧格式是“探测决定”的，再报“本次的 is_fd 猜错了”就是噪声（与 C 版同策略）。
         what = "Classic" if got == 1 else "CAN FD"
         flag = "--classic" if got == 1 else "--data-bitrate 5000000"
         print(f"jsdk_can: [注意] 对端在发 {what} 帧，已自动按 {what} 发送"
@@ -901,33 +934,57 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_GATE
 
     is_fd = not args.classic and args.data_bitrate != 0
-    hal = _build_hal(args)
     period_ns = int(1e9 / max(1, args.rate_hz)) if args.cmd in LOOP_CMDS else 0
+    probe = 0
 
+    def _new_ctx(h, fd: bool, explicit: bool = True) -> Context:
+        # `explicit=False` = “先按这个格式发，但允许被对端帧对齐（学习）”
+        return Context(h, master_id=args.master_id, is_fd=fd,
+                       is_fd_explicit=explicit,
+                       period_ns=period_ns,
+                       state_timeout_ms=int(getattr(args, "state_timeout_ms", 0)))
+
+    # 自动模式（没写 --classic/--data-bitrate）：**先按 Classic 起步**（可被对齐），
+    # 发帧前只收不发地听一耳朵（与 C 版 jsdk-cli 同策略）。
+    #   * Classic 是两者都安全的方向：FD 控制器也收经典帧，反之不成立；
+    #   * 真机上“第一条帧就用错格式”还会让适配器按 FD 配，之后改学也没用。
+    hal = _build_hal(args, data_bitrate=(0 if (not fd_explicit and args.iface == "slcan")
+                                        else args.data_bitrate))
+    ctx = _new_ctx(hal, is_fd if fd_explicit else False, explicit=fd_explicit)
     try:
-        with Context(hal, master_id=args.master_id,
-                     is_fd=(is_fd if fd_explicit else None),
-                     period_ns=period_ns,
-                     state_timeout_ms=int(getattr(args, "state_timeout_ms", 0))) as ctx:
-            ctx.add_joint(args.node, mode=Mode.MIT)
-            # ⚠ 帧格式报告要**在描述符加载之后、异常处理之前**打：
-            #   “格式猜错”正是“下载 0 字节但心跳正常”的头号原因，而这个分支
-            #   恰恰是最需要那句提示的时候（早先只在成功路径上打，于是用户
-            #   只能看到一条超时）。与 C 版 jsdk-cli 同一句。
-            try:
-                # 三档前置（与 jsdk-cli 一致）：
-                #   ① 不下载描述符 ② 只下描述符（不标定）③ 完整配置（含标定）
-                if args.cmd not in NO_DESC_CMDS:
-                    if args.cmd in DESC_ONLY_CMDS:
-                        ctx.desc_fetch()
-                    else:
-                        ctx.configure()
-                rc = _HANDLERS[args.cmd](ctx, args)
-            except JsdkError as exc:
-                _warn_framing(ctx, args)
-                raise exc
-            _warn_framing(ctx, args)
-            return rc
+        ctx.add_joint(args.node, mode=Mode.MIT)
+        if not fd_explicit and args.cmd != "estop":      # estop：安全命令，立刻发
+            probe = _probe_framing(ctx)
+            want_fd = True if (probe == 2 or (probe == 0 and is_fd)) else False
+            if want_fd and not is_fd:
+                ctx.close()                              # 重开：要补上 FD 数据段配置
+                hal = _build_hal(args, data_bitrate=args.data_bitrate or 5_000_000)
+                ctx = _new_ctx(hal, True)
+                ctx.add_joint(args.node, mode=Mode.MIT)
+                if getattr(args, "verbose", False):
+                    print(f"jsdk_can: 探测结果 {probe} → 重开为 CAN FD",
+                          file=sys.stderr)
+            elif want_fd and is_fd and probe == 2 and getattr(args, "verbose", False):
+                print("jsdk_can: 探测到对端是 CAN FD，已切到 FD 发送", file=sys.stderr)
+
+        # ⚠ 帧格式报告要**在描述符加载之后、异常处理之前**打：
+        #   “格式猜错”正是“下载 0 字节但心跳正常”的头号原因，而这个分支
+        #   恰恰是最需要那句提示的时候（早先只在成功路径上打，于是用户
+        #   只能看到一条超时）。与 C 版 jsdk-cli 同一句。
+        try:
+            # 三档前置（与 jsdk-cli 一致）：
+            #   ① 不下载描述符 ② 只下描述符（不标定）③ 完整配置（含标定）
+            if args.cmd not in NO_DESC_CMDS:
+                if args.cmd in DESC_ONLY_CMDS:
+                    ctx.desc_fetch()
+                else:
+                    ctx.configure()
+            rc = _HANDLERS[args.cmd](ctx, args)
+        except JsdkError as exc:
+            _warn_framing(ctx, args, probe)
+            raise exc
+        _warn_framing(ctx, args, probe)
+        return rc
     except JsdkError as exc:
         if args.json:
             print(json.dumps({"error": {"op": exc.op, "status": exc.name(),
@@ -943,6 +1000,10 @@ def main(argv: list[str] | None = None) -> int:
             if why:
                 print(f"  原因：{why}", file=sys.stderr)
         return EXIT_RUNTIME
+    finally:
+        # 显式 `close()`（原来是 `with Context(...)`，但自动探测需要"必要时重开"，
+        # 所以改成手动管理生命周期）—— 保证任何路径（含异常/重开失败）都释放后端。
+        ctx.close()
 
 
 if __name__ == "__main__":  # pragma: no cover
