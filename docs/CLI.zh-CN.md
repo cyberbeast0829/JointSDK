@@ -157,7 +157,7 @@ python -c "d=open('gbk.bin','rb').read();print(d[:4].hex(' '), d.decode('gbk')[:
 | 命令 | 说明 |
 |---|---|
 | `scan` | 节点发现：被动听心跳 200 ms + 主动 `QUERY_STATUS` 探测 1..`--probe`。**不下载描述符**（省 41 KB 流量） |
-| `info` | `QUERY_DEVICE_INFO(0x46)`：hw / fw / serial |
+| `info` | `QUERY_DEVICE_INFO(0x46)`：hw / fw / serial。⚠ **Classic 链路下 `serial` 恒为 0 是协议如此** —— 真机实测 `0x46` 的响应只有 8 字节（`hw u32 + fw u32`，没有 serial 字段；FD 才是 16 字节）。要序列号用 `read serial_number`（描述符端点，u64，本机实测 `108005767394384`）|
 | `health` | 健康快照：模式、轴状态、错误码、心跳标志、温度、母线、`age_ms`、链路统计 |
 | `mon` | 周期监控；`--csv` 换格式，`--csv-file` 同时落文件 |
 | `read <path>` | 按名读参数（类型随描述符） |

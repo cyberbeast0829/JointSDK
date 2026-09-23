@@ -287,6 +287,17 @@ static int cmd_info(cli_app_t *a)
         out_kv(a, "serial", "%llu", (unsigned long long)info.serial);
         out_kv(a, "device_mode", "%s", info.classic ? "Classic" : "FD");
     }
+    /*
+     * ⚠ Classic 下 `serial:0` 是**协议如此**，不是"没读出来"：真机实测（1 Mbps
+     *   Classic 的设备）`0x46` 的**响应只有 8 字节**，装得下 `hw u32 + fw u32`，
+     *   **没有 serial 字段**（见 PROTOCOL_NOTES §3 的 `0x46` 行）。用户很容易把
+     *   这个 0 当成故障，所以这里直接说清 + 给出正确取法。
+     */
+    if (info.serial == 0u && info.classic) {
+        cli_fprintf(a->err, "jsdk-cli: 提示：Classic 下 `0x46` 的响应只有 hw+fw"
+                        "（8 字节，协议如此），所以 `serial` 恒为 0；"
+                        "要序列号请用 `read serial_number`（描述符端点）。\n");
+    }
     return CLI_EXIT_OK;
 }
 
