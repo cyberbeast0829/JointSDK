@@ -1840,9 +1840,13 @@ int jsdk_cli_run(int argc, char **argv, FILE *out, FILE *err)
            这两样是排“到底发出去了没有”最快的东西（真机上一整轮排查都卡在
            看不出自己发的帧有没有上总线）。 */
         if (a.o.verbose) {
+            /* ⚠ 报**实际生效**的格式，而不是 `a.fd`：SDK 的自动对齐可能已经把
+               上下文改成对端的格式（此时 `a.fd` 还是起步时的值，说了会自相矛盾）。 */
+            int eff_fd = (got == 2) ? 1 : ((got == 1) ? 0 : a.fd);
+
             cli_fprintf(err, "jsdk-cli: 帧格式：%s%s；framing_learned=%d；"
                             "首发=%s（tx=%u rx=%u）\n",
-                    a.fd ? "CAN FD" : "Classic",
+                    eff_fd ? "CAN FD" : "Classic",
                     a.fd_auto ? "（探测决定）" : "（显式/已定）", got,
                     a.first_tx_fd < 0 ? "none"
                                       : (a.first_tx_fd ? "CAN FD" : "Classic"),
