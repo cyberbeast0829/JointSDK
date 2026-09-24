@@ -2397,7 +2397,11 @@ int jsdk_ctx_wait_response(jsdk_context_t *ctx, uint8_t msgtype, uint8_t source,
  * @return 1 = 有设备应答；0 = 无应答（含发送失败）
  * @note **仅配置阶段可用**（会阻塞）。
  */
+/** 扫描用：单个地址问一句，**不重发**（“没人应答”就是正常结果）。 */
 int jsdk_ctx_probe_node(jsdk_context_t *ctx, uint8_t node_id);
+
+/** 改号前的安全检查：同一个探测但**允许重发**（假阴性会造出两个同号设备）。 */
+int jsdk_ctx_probe_node_strict(jsdk_context_t *ctx, uint8_t node_id);
 
 /**
  * 学一次对端的帧格式（Classic vs FD），只认**我们自己的关节**发来的帧。
@@ -7713,17 +7717,39 @@ jsdk_status_t jsdk_joint_read_config_snapshot(jsdk_joint_t *j,
  *
  * @return 1 = 有设备应答；0 = 无应答（包含发送失败 —— 发不出去时后续步骤会自己报错）
  */
-int jsdk_ctx_probe_node(jsdk_context_t *ctx, uint8_t node_id)
+/**
+ * 目标地址上是否有人在应答 —— `allow_retry` 决定“丢一帧要不要补一次”。
+ *
+ * ⚠ 两个调用场景对重发的需求**正好相反**，所以必须分开：
+ *   - `discover()` 的主动扫描（`1..max_probe` 逐个问）：**绝大多数地址本来就没人**，
+ *     “等不到应答”是**正常结果**。给它重发等于把不存在节点的等待时间翻倍
+ *     （真机实测：16 个地址 × 2 次 × 375 ms ⇒ `scan` 里一半的重发都是这种，
+ *     `重发=15` 全是假信号）。
+ *   - `set_node_id()` 改号前的“这个号是否已被占用”：**假阴性会造出两个同号设备**，
+ *     所以这里宁可多等一个超时也要补一次。
+ */
+static int probe_node_ex(jsdk_context_t *ctx, uint8_t node_id, int allow_retry)
 {
     jsdk_can_frame_t rsp;
 
     if (!jsdk_ctx_check(ctx) || node_id == 0u) return 0;
 
-    /* 回复一律以 MsgType 0x00 回来，靠 Source 区分设备（见协议手册）。
-       探测是只读的（`QUERY_STATUS` 不改任何状态）⇒ 幂等，可重发。 */
+    /* 回复一律以 MsgType 0x00 回来，靠 Source 区分设备（见协议手册）。 */
     return (jsdk_ctx_request(ctx, CB_PRI_QUERY, CB_MSG_QUERY_STATUS, node_id,
                              NULL, 0u, CB_MSG_MIT_CONTROL, &rsp,
-                             JSDK_CFG_TIMEOUT_MS / 8u, 1) == JSDK_OK) ? 1 : 0;
+                             JSDK_CFG_TIMEOUT_MS / 8u, allow_retry) == JSDK_OK) ? 1 : 0;
+}
+
+/** 扫描用：**不重发**（“没人应答”就是正常结果，见 `probe_node_ex()`）。 */
+int jsdk_ctx_probe_node(jsdk_context_t *ctx, uint8_t node_id)
+{
+    return probe_node_ex(ctx, node_id, 0);
+}
+
+/** 改号前的安全检查用：**允许重发**（假阴性会造出两个同号设备）。 */
+int jsdk_ctx_probe_node_strict(jsdk_context_t *ctx, uint8_t node_id)
+{
+    return probe_node_ex(ctx, node_id, 1);
 }
 
 jsdk_status_t jsdk_context_discover(jsdk_context_t *ctx, uint8_t *ids, unsigned cap,
@@ -11267,7 +11293,7 @@ jsdk_status_t jsdk_joint_set_node_id(jsdk_joint_t *j, uint8_t new_id, int persis
      * 多轴机柜上这是很容易踩到的：CLI/Python 只往上下文里加自己关心的那个关节，
      * 因此本函数开头那个「本上下文内冲突」检查对总线上的其它设备一无所知。
      */
-    if (new_id != old_id && jsdk_ctx_probe_node(j->ctx, new_id)) {
+    if (new_id != old_id && jsdk_ctx_probe_node_strict(j->ctx, new_id)) {
         jsdk_joint_seterr(j, "node %u already answers on the bus; renaming %u -> %u "
                              "would create a duplicate id",
                           (unsigned)new_id, (unsigned)old_id, (unsigned)new_id);

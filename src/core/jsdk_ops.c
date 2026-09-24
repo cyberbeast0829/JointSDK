@@ -523,7 +523,7 @@ jsdk_status_t jsdk_joint_set_node_id(jsdk_joint_t *j, uint8_t new_id, int persis
      * 多轴机柜上这是很容易踩到的：CLI/Python 只往上下文里加自己关心的那个关节，
      * 因此本函数开头那个「本上下文内冲突」检查对总线上的其它设备一无所知。
      */
-    if (new_id != old_id && jsdk_ctx_probe_node(j->ctx, new_id)) {
+    if (new_id != old_id && jsdk_ctx_probe_node_strict(j->ctx, new_id)) {
         jsdk_joint_seterr(j, "node %u already answers on the bus; renaming %u -> %u "
                              "would create a duplicate id",
                           (unsigned)new_id, (unsigned)old_id, (unsigned)new_id);

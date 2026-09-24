@@ -2089,8 +2089,32 @@ static void test_idempotent_request_retry(void)
         fx.drop_msgtype   = 0u;
     }
 
+    /* ---- ⑤ 扫描（大多数地址本来就没人）**不**重发：否则不存在的节点会把耗时翻倍
+           （真机实测：`scan` 每次都报 `重发=15（预热 0 + 幂等请求 15）`，
+             全是 2..16 号空地址的假重发）。 ---- */
+    {
+        uint8_t ids[16];
+        unsigned found = 0u;
+        uint32_t before_retries = fx.ctx->bus.tx_retries_req;
+
+        CHECK_EQ(jsdk_context_discover(fx.ctx, ids, 16u, &found, 16u), JSDK_OK);
+        CHECK(found >= 1u);
+        CHECK_EQ(jsdk_ctx_probe_node(fx.ctx, 1u), 1);          /* 在线的能找到 */
+        CHECK_EQ(jsdk_ctx_probe_node(fx.ctx, 9u), 0);          /* 不在线：正常结果 */
+        CHECK_EQ(fx.ctx->bus.tx_retries_req, before_retries);  /* 一次都没重发 */
+
+        /* 改号前的安全检查用 strict：丢一帧也要补一次（假阴性 = 造出两个同号设备） */
+        fx.drop_msgtype    = (uint8_t)CB_MSG_QUERY_STATUS;
+        fx.drop_msgtype_n  = 1u;
+        fx.dropped_msgtype = 0u;
+        CHECK_EQ(jsdk_ctx_probe_node_strict(fx.ctx, 1u), 1);
+        CHECK_EQ(fx.ctx->bus.tx_retries_req, before_retries + 1u);
+        fx.drop_msgtype_n = 0u;
+        fx.drop_msgtype   = 0u;
+    }
+
     printf("      dropped 1 read -> retried once (tx_retries_req=1); "
-           "all dropped -> bounded failure; polling/no-ACK paths never retry\n");
+           "all dropped -> bounded failure; polling/no-ACK/scan never retry\n");
     fx_close(&fx);
 }
 

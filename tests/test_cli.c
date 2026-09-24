@@ -915,6 +915,15 @@ static void test_warmup(void)
     expect_has(&r, "out", "\"value\":16.5");
     expect_has(&r, "err", "幂等请求 1");
 
+    /*
+     * --- `scan` 的主动扫描**不重发**：1..16 逐个问，绝大多数地址本来就没人，
+     *     “没人应答”是**正常结果**。真机实测（v0.32 第一版）：每次 `scan` 都报
+     *     `重发=15（预热 0 + 幂等请求 15）` —— 全是假信号，而且把扫描耗时翻倍。
+     */
+    RUN_CLI(&r, VIF, "-v", "--json", "scan");
+    CHECK(r.rc == 0);
+    expect_has(&r, "err", "重发=0（预热 0 + 幂等请求 0）");
+
     /* 全丢：必须**明确失败**（不能无限重试），且只多试一次 */
     RUN_CLI(&r, "--if", "virtual", "--channel",
             "0:id=1,gear=16.5,hb=10,timeout=30000,fd,dropmsg=0x45:100000", "-v",

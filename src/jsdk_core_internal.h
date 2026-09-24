@@ -381,7 +381,11 @@ int jsdk_ctx_wait_response(jsdk_context_t *ctx, uint8_t msgtype, uint8_t source,
  * @return 1 = 有设备应答；0 = 无应答（含发送失败）
  * @note **仅配置阶段可用**（会阻塞）。
  */
+/** 扫描用：单个地址问一句，**不重发**（“没人应答”就是正常结果）。 */
 int jsdk_ctx_probe_node(jsdk_context_t *ctx, uint8_t node_id);
+
+/** 改号前的安全检查：同一个探测但**允许重发**（假阴性会造出两个同号设备）。 */
+int jsdk_ctx_probe_node_strict(jsdk_context_t *ctx, uint8_t node_id);
 
 /**
  * 学一次对端的帧格式（Classic vs FD），只认**我们自己的关节**发来的帧。
