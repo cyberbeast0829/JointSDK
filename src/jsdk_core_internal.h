@@ -254,6 +254,16 @@ struct jsdk_context {
     /** 对端帧格式的学习结果：0 = 未知，1 = 已改为 Classic，2 = 已改为 FD，
         3 = 与配置一致（无需调整）。见 `jsdk_context_framing_learned()`。 */
     uint8_t           framing_learned;
+    /** 1 = 会话预热已成功过（同一个会话里再调 `jsdk_context_warmup()` 是空操作）。 */
+    uint8_t           warmed;
+    /* 自动预热是否已经尝试过（成功或失败都置 1）：失败后**不**在每个请求前
+       反复重试 500 ms —— 显式调用 jsdk_context_warmup() 仍然可以重试。 */
+    uint8_t           warmup_tried;
+    /* 1 = 正在跑会话预热。预热的收发**不参与帧格式学习**：设备对 0x46 的回包会
+       按**请求**的格式回（经典 8 B / FD 16 B），学到“一致”只是镜像，会掩盖
+       “对端其实是 FD”的真相（`jsdk_ctx__learn_framing()` 只学一次）。 */
+    uint8_t           in_warmup;
+    /** 1 = 正在预热（`jsdk_ctx_wait_response()` 里的懒预热靠它防递归）。 */
     jsdk_desc_info_t  desc;           /**< 对外元信息；crc/fw 同时是缓存键 */
 
     /**
@@ -313,6 +323,10 @@ static inline uint32_t jsdk_elapsed(uint32_t now, uint32_t then)
 int jsdk_ctx_send(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
                   uint8_t dest, const uint8_t *payload, uint8_t len);
 
+/** 不含自动预热的发送：控制帧 / 急停专用（延迟敏感，不能等）。 */
+int jsdk_ctx_send_raw(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
+                      uint8_t dest, const uint8_t *payload, uint8_t len);
+
 /**
  * 阻塞等待某个 `(msgtype, source)` 的响应，同时把所有收到的帧分派给
  * 反馈解复用器（否则会丢掉期间的心跳）。
@@ -334,6 +348,18 @@ int jsdk_ctx_wait_response(jsdk_context_t *ctx, uint8_t msgtype, uint8_t source,
  * @note **仅配置阶段可用**（会阻塞）。
  */
 int jsdk_ctx_probe_node(jsdk_context_t *ctx, uint8_t node_id);
+
+/**
+ * 学一次对端的帧格式（Classic vs FD），只认**我们自己的关节**发来的帧。
+ *
+ * ⚠ 从 `jsdk_ctx_handle_frame()` 与 `jsdk_ctx_wait_response()` **两处**都要调：
+ *   后者会把匹配的响应帧直接返回，**不再交给** handle_frame —— 只挂在
+ *   handle_frame 上的话，“响应帧自己就能告诉我们对端格式”这条信息就丢了
+ *   （而会话预热正是靠它工作的：静默总线上没有心跳可听）。
+ *
+ * @return 1 = 本次调用学到了/确认了（含“与配置一致”）；0 = 与本主站无关或已学过
+ */
+int jsdk_ctx__learn_framing(jsdk_context_t *ctx, const jsdk_can_frame_t *f);
 
 /**
  * 接收并解复用**一帧**（不推进时钟、不记账 rx 计数以外的状态）。

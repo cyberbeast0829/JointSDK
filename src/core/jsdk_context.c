@@ -292,8 +292,14 @@ void jsdk_ctx_publish_arena_used(jsdk_context_t *ctx)
  * 发送
  * ======================================================================== */
 
-int jsdk_ctx_send(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
-                  uint8_t dest, const uint8_t *payload, uint8_t len)
+/**
+ * 真正把帧交给 HAL（不含任何隐匿逻辑）。
+ *
+ * 控制帧、广播急停等“延迟敏感 / 不能等”的路径**必须**用这个函数，
+ * 否则可能被自动预热拖住（最多 `JSDK_WARMUP_TIMEOUT_MS`）。
+ */
+int jsdk_ctx_send_raw(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
+                      uint8_t dest, const uint8_t *payload, uint8_t len)
 {
     jsdk_can_frame_t f;
     int rc;
@@ -313,6 +319,26 @@ int jsdk_ctx_send(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
     rc = ctx->cfg.hal.send(ctx->cfg.hal.user, &f);
     if (rc != 0) ctx->bus.tx_failed++;
     return rc;
+}
+
+/**
+ * 配置阶段的请求发送：**在第一次发帧之前**先把会话预热掉。
+ *
+ * 放在这里（而不是等到 `wait_response()`）是有原因的：首帧丢失时，
+ * **已经发出去的**那条请求就是丢的那条，事后预热再成功也救不回它 ——
+ * 实测 `device_info()` 会照旧超时。所以顺序必须是“先预热、再发”。
+ *
+ * 控制路径（`in_cycle`）与急停走的是 `jsdk_ctx_send_raw()`：它们不能被
+ * 最多 500 ms 的预热阻塞（同时也是为了不让周期里多出帧）。
+ */
+int jsdk_ctx_send(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
+                  uint8_t dest, const uint8_t *payload, uint8_t len)
+{
+    if (jsdk_ctx_check(ctx) && !ctx->warmup_tried && ctx->nj > 0u
+        && !ctx->in_cycle) {
+        (void)jsdk_context_warmup(ctx, 0u);   /* 失败不阻断：下面照常发 */
+    }
+    return jsdk_ctx_send_raw(ctx, pri, msgtype, dest, payload, len);
 }
 
 /**
@@ -349,19 +375,11 @@ int jsdk_context_framing_learned(const jsdk_context_t *ctx)
  *
  * @return 1 = 已消费；0 = 与本主站无关（丢弃）
  */
-int jsdk_ctx_handle_frame(jsdk_context_t *ctx, const jsdk_can_frame_t *f)
+int jsdk_ctx__learn_framing(jsdk_context_t *ctx, const jsdk_can_frame_t *f)
 {
-    uint8_t msgtype = (uint8_t)cb_id_msgtype(f->id);
-    uint8_t src     = (uint8_t)cb_id_source(f->id);
-    uint8_t dst     = (uint8_t)cb_id_dest(f->id);
-    jsdk_joint_t *j;
+    uint8_t src = (uint8_t)cb_id_source(f->id);
 
-    if (!jsdk_ctx_check(ctx) || !f) return 0;
-
-    ctx->bus.rx_frames++;
-    ctx->bus.last_rx_age_ms = 0u;
-    ctx->bus.link_up = 1u;
-    ctx->last_rx_ms  = ctx->now_ms;
+    if (ctx->in_warmup) return 0;   /* 见 in_warmup 的说明：预热的回包是镜像 */
 
     /*
      * 学一次对端的**帧格式**（Classic vs FD）。
@@ -381,7 +399,9 @@ int jsdk_ctx_handle_frame(jsdk_context_t *ctx, const jsdk_can_frame_t *f)
      * 若悄悄改掉显式配置，调用者看到的 cfg 与实际发出的帧不一致，
      * 而且 8 字节参数的分块读也依赖 `is_fd`（FD 一次 8 B / Classic 一次 4 B）。
      */
-    if (ctx->framing_learned == 0u) {
+    if (ctx->framing_learned != 0u) return 0;
+
+    {
         unsigned k;
 
         for (k = 0u; k < ctx->nj; ++k) {
@@ -397,10 +417,28 @@ int jsdk_ctx_handle_frame(jsdk_context_t *ctx, const jsdk_can_frame_t *f)
                     ctx->cfg.is_fd       = peer_fd;
                     ctx->framing_learned = peer_fd ? 2u : 1u;   /* 1 = 改学 Classic */
                 }
-                break;
+                return 1;
             }
         }
     }
+    return 0;
+}
+
+int jsdk_ctx_handle_frame(jsdk_context_t *ctx, const jsdk_can_frame_t *f)
+{
+    uint8_t msgtype = (uint8_t)cb_id_msgtype(f->id);
+    uint8_t src     = (uint8_t)cb_id_source(f->id);
+    uint8_t dst     = (uint8_t)cb_id_dest(f->id);
+    jsdk_joint_t *j;
+
+    if (!jsdk_ctx_check(ctx) || !f) return 0;
+
+    ctx->bus.rx_frames++;
+    ctx->bus.last_rx_age_ms = 0u;
+    ctx->bus.link_up = 1u;
+    ctx->last_rx_ms  = ctx->now_ms;
+
+    (void)jsdk_ctx__learn_framing(ctx, f);   /* 见上面的长注释 */
 
     /* 寻址：设备只会以 dest = master_id 单播回复；广播告警除外 */
     if (dst != ctx->cfg.master_id && !(cb_id_is_broadcast(f->id) && dst == CB_ADDR_BROADCAST)) {
@@ -515,6 +553,12 @@ int jsdk_ctx_wait_response(jsdk_context_t *ctx, uint8_t msgtype, uint8_t source,
             ctx->bus.rx_frames++;
             ctx->bus.link_up = 1u;
             ctx->last_rx_ms  = ctx->now_ms;
+            /*
+             * ⚠ 匹配的响应帧**直接返回**，不会经过 `jsdk_ctx_handle_frame()`
+             *   —— 所以帧格式学习必须在这里也走一遍：会话预热就是靠**响应帧**
+             *   工作的（静默总线上没有心跳可听）。
+             */
+            (void)jsdk_ctx__learn_framing(ctx, &f);
             if (cb_id_msgtype(f.id) == msgtype && cb_id_source(f.id) == source) {
                 if (out) *out = f;
                 return JSDK_OK;
@@ -619,8 +663,10 @@ const char *jsdk_context_last_error(jsdk_context_t *ctx)
 void jsdk_context_estop(jsdk_context_t *ctx)
 {
     if (!jsdk_ctx_check(ctx)) return;
-    /* MsgType 0xC0 是全局广播（Dest = 0xFF），载荷被固件忽略 */
-    (void)jsdk_ctx_send(ctx, CB_PRI_CRITICAL, CB_MSG_ESTOP, CB_ADDR_BROADCAST, NULL, 0u);
+    /* MsgType 0xC0 是全局广播（Dest = 0xFF），载荷被固件忽略。
+       ⚠ 必须走 raw：急停不允许被自动预热拖住。 */
+    (void)jsdk_ctx_send_raw(ctx, CB_PRI_CRITICAL, CB_MSG_ESTOP, CB_ADDR_BROADCAST,
+                            NULL, 0u);
     ctx->tx_seq = cb_seq_next(ctx->tx_seq);
     jsdk_ctx_seterr(ctx, "ESTOP broadcast sent");
 }

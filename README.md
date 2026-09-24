@@ -381,7 +381,13 @@ tools/                夹具/黄金向量生成、构建与验证脚本（`wsl_b
 | C 测试 | **11 套 / 30504 项断言**，0 失败（Windows MinGW gcc 13；Windows MSVC 19.44；Linux WSL gcc 9；ASan+UBSan 同样全过） |
 | ctest | **21 项**（11 套 C + 8 个示例 + `cli_text_lint` + `hw_verify_virtual`；共享库构建为 22 项，多一个 `python_bindings`） |
 | Python | **224 passed / 2 skipped**（Windows 3.12 与 Linux 3.8 结果一致）；公共 C API **114/114 已绑定，0 缺口**；`python -m jsdk_can` 与 `jsdk-cli` **25 个子命令对齐**（同款安全闸、同款退出码、同款 JSON 字段与 CSV 列） |
-| 真机 | slcan + CANable + 一台关节（node 1，fw 1545）：`scan`/`info`/`desc-*`/`read`/`batch-read`/`health`/`dump-config`/`mon` **与写路径**（原值回写 / 写探针后恢复，实测 `100 → 150 → 恢复 100`）逐条验证；`tools/hw_verify.sh` 多轮全过（3 轮 **45/45**） |
+| 真机 | slcan + CyberBeast USB2CAN + 一台关节（node 1，hw 262711 / fw 1545，1 Mbps **Classic**）：`scan`/`info`/`desc-*`/`read`/`batch-read`/`health`/`dump-config`/`mon` **与写路径**（原值回写 / 写探针后恢复，实测 `100 → 150 → 恢复 100`）逐条验证；**`calibrate` 全流程 + `save` 落 Flash**（软复位后 `pre_calibrated` 仍为 true）、`tools/hw_verify.sh --runs 3 --write-probe` **45/45**、`tools/py_hw_smoke.py` **10/10**；**会话预热**（`jsdk_context_warmup()`）把 slcan“首帧丢失”挡在第一条命令之前（真机复现 1/10 → 现为 0） |
+
+**会话预热（`jsdk_context_warmup()`）**：slcan 适配器打开端口时会丢掉主站**头一两帧**，
+而 Lawicel 对帧行**不回报结果**（`acks/nacks` 恒 0）⇒ 主机侧没有任何可观测信号，
+第一条命令就会莫名超时（`0/0 bytes` + 心跳正常），再敲一次又好了。
+解法是幂等请求 + 重发（只读的 `QUERY_DEVICE_INFO`），SDK 已**自动挂在发帧之前**，
+计数在 `ctx.bus_state().tx_retries` / `-v` 的 `重发=N（预热）`。
 
 **未完成与已知限制的完整清单见 [`docs/BACKLOG.zh-CN.md`](docs/BACKLOG.zh-CN.md)**
 （§1 未完成项 A12、B6；§3 已知限制 L1~L7 与记录缺失）。

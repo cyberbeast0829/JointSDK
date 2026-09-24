@@ -105,6 +105,10 @@ def _probe_framing(ctx, ms: int = _PROBE_MS) -> int:
     与 C 版 `jsdk-cli` 同策略：协议没有运行时协商，而“第一条帧就用错格式”的
     代价不只是没人应（真机上还会把适配器按 FD 配，之后改学也发不出去）。
 
+    ⚠ 必须排在 :meth:`Context.warmup` **之前**：预热是主动问一句，而设备对
+      0x46 的回包可能**按请求的格式回**（镜像），于是“学到的一致”看不出对端
+      是 FD。心跳的格式才是设备自己的（见 C 版 `cli_probe_framing()`）。
+
     :return: ``framing_learned()`` 的值（0 = 窗口内没听到）。
     """
     t0 = time.monotonic()
@@ -114,6 +118,16 @@ def _probe_framing(ctx, ms: int = _PROBE_MS) -> int:
         if got or (time.monotonic() - t0) * 1000.0 >= ms:
             return got
         time.sleep(0.001)
+
+
+def _warmup(ctx, verbose: bool) -> None:
+    """会话预热（幂等重发）：把"首帧丢失"挡在用户真正要跑的命令之前。
+
+    真机症状与根因见 :meth:`Context.warmup`。⚠ 失败**不阻断**：后面那条命令
+    自己有完整的错误报告；`hb-dump` 这类只收不发的命令也不会走到这里。
+    """
+    if not ctx.warmup() and verbose:
+        print(f"jsdk_can: 预热未收到应答（{ctx.last_error()}）", file=sys.stderr)
 
 
 #: 全局选项的默认值。parent parser 用 SUPPRESS，解析完再统一补齐。
@@ -292,7 +306,8 @@ def _cmd_health(ctx: Context, args) -> int:
         f"tMot={fb.t_motor_C:.1f} vbus={fb.vbus_V:.2f} age={fb.age_ms}ms",
         f"  flags={fb.has_flag!r}",
         f"总线: link_up={bs.link_up} nodes={bs.nodes_online} "
-        f"tx={bs.tx_frames} rx={bs.rx_frames} errors={bs.link_errors}",
+        f"tx={bs.tx_frames} rx={bs.rx_frames} retries={bs.tx_retries} "
+        f"errors={bs.link_errors}",
     ]
     if j.is_fault():
         human.append("  故障: " + (j.describe_fault() or "(无描述)"))
@@ -953,8 +968,9 @@ def main(argv: list[str] | None = None) -> int:
     ctx = _new_ctx(hal, is_fd if fd_explicit else False, explicit=fd_explicit)
     try:
         ctx.add_joint(args.node, mode=Mode.MIT)
-        if not fd_explicit and args.cmd != "estop":      # estop：安全命令，立刻发
-            probe = _probe_framing(ctx)
+        if args.cmd != "estop":              # estop：安全命令，立刻发，不探测也不预热
+            if not fd_explicit:
+                probe = _probe_framing(ctx)
             want_fd = True if (probe == 2 or (probe == 0 and is_fd)) else False
             if want_fd and not is_fd:
                 ctx.close()                              # 重开：要补上 FD 数据段配置
@@ -966,6 +982,8 @@ def main(argv: list[str] | None = None) -> int:
                           file=sys.stderr)
             elif want_fd and is_fd and probe == 2 and getattr(args, "verbose", False):
                 print("jsdk_can: 探测到对端是 CAN FD，已切到 FD 发送", file=sys.stderr)
+            # 会话预热：把"首帧丢失"挡在下面那条真命令之前（见 _warmup 的说明）
+            _warmup(ctx, bool(getattr(args, "verbose", False)))
 
         # ⚠ 帧格式报告要**在描述符加载之后、异常处理之前**打：
         #   “格式猜错”正是“下载 0 字节但心跳正常”的头号原因，而这个分支

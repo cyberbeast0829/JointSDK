@@ -114,12 +114,14 @@ typedef struct {
     int      fd;                 /**< 生效的 FD 标志 */
     /** 1 = 帧格式**没被显式指定**（`--classic` / `--data-bitrate` 都没给）。
         此时 `cli_open()` 会：先按 **Classic** 起步（最兼容的方向：FD 控制器也收经典帧，
-        反之不成立）→ **发帧前只收不发地探测**对端实际格式 → 必要时重开为 FD。
+        反之不成立）→ **发帧前先预热**对端（幂等重发，见 `jsdk_context_warmup()`）
+        → 必要时重开为 FD。
         理由：协议没有运行时协商，而“第一条帧就用错格式”的代价不只是没人应 ——
         真机上还会把适配器按 FD 配（slcan 的 `Y<n>`）而设备是 Classic，
         之后即使我们自己改学对了，那些帧也已经发不出去了。 */
     int      fd_auto;
-    /** 探测结果：0 = 窗口内没听到；否则 = `jsdk_context_framing_learned()` 的值。 */
+    /** 预热的结果：0 = 没得到应答（报不出帧格式）；
+        否则 = `jsdk_context_framing_learned()` 的值（1/2/3/4）。 */
     int      framing_probe;
 } cli_app_t;
 

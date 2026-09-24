@@ -86,6 +86,7 @@ ctx = Context(
 )
 
 j = ctx.add_joint(1)             # 必须在 configure() 之前
+ctx.warmup()                     # 会话预热（幂等重发）：挡掉 slcan "首帧丢失"
 ctx.configure()                  # 下载描述符 → 解析 → 读回标定量并校验
 ctx.activate()                   # 阻塞：使能 + 安全首帧；全有或全无
 ...
@@ -98,6 +99,25 @@ ctx.close()                      # 或 with Context(...) as ctx:
 - `add_joint()` 在 `configure()` 之后调用 → `JsdkStateError`；
 - 未 `configure()` 就 `activate()` → `JsdkStateError`，且**不改任何状态**；
 - `discover()` 不要在控制回路运行期间调（会争用响应队列）。
+
+**会话预热（`ctx.warmup()`）**：真机上**第一条命令随机超时**（`0/0 bytes` + 心跳正常，
+再敲一次就好）的根因是 **slcan 的“首帧丢失”** —— 适配器打开端口时重置输入缓冲，
+主站头一两帧上不了总线，而 Lawicel 对帧行**不回报结果**（`acks/nacks` 恒 0）⇒
+主机侧**没有任何可观测信号**。唯一可验证的解法是幂等请求 + 重发，
+也就是 `ctx.warmup()`：反复发一条只读的 `QUERY_DEVICE_INFO(0x46)`，每轮等 50 ms、
+默认总预算 500 ms；返回 `True` = 设备应答了，`False` = 预算内没应答
+（**不是致命错误**，只收不发的命令照样能用；但别当成功 —— 设备掉电/线松最先在这里暴露）。
+
+```python
+if not ctx.warmup():
+    print("链路没应答：", ctx.last_error())
+print(ctx.bus_state().tx_retries)   # 预热吸收了几次丢帧（正常 0，非 0 说明确实丢过）
+```
+
+⚠ SDK 已经把它**自动挂在发帧之前**（`Context` 内部，覆盖库用户），所以不调用也不会
+再“莫名其妙失败”；显式调用是为了**尽早知道链路坏了**，以及让只收不发的命令也先确认链路。
+⚠ 同一个会话里成功后**再调是空操作**；失败后自动预热不会反复花时间，但**显式**调用仍可重试。
+⚠ 需要至少一个关节（用它定 `node_id`），否则 `JsdkStateError`（而不是乱发一帧）。
 
 ---
 
@@ -319,6 +339,7 @@ $ python tools/_abi_gap.py
 
 | 能力 | Python 入口 | 说明 |
 |---|---|---|
+| **会话预热** | `Context.warmup(timeout_ms=0)` → `bool` | 幂等重发，挡掉 slcan 的**首帧丢失**（现场：第一条命令随机超时、再敲一次就好）。`False` = 预算内没应答（不致命）；次数在 `ctx.bus_state().tx_retries`。SDK 已自动挂在发帧之前，显式调用是为了**尽早**发现链路坏 |
 | **SDO 风格端点访问** | `Joint.sdo(path_or_ep, *, subindex, size)` → `Sdo` 对象：`.state/.data/.size/.start_read()/.start_write()/.read()/.write()/.read_value()/.write_value()` | 非阻塞启动 + 阻塞等（内部抽 `cycle_begin/end`）；`.data` 是**裸线上字节**，参数值**小端**（见 `PROTOCOL_NOTES` §3.1）；`.read_value()/.write_value()` 按 `size` 帮你解成 int/float。同一个端点会**复用**句柄（`sdo_slots_used` 可查） |
 | **单位与标度** | `units.UnitScale`、`unit_scale_default()`、`unit_scale_calc(enc, motor_rev, shaft_rev, rated)`、`Joint.set_scale()/get_scale()` | CAN 上一般不需要（线上量已是物理量，默认标度是恒等映射）——但工具类/换算场景现在不用自己手算 |
 | **描述符缓存与回调** | `Context.desc_fetch()` / `desc_poll()` / `desc_import_raw(json, crc=, fw_version=)` / `desc_raw_sink(cb)` / `desc_progress(cb)` / `on_fault(cb)` | 路线 B 全开：可拿**原始描述符字节**、可看进度、可注册故障回调（边缘触发，只变沿时回调）。回调异常会被吞掉并保留引用，不会因 GC 丢 |

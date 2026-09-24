@@ -626,6 +626,12 @@ static int cli_reopen_as(cli_app_t *a, const char *ifname, const char *chan,
  * 现场表现为 `0/0 bytes` + 心跳正常 + 末尾却提示“已自动按 Classic 发送”。
  * 先只听（Classic 是更兼容的方向：FD 控制器也接受经典帧）就能彻底躲开这一整类。
  *
+ * ⚠ **必须排在会话预热之前**：预热是主动问一句，而设备对 0x46 的回包会**按请求
+ *   的格式回**（经典 8 字节 / FD 16 字节，见 `cb_query_device_info` 与固件的
+ *   `is_fd` 分叉）。也就是说“主动问”在 FD 对端上会学到“Classic 一致”——
+ *   镜像不等于真相，**永远发现不了对端是 FD**（`jsdk_ctx__learn_framing` 只学
+ *   一次）。只听心跳不存在这个问题：心跳格式是设备自己的。
+ *
  * @return 0 = 探测完成（不管有没有听到）；非 0 = 重开失败（错误已打印）
  */
 static int cli_probe_framing(cli_app_t *a, const char *ifname, const char *chan)
@@ -668,6 +674,29 @@ static int cli_probe_framing(cli_app_t *a, const char *ifname, const char *chan)
     return 0;
 }
 
+/**
+ * 会话预热：**幂等重发**把“首帧丢失”挡在用户真正要跑的命令之前。
+ *
+ * 为什么必须有（真机现场，2026-09）：适配器打开端口时会重置输入缓冲，主站头一两帧
+ * 会被丢掉，而 Lawicel slcan 对帧行**不回报结果**（实测 `acks/nacks` 恒 0）⇒
+ * 主机侧没有任何可观测信号，唯一的解法就是“幂等请求 + 重发”
+ * （见 `joint_sdk.h` 的 `jsdk_context_warmup()`）。
+ *
+ * 为什么排在探测之后：见 `cli_probe_framing()` 的说明（回包是镜像，学不到真相）。
+ *
+ * ⚠ 失败**不阻断**：预热只回答“设备有没有应答”，后面那条命令自己有完整的错误报告；
+ *   `hb-dump` 这类只收不发的场景根本不会走到这里（预热挂在“发帧之前”）。
+ */
+static void cli_warmup(cli_app_t *a)
+{
+    jsdk_status_t st = jsdk_context_warmup(a->ctx, 0u);
+
+    if (st != JSDK_OK && a->o.verbose) {
+        cli_fprintf(a->err, "jsdk-cli: 预热未收到应答（%s）：%s\n",
+                jsdk_status_string(st), jsdk_context_last_error(a->ctx));
+    }
+}
+
 int cli_open(cli_app_t *a)
 {
     const char *ifname = a->o.ifname ? a->o.ifname : default_ifname();
@@ -686,14 +715,22 @@ int cli_open(cli_app_t *a)
     if (rc != 0) return rc;
 
     /*
-     * ⚠ `estop` 不做探测：它是安全命令，必须**立刻**发出去。按 Classic 发是安全的
-     *   选择（FD 控制器也接受经典帧，而 8 字节以内的载荷两种格式完全一样）；
-     *   顺带把“Classic 总线上 estop 静默发不出去”这个老问题也避开了。
+     * ⚠ `estop` 不做探测、也不预热：它是安全命令，必须**立刻**发出去。按 Classic
+     *   发是安全的选择（FD 控制器也接受经典帧，而 8 字节以内的载荷两种格式完全
+     *   一样）；顺带把“Classic 总线上 estop 静默发不出去”这个老问题也避开了。
+     *   （先跑一条 `info`/`read` 可以把链路热起来；真要“不丢”的急停，见
+     *   `jsdk_context_warmup()` 的说明与固件侧的看门狗超时。）
      */
-    if (a->fd_auto && (!a->o.sub || strcmp(a->o.sub, "estop") != 0)) {
+    if (a->o.sub && strcmp(a->o.sub, "estop") == 0) return 0;
+
+    /* ① 帧格式：自动模式下先听一耳朵（必要时重开为 FD） */
+    if (a->fd_auto) {
         rc = cli_probe_framing(a, ifname, chan);
+        if (rc != 0) return rc;
     }
-    return rc;
+    /* ② 会话预热：把“首帧丢失”挡在用户真正要跑的命令之前 */
+    cli_warmup(a);
+    return 0;
 }
 
 /**

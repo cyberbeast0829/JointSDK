@@ -2270,6 +2270,16 @@ struct jsdk_context {
     /** 对端帧格式的学习结果：0 = 未知，1 = 已改为 Classic，2 = 已改为 FD，
         3 = 与配置一致（无需调整）。见 `jsdk_context_framing_learned()`。 */
     uint8_t           framing_learned;
+    /** 1 = 会话预热已成功过（同一个会话里再调 `jsdk_context_warmup()` 是空操作）。 */
+    uint8_t           warmed;
+    /* 自动预热是否已经尝试过（成功或失败都置 1）：失败后**不**在每个请求前
+       反复重试 500 ms —— 显式调用 jsdk_context_warmup() 仍然可以重试。 */
+    uint8_t           warmup_tried;
+    /* 1 = 正在跑会话预热。预热的收发**不参与帧格式学习**：设备对 0x46 的回包会
+       按**请求**的格式回（经典 8 B / FD 16 B），学到“一致”只是镜像，会掩盖
+       “对端其实是 FD”的真相（`jsdk_ctx__learn_framing()` 只学一次）。 */
+    uint8_t           in_warmup;
+    /** 1 = 正在预热（`jsdk_ctx_wait_response()` 里的懒预热靠它防递归）。 */
     jsdk_desc_info_t  desc;           /**< 对外元信息；crc/fw 同时是缓存键 */
 
     /**
@@ -2329,6 +2339,10 @@ static inline uint32_t jsdk_elapsed(uint32_t now, uint32_t then)
 int jsdk_ctx_send(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
                   uint8_t dest, const uint8_t *payload, uint8_t len);
 
+/** 不含自动预热的发送：控制帧 / 急停专用（延迟敏感，不能等）。 */
+int jsdk_ctx_send_raw(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
+                      uint8_t dest, const uint8_t *payload, uint8_t len);
+
 /**
  * 阻塞等待某个 `(msgtype, source)` 的响应，同时把所有收到的帧分派给
  * 反馈解复用器（否则会丢掉期间的心跳）。
@@ -2350,6 +2364,18 @@ int jsdk_ctx_wait_response(jsdk_context_t *ctx, uint8_t msgtype, uint8_t source,
  * @note **仅配置阶段可用**（会阻塞）。
  */
 int jsdk_ctx_probe_node(jsdk_context_t *ctx, uint8_t node_id);
+
+/**
+ * 学一次对端的帧格式（Classic vs FD），只认**我们自己的关节**发来的帧。
+ *
+ * ⚠ 从 `jsdk_ctx_handle_frame()` 与 `jsdk_ctx_wait_response()` **两处**都要调：
+ *   后者会把匹配的响应帧直接返回，**不再交给** handle_frame —— 只挂在
+ *   handle_frame 上的话，“响应帧自己就能告诉我们对端格式”这条信息就丢了
+ *   （而会话预热正是靠它工作的：静默总线上没有心跳可听）。
+ *
+ * @return 1 = 本次调用学到了/确认了（含“与配置一致”）；0 = 与本主站无关或已学过
+ */
+int jsdk_ctx__learn_framing(jsdk_context_t *ctx, const jsdk_can_frame_t *f);
 
 /**
  * 接收并解复用**一帧**（不推进时钟、不记账 rx 计数以外的状态）。
@@ -2954,12 +2980,15 @@ typedef struct {
     uint32_t rx_frames;
     uint32_t rx_for_me;
     uint32_t tx_frames;
-    uint32_t bad_len_drops;
-    /** 被“帧格式门限”丢掉的帧数：配成 **Classic** 的节点收到 FD 帧（真实控制器
+    uint32_t bad_len_drops;    /** 被“帧格式门限”丢掉的帧数：配成 **Classic** 的节点收到 FD 帧（真实控制器
         解析不了 FD 帧，现场表现就是“心跳收得到、请求没人应”）。
         有它才能让测试断言“请求**确实**被丢了”，而不是刚好被宽容地放过。 */
     uint32_t fd_into_classic_drops;
     uint32_t unhandled;
+    /** 首帧丢失注入：丢掉主站最初的 `drop_tx_head` 帧（真机 = 适配器刚打开时
+        头一两帧上不了总线）。`dropped_tx_head` 是实际丢掉的计数。 */
+    uint32_t drop_tx_head;
+    uint32_t dropped_tx_head;
 
     /* JSON 描述符（0x24 / 0x25） */
     struct {
@@ -7979,8 +8008,14 @@ void jsdk_ctx_publish_arena_used(jsdk_context_t *ctx)
  * 发送
  * ======================================================================== */
 
-int jsdk_ctx_send(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
-                  uint8_t dest, const uint8_t *payload, uint8_t len)
+/**
+ * 真正把帧交给 HAL（不含任何隐匿逻辑）。
+ *
+ * 控制帧、广播急停等“延迟敏感 / 不能等”的路径**必须**用这个函数，
+ * 否则可能被自动预热拖住（最多 `JSDK_WARMUP_TIMEOUT_MS`）。
+ */
+int jsdk_ctx_send_raw(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
+                      uint8_t dest, const uint8_t *payload, uint8_t len)
 {
     jsdk_can_frame_t f;
     int rc;
@@ -8000,6 +8035,26 @@ int jsdk_ctx_send(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
     rc = ctx->cfg.hal.send(ctx->cfg.hal.user, &f);
     if (rc != 0) ctx->bus.tx_failed++;
     return rc;
+}
+
+/**
+ * 配置阶段的请求发送：**在第一次发帧之前**先把会话预热掉。
+ *
+ * 放在这里（而不是等到 `wait_response()`）是有原因的：首帧丢失时，
+ * **已经发出去的**那条请求就是丢的那条，事后预热再成功也救不回它 ——
+ * 实测 `device_info()` 会照旧超时。所以顺序必须是“先预热、再发”。
+ *
+ * 控制路径（`in_cycle`）与急停走的是 `jsdk_ctx_send_raw()`：它们不能被
+ * 最多 500 ms 的预热阻塞（同时也是为了不让周期里多出帧）。
+ */
+int jsdk_ctx_send(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
+                  uint8_t dest, const uint8_t *payload, uint8_t len)
+{
+    if (jsdk_ctx_check(ctx) && !ctx->warmup_tried && ctx->nj > 0u
+        && !ctx->in_cycle) {
+        (void)jsdk_context_warmup(ctx, 0u);   /* 失败不阻断：下面照常发 */
+    }
+    return jsdk_ctx_send_raw(ctx, pri, msgtype, dest, payload, len);
 }
 
 /**
@@ -8036,19 +8091,11 @@ int jsdk_context_framing_learned(const jsdk_context_t *ctx)
  *
  * @return 1 = 已消费；0 = 与本主站无关（丢弃）
  */
-int jsdk_ctx_handle_frame(jsdk_context_t *ctx, const jsdk_can_frame_t *f)
+int jsdk_ctx__learn_framing(jsdk_context_t *ctx, const jsdk_can_frame_t *f)
 {
-    uint8_t msgtype = (uint8_t)cb_id_msgtype(f->id);
-    uint8_t src     = (uint8_t)cb_id_source(f->id);
-    uint8_t dst     = (uint8_t)cb_id_dest(f->id);
-    jsdk_joint_t *j;
+    uint8_t src = (uint8_t)cb_id_source(f->id);
 
-    if (!jsdk_ctx_check(ctx) || !f) return 0;
-
-    ctx->bus.rx_frames++;
-    ctx->bus.last_rx_age_ms = 0u;
-    ctx->bus.link_up = 1u;
-    ctx->last_rx_ms  = ctx->now_ms;
+    if (ctx->in_warmup) return 0;   /* 见 in_warmup 的说明：预热的回包是镜像 */
 
     /*
      * 学一次对端的**帧格式**（Classic vs FD）。
@@ -8068,7 +8115,9 @@ int jsdk_ctx_handle_frame(jsdk_context_t *ctx, const jsdk_can_frame_t *f)
      * 若悄悄改掉显式配置，调用者看到的 cfg 与实际发出的帧不一致，
      * 而且 8 字节参数的分块读也依赖 `is_fd`（FD 一次 8 B / Classic 一次 4 B）。
      */
-    if (ctx->framing_learned == 0u) {
+    if (ctx->framing_learned != 0u) return 0;
+
+    {
         unsigned k;
 
         for (k = 0u; k < ctx->nj; ++k) {
@@ -8084,10 +8133,28 @@ int jsdk_ctx_handle_frame(jsdk_context_t *ctx, const jsdk_can_frame_t *f)
                     ctx->cfg.is_fd       = peer_fd;
                     ctx->framing_learned = peer_fd ? 2u : 1u;   /* 1 = 改学 Classic */
                 }
-                break;
+                return 1;
             }
         }
     }
+    return 0;
+}
+
+int jsdk_ctx_handle_frame(jsdk_context_t *ctx, const jsdk_can_frame_t *f)
+{
+    uint8_t msgtype = (uint8_t)cb_id_msgtype(f->id);
+    uint8_t src     = (uint8_t)cb_id_source(f->id);
+    uint8_t dst     = (uint8_t)cb_id_dest(f->id);
+    jsdk_joint_t *j;
+
+    if (!jsdk_ctx_check(ctx) || !f) return 0;
+
+    ctx->bus.rx_frames++;
+    ctx->bus.last_rx_age_ms = 0u;
+    ctx->bus.link_up = 1u;
+    ctx->last_rx_ms  = ctx->now_ms;
+
+    (void)jsdk_ctx__learn_framing(ctx, f);   /* 见上面的长注释 */
 
     /* 寻址：设备只会以 dest = master_id 单播回复；广播告警除外 */
     if (dst != ctx->cfg.master_id && !(cb_id_is_broadcast(f->id) && dst == CB_ADDR_BROADCAST)) {
@@ -8202,6 +8269,12 @@ int jsdk_ctx_wait_response(jsdk_context_t *ctx, uint8_t msgtype, uint8_t source,
             ctx->bus.rx_frames++;
             ctx->bus.link_up = 1u;
             ctx->last_rx_ms  = ctx->now_ms;
+            /*
+             * ⚠ 匹配的响应帧**直接返回**，不会经过 `jsdk_ctx_handle_frame()`
+             *   —— 所以帧格式学习必须在这里也走一遍：会话预热就是靠**响应帧**
+             *   工作的（静默总线上没有心跳可听）。
+             */
+            (void)jsdk_ctx__learn_framing(ctx, &f);
             if (cb_id_msgtype(f.id) == msgtype && cb_id_source(f.id) == source) {
                 if (out) *out = f;
                 return JSDK_OK;
@@ -8306,8 +8379,10 @@ const char *jsdk_context_last_error(jsdk_context_t *ctx)
 void jsdk_context_estop(jsdk_context_t *ctx)
 {
     if (!jsdk_ctx_check(ctx)) return;
-    /* MsgType 0xC0 是全局广播（Dest = 0xFF），载荷被固件忽略 */
-    (void)jsdk_ctx_send(ctx, CB_PRI_CRITICAL, CB_MSG_ESTOP, CB_ADDR_BROADCAST, NULL, 0u);
+    /* MsgType 0xC0 是全局广播（Dest = 0xFF），载荷被固件忽略。
+       ⚠ 必须走 raw：急停不允许被自动预热拖住。 */
+    (void)jsdk_ctx_send_raw(ctx, CB_PRI_CRITICAL, CB_MSG_ESTOP, CB_ADDR_BROADCAST,
+                            NULL, 0u);
     ctx->tx_seq = cb_seq_next(ctx->tx_seq);
     jsdk_ctx_seterr(ctx, "ESTOP broadcast sent");
 }
@@ -8692,6 +8767,16 @@ jsdk_status_t jsdk_context_desc_fetch(jsdk_context_t *ctx)
     }
 
     node = ctx->joints[0].cfg.node_id;
+
+    /*
+     * 会话预热（幂等 + 重发）由 `jsdk_ctx_send()` 自动完成 —— 也就是下面
+     * `desc_fetch_from()` 发的**第一个**请求之前。不做的话，丢的会是我们这
+     * 38 KB 流的第一个请求（下载本身也重发，所以能自愈 —— 但那是“事后补救”；
+     * 预热让它压根别发生，而且顺带把这条链是否活着先确认掉）。
+     *
+     * ⚠ 这里**不**显式调用：只收不发的场景（`hb-dump` 这类）压根不需要设备先
+     *   应答，而自动钩子挂在“发帧之前”，天然跳过它们。
+     */
     st = desc_fetch_from(ctx, node);
     if (st != JSDK_OK) {
         ctx->desc_present = 0u;
@@ -10521,6 +10606,84 @@ void jsdk_joint__cycle_end_all(jsdk_context_t *ctx)
  */
 
 
+
+/* ==========================================================================
+ * 会话预热（`jsdk_context_warmup()`）
+ * ======================================================================== */
+
+/* 每轮等响应的窗口 = `JSDK_WARMUP_ATTEMPT_MS`（公共头里有说明：刻意取小，
+   因为“首帧丢失”等再久也没用，该做的是重发）。 */
+
+jsdk_status_t jsdk_context_warmup(jsdk_context_t *ctx, uint32_t timeout_ms)
+{
+    uint32_t budget;
+    uint32_t t0;
+    unsigned attempts = 0u;
+    unsigned max_attempts;
+    uint8_t  node;
+
+    if (!jsdk_ctx_check(ctx)) return JSDK_ERR_INVALID_ARG;
+    if (ctx->nj == 0u) {
+        jsdk_ctx_seterr(ctx, "warm-up needs at least one joint (its node_id is the "
+                             "probe target)");
+        return JSDK_ERR_BAD_STATE;
+    }
+    if (ctx->warmed) return JSDK_OK;      /* 同一个会话里只做一次 */
+
+    node   = ctx->joints[0].cfg.node_id;
+    budget = timeout_ms ? timeout_ms : JSDK_WARMUP_TIMEOUT_MS;
+    /*
+     * ⚠ 除了时间预算，还必须有**轮次上限**：`now_ms()` 不前进的 HAL（部分测试夹具、
+     *   客户自写的假时钟）下时间预算永远不会到期，光靠它就是一个**死循环**。
+     *   （`jsdk_ctx_wait_response()` 里那个自旋上限是同样理由的同一道防线。）
+     */
+    max_attempts = (unsigned)(budget / JSDK_WARMUP_ATTEMPT_MS) + 2u;
+    t0     = ctx->cfg.hal.now_ms(ctx->cfg.hal.user);
+    /*
+     * 标记“会话预热已经尝试过”：
+     *   - 成功 → `warmed`，以后全是空操作；
+     *   - 失败 → 自动预热（`jsdk_ctx_send()` 里的钩子）不会**每个请求**都再花
+     *     500 ms，但显式再调本函数仍然会重试（现场复查链路时很有用）。
+     */
+    ctx->warmup_tried = 1u;
+    ctx->in_warmup    = 1u;   /* 预热期间的收发不参与帧格式学习（见内部头注释） */
+
+    for (;;) {
+        attempts++;
+
+        /* 幂等探测：`QUERY_DEVICE_INFO` 只读一个设备信息，重发无副作用。
+           ⚠ 用 raw 发送：不能在这里再触发一次自动预热（那才是真的递归）。 */
+        if (jsdk_ctx_send_raw(ctx, CB_PRI_QUERY, CB_MSG_QUERY_DEVICE_INFO, node,
+                              NULL, 0u) != 0) {
+            ctx->in_warmup = 0u;
+            return JSDK_ERR_TRANSPORT;
+        }
+        ctx->tx_seq = cb_seq_next(ctx->tx_seq);
+
+        if (jsdk_ctx_wait_response(ctx, CB_MSG_QUERY_DEVICE_INFO, node, NULL,
+                                   JSDK_WARMUP_ATTEMPT_MS) == JSDK_OK) {
+            ctx->warmed     = 1u;
+            ctx->in_warmup  = 0u;
+            ctx->bus.tx_retries += (uint32_t)(attempts - 1u);
+            return JSDK_OK;
+        }
+
+        if (attempts >= max_attempts
+            || jsdk_elapsed(ctx->cfg.hal.now_ms(ctx->cfg.hal.user), t0)
+                   + JSDK_WARMUP_ATTEMPT_MS >= budget) {
+            ctx->in_warmup = 0u;
+            ctx->bus.tx_retries += (uint32_t)(attempts - 1u);
+            jsdk_ctx_seterr(ctx,
+                "session warm-up failed: node %u did not answer %u attempts "
+                "(budget %u ms, %u ms per attempt) — the link is up but there is no "
+                "reply; check the adapter/device, or the frame format if you set one "
+                "explicitly",
+                (unsigned)node, (unsigned)attempts, (unsigned)budget,
+                (unsigned)JSDK_WARMUP_ATTEMPT_MS);
+            return JSDK_ERR_TIMEOUT;
+        }
+    }
+}
 
 /* ==========================================================================
  * 内部工具

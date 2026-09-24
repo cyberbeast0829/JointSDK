@@ -851,6 +851,67 @@ static void test_framing_adopt(void)
  * main
  * ======================================================================== */
 
+/**
+ * [14] 会话预热：`drophead=N` 注入“主站头 N 帧上不了总线”（真机 = 适配器刚打开时
+ *      重置了输入缓冲，而 Lawicel slcan 对帧行不回报结果 ⇒ 主机毫无信号），
+ *      断言命令**照样成功** —— 也就是幂等重发真的自救。
+ *
+ * ⚠ 獟牙：去掉 `cli_open()` 里的 `cli_warmup(a)`（或把预热里的重发循环拆掉），
+ *   第一条 `read` 就会失败 → 本项变红。这是唯一一条**端到端**钉住“首帧丢失”
+ *   这个现场问题的用例（仿真器侧由 `drophead` 复刻适配器行为）。
+ */
+static void test_warmup(void)
+{
+    run_t r;
+
+    printf("[14] session warm-up: dropped first frames are absorbed before the "
+           "user's command\n");
+
+    /*
+     * --- `info` 是**最锋利**的一条：它只发一条 0x46 就等回包，没有描述符
+     *     那一套“下载自带重发”的兜底 ⇒ 丢首帧就是真失败（现场原症状）。
+     *     没有预热时这里必红（`info 失败：timeout / not configured`）。
+     *     顺带把 1..5 帧都过一遍：`重发=` 正好等于丢掉的帧数。
+     */
+    {
+        static const unsigned drops[] = { 1u, 2u, 5u };
+        size_t k;
+
+        for (k = 0u; k < sizeof drops / sizeof drops[0]; ++k) {
+            char ch[128];
+            char want[32];
+
+            snprintf(ch, sizeof ch,
+                     "0:id=1,gear=16.5,hb=10,timeout=30000,fd,drophead=%u",
+                     drops[k]);
+            snprintf(want, sizeof want, "重发=%u（预热）", drops[k]);
+
+            RUN_CLI(&r, "--if", "virtual", "--channel", ch, "-v", "--json", "info");
+            CHECK(r.rc == 0);
+            expect_has(&r, "out", "\"serial\"");
+            expect_has(&r, "err", want);
+        }
+    }
+
+    /* --- `read`：错误注入下也要成功（这条另有描述符重发兜底，用来钉住报告值） --- */
+    RUN_CLI(&r, "--if", "virtual", "--channel",
+            "0:id=1,gear=16.5,hb=10,timeout=30000,fd,drophead=2", "-v",
+            "--json", "read", "axis0.motor.config.gear_ratio");
+    CHECK(r.rc == 0);
+    expect_has(&r, "out", "\"value\":16.5");
+    expect_has(&r, "err", "重发=2（预热）");
+
+    /* --- 全丢：必须**明确失败**（不能“静静地什么也没做”），并说明预热没等到应答 --- */
+    RUN_CLI(&r, "--if", "virtual", "--channel",
+            "0:id=1,gear=16.5,hb=10,timeout=30000,fd,drophead=100000", "-v",
+            "--json", "info");
+    CHECK(r.rc != 0);
+    expect_has(&r, "err", "预热未收到应答");
+
+    printf("      drophead=1/2/5 -> info still succeeded and reported the retries; "
+           "all dropped -> reported\n");
+}
+
 int main(void)
 {
     printf("=== WP7 tests (jsdk-cli) ===\n\n");
@@ -880,6 +941,8 @@ int main(void)
     test_calibrate_timeout();
     printf("\n");
     test_framing_adopt();
+    printf("\n");
+    test_warmup();
 
     printf("\n=== %u checks, %u failures ===\n", g_checks, g_fail);
     return (g_fail == 0u) ? 0 : 1;

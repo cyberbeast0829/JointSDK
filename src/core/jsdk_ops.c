@@ -18,6 +18,85 @@
 #include <string.h>
 
 /* ==========================================================================
+ * 会话预热（`jsdk_context_warmup()`）
+ * ======================================================================== */
+
+/* 每轮等响应的窗口 = `JSDK_WARMUP_ATTEMPT_MS`（公共头里有说明：刻意取小，
+   因为“首帧丢失”等再久也没用，该做的是重发）。 */
+
+jsdk_status_t jsdk_context_warmup(jsdk_context_t *ctx, uint32_t timeout_ms)
+{
+    uint32_t budget;
+    uint32_t t0;
+    unsigned attempts = 0u;
+    unsigned max_attempts;
+    uint8_t  node;
+
+    if (!jsdk_ctx_check(ctx)) return JSDK_ERR_INVALID_ARG;
+    if (ctx->nj == 0u) {
+        jsdk_ctx_seterr(ctx, "warm-up needs at least one joint (its node_id is the "
+                             "probe target)");
+        return JSDK_ERR_BAD_STATE;
+    }
+    if (ctx->warmed) return JSDK_OK;      /* 同一个会话里只做一次 */
+
+    node   = ctx->joints[0].cfg.node_id;
+    budget = timeout_ms ? timeout_ms : JSDK_WARMUP_TIMEOUT_MS;
+    /*
+     * ⚠ 除了时间预算，还必须有**轮次上限**：`now_ms()` 不前进的 HAL（部分测试夹具、
+     *   客户自写的假时钟）下时间预算永远不会到期，光靠它就是一个**死循环**。
+     *   （`jsdk_ctx_wait_response()` 里那个自旋上限是同样理由的同一道防线。）
+     */
+    max_attempts = (unsigned)(budget / JSDK_WARMUP_ATTEMPT_MS) + 2u;
+    t0     = ctx->cfg.hal.now_ms(ctx->cfg.hal.user);
+    /*
+     * 标记“会话预热已经尝试过”：
+     *   - 成功 → `warmed`，以后全是空操作；
+     *   - 失败 → 自动预热（`jsdk_ctx_send()` 里的钩子）不会**每个请求**都再花
+     *     500 ms，但显式再调本函数仍然会重试（现场复查链路时很有用）。
+     */
+    ctx->warmup_tried = 1u;
+    ctx->in_warmup    = 1u;   /* 预热期间的收发不参与帧格式学习（见内部头注释） */
+
+    for (;;) {
+        attempts++;
+
+        /* 幂等探测：`QUERY_DEVICE_INFO` 只读一个设备信息，重发无副作用。
+           ⚠ 用 raw 发送：不能在这里再触发一次自动预热（那才是真的递归）。 */
+        if (jsdk_ctx_send_raw(ctx, CB_PRI_QUERY, CB_MSG_QUERY_DEVICE_INFO, node,
+                              NULL, 0u) != 0) {
+            ctx->in_warmup = 0u;
+            ctx->bus.tx_retries += (uint32_t)(attempts - 1u);   /* 之前那几轮是真重发 */
+            return JSDK_ERR_TRANSPORT;
+        }
+        ctx->tx_seq = cb_seq_next(ctx->tx_seq);
+
+        if (jsdk_ctx_wait_response(ctx, CB_MSG_QUERY_DEVICE_INFO, node, NULL,
+                                   JSDK_WARMUP_ATTEMPT_MS) == JSDK_OK) {
+            ctx->warmed     = 1u;
+            ctx->in_warmup  = 0u;
+            ctx->bus.tx_retries += (uint32_t)(attempts - 1u);
+            return JSDK_OK;
+        }
+
+        if (attempts >= max_attempts
+            || jsdk_elapsed(ctx->cfg.hal.now_ms(ctx->cfg.hal.user), t0)
+                   + JSDK_WARMUP_ATTEMPT_MS >= budget) {
+            ctx->in_warmup = 0u;
+            ctx->bus.tx_retries += (uint32_t)(attempts - 1u);
+            jsdk_ctx_seterr(ctx,
+                "session warm-up failed: node %u did not answer %u attempts "
+                "(budget %u ms, %u ms per attempt) — the link is up but there is no "
+                "reply; check the adapter/device, or the frame format if you set one "
+                "explicitly",
+                (unsigned)node, (unsigned)attempts, (unsigned)budget,
+                (unsigned)JSDK_WARMUP_ATTEMPT_MS);
+            return JSDK_ERR_TIMEOUT;
+        }
+    }
+}
+
+/* ==========================================================================
  * 内部工具
  * ======================================================================== */
 

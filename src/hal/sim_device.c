@@ -1098,11 +1098,22 @@ static void handle_frame_for_node(sim_bus_t *b, sim_node_t *n,
         cb_be_put_u32(payload, d.hw_ver);
         cb_be_put_u32(payload + 4, d.fw_ver);
         cb_be_put_u64(payload + 8, d.serial);
+        /*
+         * ⚠ 回包格式用**节点自己的** `is_fd`，不是请求的格式。
+         *
+         * 设备的帧格式是它自己的配置（`can.config.baud_rate`）决定的，它对收到的
+         * 经典请求照样用 FD 回 —— 就像它自己发的心跳与描述符流一样
+         * （见 `b->desc.is_classic = !n->is_fd`）。若这里改成“跟随请求格式”，
+         * 主站就会从回包里学到“一致”，从而**永远发现不了对端其实是 FD**：
+         * 自动对齐失效、显式配置冲突也报不出来（`jsdk_ctx__learn_framing()`
+         * 只学一次，谁都救不回来）。
+         * `classic`（请求格式）仍然要用来**解析请求载荷**（经典 4 B 分块读）。
+         */
         sim_emit(b, cb_make_id(CB_PRI_QUERY, msgtype, master_id,
                                (uint8_t)n->node_id, 0u),
                  payload,
-                 (uint8_t)(classic ? CB_QUERY_DEVLEN_CLASSIC : CB_QUERY_DEVLEN_FD),
-                 classic ? 0 : 1);
+                 (uint8_t)(n->is_fd ? CB_QUERY_DEVLEN_FD : CB_QUERY_DEVLEN_CLASSIC),
+                 (int)n->is_fd);
         break;
     }
 
@@ -1160,6 +1171,16 @@ void sim_rx(sim_bus_t *b, const jsdk_can_frame_t *f)
 
     if (!b || !f) return;
     b->rx_frames++;
+
+    /*
+     * 首帧丢失：主站打开端口后头 N 帧**上不了总线**（现场由适配器重置输入缓冲
+     * 造成，Lawicel slcan 对帧行不回报结果 ⇒ 主机毫无信号）。
+     * 复刻它，才能端到端验证“会话预热 = 幂等重发”真的能自救。
+     */
+    if (b->dropped_tx_head < b->drop_tx_head) {
+        b->dropped_tx_head++;
+        return;
+    }
 
     for (i = 0u; i < b->n_nodes; ++i) {
         sim_node_t *n = &b->nodes[i];
@@ -1432,6 +1453,15 @@ int sim_configure(sim_bus_t *b, const char *spec)
             /* 故障注入：静默丢弃参数写（复刻固件 `if (msg.len < 8) return;`）。
                **不走总线的正常路径**，就是“写进去没反应、也不报错”的真机语义。 */
             if (!matched) { TRY_KEY("dropwrite");if (matched) { b->nodes[idx].drop_writes = 1u; p += adv; } }
+            /* 故障注入：丢掉主站最初的 N 帧（“首帧丢失”，总线级、与节点无关）。
+               端到端验证会话预热：`drophead=2` 时命令仍必须成功。 */
+            if (!matched) { TRY_KEY("drophead");
+                if (matched) {
+                    if (p[adv] != '=') return -1;
+                    b->drop_tx_head = (uint32_t)strtoul(p + adv + 1, &end, 10);
+                    if (end == p + adv + 1) return -1;
+                    p = end;
+                } }
 
             #define TRY_F32(k, field)                                              \
                 if (!matched) {                                                    \

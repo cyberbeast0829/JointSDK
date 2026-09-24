@@ -234,12 +234,15 @@ typedef struct {
     uint32_t rx_frames;
     uint32_t rx_for_me;
     uint32_t tx_frames;
-    uint32_t bad_len_drops;
-    /** 被“帧格式门限”丢掉的帧数：配成 **Classic** 的节点收到 FD 帧（真实控制器
+    uint32_t bad_len_drops;    /** 被“帧格式门限”丢掉的帧数：配成 **Classic** 的节点收到 FD 帧（真实控制器
         解析不了 FD 帧，现场表现就是“心跳收得到、请求没人应”）。
         有它才能让测试断言“请求**确实**被丢了”，而不是刚好被宽容地放过。 */
     uint32_t fd_into_classic_drops;
     uint32_t unhandled;
+    /** 首帧丢失注入：丢掉主站最初的 `drop_tx_head` 帧（真机 = 适配器刚打开时
+        头一两帧上不了总线）。`dropped_tx_head` 是实际丢掉的计数。 */
+    uint32_t drop_tx_head;
+    uint32_t dropped_tx_head;
 
     /* JSON 描述符（0x24 / 0x25） */
     struct {

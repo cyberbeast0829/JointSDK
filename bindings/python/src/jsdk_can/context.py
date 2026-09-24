@@ -52,8 +52,8 @@ class BusState:
     """``jsdk_bus_state_t`` 的 Python 视图。"""
 
     __slots__ = ("tx_frames", "rx_frames", "tx_failed", "rx_dropped",
-                 "keepalive_sent", "last_rx_age_ms", "hal_bus_flags",
-                 "link_errors", "nodes_online", "link_up")
+                 "keepalive_sent", "tx_retries", "last_rx_age_ms",
+                 "hal_bus_flags", "link_errors", "nodes_online", "link_up")
 
     def __init__(self, c: _abi.BusState) -> None:
         self.tx_frames = c.tx_frames
@@ -61,6 +61,7 @@ class BusState:
         self.tx_failed = c.tx_failed
         self.rx_dropped = c.rx_dropped
         self.keepalive_sent = c.keepalive_sent
+        self.tx_retries = c.tx_retries
         self.last_rx_age_ms = c.last_rx_age_ms
         self.hal_bus_flags = c.hal_bus_flags
         self.link_errors = c.link_errors
@@ -277,6 +278,34 @@ class Context:
         joint = Joint(self, ptr, len(self._joints), int(node_id))
         self._joints.append(joint)
         return joint
+
+    def warmup(self, timeout_ms: int = 0) -> bool:
+        """会话预热（幂等重发）：把"首帧丢失"挡在第一条真命令之前。
+
+        真机（slcan）症状：适配器打开端口时重置输入缓冲，主站**头一两帧上不了
+        总线**，而 Lawicel 对帧行**不回报结果**（``acks/nacks`` 恒 0）⇒ 主机侧
+        没有任何可观测信号，第一条命令就会莫名超时（``0/0 bytes`` + 心跳正常），
+        再敲一次又好了。唯一可验证的解法就是"幂等请求 + 重发"，也就是这个调用：
+        反复发一条只读的 ``QUERY_DEVICE_INFO(0x46)``，每轮只等 50 ms，直到
+        设备应答或总预算用完。
+
+        :param timeout_ms: 总预算（ms）；``0`` = 用库默认（``JSDK_WARMUP_TIMEOUT_MS``）。
+        :return: ``True`` = 设备应答了（链路可确认）；``False`` = 预算内没应答。
+
+        ⚠ ``False`` **不是致命错误**：只收不发的命令（``hb-dump`` 这类）照样能用；
+          但别把它当成功 —— 设备掉电/线松了就是这一步最先暴露。
+        ⚠ 同一会话里成功后**再调是空操作**；失败后自动预热不会再反复花时间，
+          但**显式**调用本方法仍然可以重试（现场复查链路很有用）。
+        ⚠ 预热自己的收发**不参与帧格式学习**（设备可能按请求的格式回包，那是镜像
+          而不是真相）。格式仍然靠设备主动发的帧（心跳）或显式配置来判断。
+        """
+        st = self._lib.jsdk_context_warmup(self._ctx_ptr, int(timeout_ms))
+        if st == Status.OK:
+            return True
+        if st == Status.TIMEOUT:
+            return False
+        raise_for_status(st, "warmup", self.last_error())
+        return False
 
     def configure(self) -> None:
         """握手 → 下载并解析 JSON 描述符 → 读回标定量。

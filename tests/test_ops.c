@@ -128,9 +128,13 @@ typedef struct {
     unsigned                 desc_stream_seen;    /* 设备已开始发本次 0x25 流 */
 
     /* 注入故障 4：把某个端点的**读响应值**改成指定值
-       （模拟真机 F28：`can.config.break_timeout` 读回恒为 0） */
+       （模拟真机 F28：`can.config.read_timeout` 读回恒为 0） */
     uint16_t                 patch_read_ep;
     uint16_t                 patch_read_value;
+
+    /* 注入故障 5：时钟冻住（`now_ms` 不前进）—— 客户自写假时钟的常见写法。
+       时间预算永远不到期，所以预热**必须有轮次上限**，否则就是死循环。 */
+    int                      freeze_clock;
 } fix_t;
 
 static int w_send(void *u, const jsdk_can_frame_t *f)
@@ -203,7 +207,8 @@ static int w_recv(void *u, jsdk_can_frame_t *f)
 static uint32_t w_now(void *u)
 {
     fix_t *fx = (fix_t *)u;
-    jsdk_hal_virtual_advance_ms(fx->h, 1u);
+
+    if (!fx->freeze_clock) jsdk_hal_virtual_advance_ms(fx->h, 1u);
     return fx->inner.now_ms(fx->inner.user);
 }
 
@@ -1320,12 +1325,20 @@ static void test_lost_first_request(void)
         CHECK_EQ(fx.desc_reqs_on_bus, 1u);              /* 只有 1 个请求真正到达设备 */
         CHECK_EQ(fx.j->calibrated, 1);
         CHECK_NEAR(fx.j->gear_ratio, 16.0f, 1e-4f);
-        printf("      dropped %u frame(s): configure() recovered "
+        /*
+         * ⚠ 这 n 帧是**会话预热**吸收掉的（不是描述符重发）：预热探测幂等，
+         *   丢一帧就重发一次 ⇒ `tx_retries == n`，而描述符请求因此**一次**就到达设备。
+         *   （去掉预热 → 这里会是 0，而描述符重发才去救 —— 用例就是要钉住这个差别。）
+         */
+        CHECK_EQ(fx.ctx->bus.tx_retries, n);
+        CHECK_EQ(jsdk_context_warmup(fx.ctx, 0u), JSDK_OK);   /* 已预热 → 空操作 */
+        CHECK_EQ(fx.ctx->bus.tx_retries, n);
+        printf("      dropped %u frame(s): warm-up retried, configure() recovered "
                "(1 request reached the device)\n", n);
         fx_close(&fx);
     }
 
-    /* --- 全丢：必须重发 3 次后超时，且给出“收到了 N 帧”这种可判定的信息 --- */
+    /* --- 全丢：预热与描述符重发都拿不到响应 → 必须失败，且信息可判定 --- */
     {
         fix_t fx;
 
@@ -1335,12 +1348,17 @@ static void test_lost_first_request(void)
         }
         fx.drop_tx_head = 1000u;
         CHECK_EQ(fx_configure(&fx), -1);
-        CHECK_EQ(fx.dropped, 4u);                      /* 1 次 + 3 次重发 */
+        /*
+         * ⚠ “丢了几帧”现在是**时间相关**的（预热每轮 50 ms、预算 500 ms），
+         *   所以断言行为而不是精确值：预热重发过，而描述符请求**一次都没**到达设备。
+         */
+        CHECK(fx.dropped >= 4u);
+        CHECK(fx.ctx->bus.tx_retries >= 5u);           /* 预热确实在重发 */
         CHECK_EQ(fx.desc_reqs_on_bus, 0u);
         CHECK(strstr(jsdk_context_last_error(fx.ctx),
                      "stalled: no new bytes") != NULL);
         CHECK(strstr(jsdk_context_last_error(fx.ctx), "frames received") != NULL);
-        printf("      all 4 attempts dropped -> %s\n",
+        printf("      everything dropped -> %s\n",
                jsdk_context_last_error(fx.ctx));
         fx_close(&fx);
     }
@@ -1902,6 +1920,79 @@ static void test_framing_semantics(void)
     fx_close(&fx);
 }
 
+/**
+ * [15] 会话预热：**幂等重发**把“首帧丢失”挡在用户命令之前。
+ *
+ * 现场（slcan）：适配器在打开端口后重置输入缓冲，我们头一两条命令**被丢掉**，
+ * 而 Lawicel slcan 对帧行**不回报结果**（实测 acks/nacks 恒 0）⇒ 主机没有任何
+ * 可观测信号。唯一可验证的解法就是幂等请求 + 重发（见 joint_sdk.h 的长注释）。
+ */
+static void test_warmup(void)
+{
+    fix_t fx;
+    uint32_t before;
+
+    printf("[15] session warm-up: idempotent probe + retry absorbs the first-frame loss\n");
+
+    /* ---- ① 链路健康：一次成功、零重发，第二次调用是空操作 ---- */
+    if (fx_open(&fx, "0:id=1,hb=10,timeout=30000,fd", 1u) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+    CHECK_EQ(jsdk_context_warmup(fx.ctx, 0u), JSDK_OK);
+    CHECK_EQ(fx.ctx->bus.tx_retries, 0u);
+    CHECK_EQ(fx.dropped, 0u);
+    before = fx.ctx->bus.tx_frames;
+    CHECK_EQ(jsdk_context_warmup(fx.ctx, 0u), JSDK_OK);
+    CHECK_EQ(fx.ctx->bus.tx_frames, before);      /* 已预热 → 一帧都不再发 */
+    fx_close(&fx);
+
+    /* ---- ② 丢 1 帧：预热重发一次即恢复 ---- */
+    if (fx_open(&fx, "0:id=1,hb=10,timeout=30000,fd", 1u) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+    fx.drop_tx_head = 1u;
+    CHECK_EQ(jsdk_context_warmup(fx.ctx, 0u), JSDK_OK);
+    CHECK_EQ(fx.dropped, 1u);
+    CHECK_EQ(fx.ctx->bus.tx_retries, 1u);
+    fx_close(&fx);
+
+    /* ---- ③ 懒预热：库用户不显式调用也能受益（第一次请求就是安全的）---- */
+    if (fx_open(&fx, "0:id=1,hb=10,timeout=30000,fd", 1u) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+    fx.drop_tx_head = 2u;                          /* 头两帧（= 预热的两轮）丢 */
+    {
+        jsdk_device_info_t info;
+
+        CHECK_EQ(jsdk_joint_get_device_info(fx.j, &info), JSDK_OK);
+        CHECK_EQ(info.hw_version != 0u, 1);
+        CHECK_EQ(fx.ctx->bus.tx_retries, 2u);
+        CHECK(fx.dropped >= 2u);
+    }
+    fx_close(&fx);
+
+    /* ---- ④ 整条链没应答：TIMEOUT + 说明是“预热失败”，且预热重发过 ---- */
+    if (fx_open(&fx, "0:id=1,hb=10,timeout=30000,fd", 1u) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+    fx.drop_tx_head = 1000u;
+    CHECK_EQ(jsdk_context_warmup(fx.ctx, 200u), JSDK_ERR_TIMEOUT);
+    CHECK(fx.ctx->bus.tx_retries >= 2u);
+    CHECK(strstr(jsdk_context_last_error(fx.ctx), "session warm-up failed") != NULL);
+    CHECK(strstr(jsdk_context_last_error(fx.ctx), "node 1") != NULL);
+    fx_close(&fx);
+
+    /* ---- ⑤ 时钟冻住（客户自写 HAL 的假时钟）：必须靠**轮次上限**收尾，不能死循环 ---- */
+    if (fx_open(&fx, "0:id=1,hb=10,timeout=30000,fd", 1u) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+    fx.drop_tx_head = 1000u;
+    fx.freeze_clock = 1;
+    CHECK_EQ(jsdk_context_warmup(fx.ctx, 100u), JSDK_ERR_TIMEOUT);
+    CHECK(fx.ctx->bus.tx_retries >= 1u);
+    fx_close(&fx);
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -1926,6 +2017,7 @@ int main(void)
     test_write_short_values(); printf("\n");
     test_desc_stall_budget(); printf("\n");
     test_framing_semantics(); printf("\n");
+    test_warmup();       printf("\n");
     test_robustness();   printf("\n");
 
     free(g_json);

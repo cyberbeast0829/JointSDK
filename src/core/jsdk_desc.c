@@ -379,6 +379,16 @@ jsdk_status_t jsdk_context_desc_fetch(jsdk_context_t *ctx)
     }
 
     node = ctx->joints[0].cfg.node_id;
+
+    /*
+     * 会话预热（幂等 + 重发）由 `jsdk_ctx_send()` 自动完成 —— 也就是下面
+     * `desc_fetch_from()` 发的**第一个**请求之前。不做的话，丢的会是我们这
+     * 38 KB 流的第一个请求（下载本身也重发，所以能自愈 —— 但那是“事后补救”；
+     * 预热让它压根别发生，而且顺带把这条链是否活着先确认掉）。
+     *
+     * ⚠ 这里**不**显式调用：只收不发的场景（`hb-dump` 这类）压根不需要设备先
+     *   应答，而自动钩子挂在“发帧之前”，天然跳过它们。
+     */
     st = desc_fetch_from(ctx, node);
     if (st != JSDK_OK) {
         ctx->desc_present = 0u;

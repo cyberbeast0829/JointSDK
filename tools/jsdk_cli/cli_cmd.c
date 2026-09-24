@@ -1854,13 +1854,20 @@ int jsdk_cli_run(int argc, char **argv, FILE *out, FILE *err)
             /* ⚠ 报**实际生效**的格式，而不是 `a.fd`：SDK 的自动对齐可能已经把
                上下文改成对端的格式（此时 `a.fd` 还是起步时的值，说了会自相矛盾）。 */
             int eff_fd = (got == 2) ? 1 : ((got == 1) ? 0 : a.fd);
+            jsdk_bus_state_t bs;
+            uint32_t retries = 0u;
+
+            if (a.ctx && jsdk_context_get_bus_state(a.ctx, &bs) == JSDK_OK) {
+                retries = bs.tx_retries;
+            }
 
             cli_fprintf(err, "jsdk-cli: 帧格式：%s%s；framing_learned=%d；"
-                            "首发=%s（tx=%u rx=%u）\n",
+                            "首发=%s；重发=%u（预热）（tx=%u rx=%u）\n",
                     eff_fd ? "CAN FD" : "Classic",
                     a.fd_auto ? "（探测决定）" : "（显式/已定）", got,
                     a.first_tx_fd < 0 ? "none"
                                       : (a.first_tx_fd ? "CAN FD" : "Classic"),
+                    (unsigned)retries,
                     (unsigned)a.tx_frames, (unsigned)a.rx_frames);
             if (a.hal && a.o.ifname && strcmp(a.o.ifname, "slcan") == 0) {
                 uint32_t tx = 0u, rx = 0u, bad = 0u, acks = 0u, nacks = 0u;
@@ -1875,9 +1882,9 @@ int jsdk_cli_run(int argc, char **argv, FILE *out, FILE *err)
 
         if (got == 1 || got == 2) {
             /*
-             * ⚠ 只在**没探测过**时才报“猜错了、已改学”：自动模式下 CLI 会先听一耳朵
-             *   （见 cli_app.c 的 cli_probe_framing），帧格式是“探测决定”的，
-             *   再报一句“本次的 is_fd 猜错了”就是噪声（而且是假话）。
+             * ⚠ 只在**预热也没得到应答**时才报“猜错了、已改学”：自动模式下 CLI
+             *   会先问一句对端（见 cli_app.c 的 cli_warmup_and_align），帧格式是
+             *   “探测决定”的，再报一句“本次的 is_fd 猜错了”就是噪声（而且是假话）。
              *   探测的结果在 `-v` 里如实打出来。
              */
             if (a.framing_probe == 0) {
