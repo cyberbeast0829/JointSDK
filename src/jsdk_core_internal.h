@@ -351,6 +351,21 @@ int jsdk_ctx_send_raw(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
  */
 #define JSDK_REQ_RETRY_MAX 1u
 
+/*
+ * `jsdk_ctx_request()` 的行为开关。
+ *
+ * ⚠⚠ 别用“重发”与“记账”两个布尔参数去堆签名 —— 这两件事的**判据不同**：
+ *   重发看“幂等吗”，记账看“这次没等到，值得让人知道吗”。
+ *   典型反例（真机实测抓到的）：`scan` 会逐个问 1..16 号地址，
+ *   **绝大多数地址本来就没人** ⇒ 15 次“等超时”是**正常结果**；
+ *   把它们算进 `req_timeouts`，现场就会看到一条健康的扫描报 `超时=15`，
+ *   与“链路坏了”完全分不清。
+ */
+/** 超时后重发同一帧（最多 `JSDK_REQ_RETRY_MAX` 次）。⚠ 只能用于**幂等**请求。 */
+#define JSDK_REQ_RETRY 0x1u
+/** 计入 `req_timeouts` / `last_retry_*`（“这次没等到值得让人知道”）。 */
+#define JSDK_REQ_COUNT 0x2u
+
 /**
  * 幂等的“请求 → 响应”：`allow_retry` 非 0 时超时后重发同一帧
  * （最多 `JSDK_REQ_RETRY_MAX` 次）。
@@ -363,12 +378,13 @@ int jsdk_ctx_send_raw(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
  * @param rsp_msgtype **应答**的 MsgType：多数查询与请求同号（0x20/0x21/0x45/0x46），
  *                    但 `QUERY_STATUS(0x40)` 等的应答是 MIT 响应（**0x00**）——
  *                    写错了就是“永远等不到应答”（本函数无法替你猜）。
- * @param allow_retry 非 0 = 允许幂等重发；0 = 只发一次。
+ * @param flags       `JSDK_REQ_RETRY` / `JSDK_REQ_COUNT` 的按位或；
+ *                    **0 = 只发一次且不记账**。
  */
 int jsdk_ctx_request(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
                      uint8_t dest, const uint8_t *payload, uint8_t len,
                      uint8_t rsp_msgtype, jsdk_can_frame_t *out,
-                     uint32_t timeout_ms, int allow_retry);
+                     uint32_t timeout_ms, unsigned flags);
 
 /** 幂等请求 + 自动重发（面向用户的命令走这个）。 */
 int jsdk_ctx_request_retry(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,

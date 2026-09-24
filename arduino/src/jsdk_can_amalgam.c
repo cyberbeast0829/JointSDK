@@ -2367,6 +2367,21 @@ int jsdk_ctx_send_raw(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
  */
 #define JSDK_REQ_RETRY_MAX 1u
 
+/*
+ * `jsdk_ctx_request()` 的行为开关。
+ *
+ * ⚠⚠ 别用“重发”与“记账”两个布尔参数去堆签名 —— 这两件事的**判据不同**：
+ *   重发看“幂等吗”，记账看“这次没等到，值得让人知道吗”。
+ *   典型反例（真机实测抓到的）：`scan` 会逐个问 1..16 号地址，
+ *   **绝大多数地址本来就没人** ⇒ 15 次“等超时”是**正常结果**；
+ *   把它们算进 `req_timeouts`，现场就会看到一条健康的扫描报 `超时=15`，
+ *   与“链路坏了”完全分不清。
+ */
+/** 超时后重发同一帧（最多 `JSDK_REQ_RETRY_MAX` 次）。⚠ 只能用于**幂等**请求。 */
+#define JSDK_REQ_RETRY 0x1u
+/** 计入 `req_timeouts` / `last_retry_*`（“这次没等到值得让人知道”）。 */
+#define JSDK_REQ_COUNT 0x2u
+
 /**
  * 幂等的“请求 → 响应”：`allow_retry` 非 0 时超时后重发同一帧
  * （最多 `JSDK_REQ_RETRY_MAX` 次）。
@@ -2379,12 +2394,13 @@ int jsdk_ctx_send_raw(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
  * @param rsp_msgtype **应答**的 MsgType：多数查询与请求同号（0x20/0x21/0x45/0x46），
  *                    但 `QUERY_STATUS(0x40)` 等的应答是 MIT 响应（**0x00**）——
  *                    写错了就是“永远等不到应答”（本函数无法替你猜）。
- * @param allow_retry 非 0 = 允许幂等重发；0 = 只发一次。
+ * @param flags       `JSDK_REQ_RETRY` / `JSDK_REQ_COUNT` 的按位或；
+ *                    **0 = 只发一次且不记账**。
  */
 int jsdk_ctx_request(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
                      uint8_t dest, const uint8_t *payload, uint8_t len,
                      uint8_t rsp_msgtype, jsdk_can_frame_t *out,
-                     uint32_t timeout_ms, int allow_retry);
+                     uint32_t timeout_ms, unsigned flags);
 
 /** 幂等请求 + 自动重发（面向用户的命令走这个）。 */
 int jsdk_ctx_request_retry(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
@@ -6862,7 +6878,8 @@ int jsdk_ctx_read_param_ex(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_id,
     rc = jsdk_ctx_request(ctx, CB_PRI_CONFIG, CB_MSG_PARAM_READ, node_id,
                             req, (uint8_t)n, CB_MSG_PARAM_READ, &rsp,
                             timeout_ms ? timeout_ms : JSDK_CFG_TIMEOUT_MS,
-                            allow_retry);
+                            allow_retry
+                                ? (JSDK_REQ_RETRY | JSDK_REQ_COUNT) : 0u);
     if (rc != JSDK_OK) return rc;
 
     {
@@ -7081,6 +7098,7 @@ int jsdk_ctx_write_param(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_id,
             }
             if (st == JSDK_OK) return JSDK_OK;
             if (st != JSDK_ERR_TIMEOUT) return st;
+            ctx->bus.req_timeouts++;                    /* 应用写：等不到也要记账 */
             if (!ctx->bus.link_up) return st;           /* 链路本就不通：别再耗时 */
             if (attempt + 1u < max_attempts) {          /* 真的还会再试一次 */
                 ctx->bus.tx_retries++;
@@ -7749,10 +7767,18 @@ static int probe_node_ex(jsdk_context_t *ctx, uint8_t node_id, int allow_retry)
 
     if (!jsdk_ctx_check(ctx) || node_id == 0u) return 0;
 
-    /* 回复一律以 MsgType 0x00 回来，靠 Source 区分设备（见协议手册）。 */
+    /*
+     * 回复一律以 MsgType 0x00 回来，靠 Source 区分设备（见协议手册）。
+     * ⚠ 扫描（`allow_retry == 0`）走 `flags = 0`：**既不重发也不记账** ——
+     *   “这个号上没人”是正常结果，算进超时统计只会让健康扫描看起来像链路坏了
+     *   （真机实测：一条正常的 `scan` 曾报 `超时=15`）。
+     */
     return (jsdk_ctx_request(ctx, CB_PRI_QUERY, CB_MSG_QUERY_STATUS, node_id,
                              NULL, 0u, CB_MSG_MIT_CONTROL, &rsp,
-                             JSDK_CFG_TIMEOUT_MS / 8u, allow_retry) == JSDK_OK) ? 1 : 0;
+                             JSDK_CFG_TIMEOUT_MS / 8u,
+                             allow_retry
+                                 ? (JSDK_REQ_RETRY | JSDK_REQ_COUNT) : 0u)
+            == JSDK_OK) ? 1 : 0;
 }
 
 /** 扫描用：**不重发**（“没人应答”就是正常结果，见 `probe_node_ex()`）。 */
@@ -8225,10 +8251,11 @@ void jsdk_ctx_note_retry(jsdk_context_t *ctx, uint8_t what)
 int jsdk_ctx_request(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
                      uint8_t dest, const uint8_t *payload, uint8_t len,
                      uint8_t rsp_msgtype, jsdk_can_frame_t *out,
-                     uint32_t timeout_ms, int allow_retry)
+                     uint32_t timeout_ms, unsigned flags)
 {
     unsigned attempt = 0u;
-    unsigned max_attempts = allow_retry ? (1u + (unsigned)JSDK_REQ_RETRY_MAX) : 1u;
+    unsigned max_attempts = (flags & JSDK_REQ_RETRY)
+                          ? (1u + (unsigned)JSDK_REQ_RETRY_MAX) : 1u;
     int      rc = JSDK_ERR_TIMEOUT;
 
     if (!jsdk_ctx_check(ctx)) return JSDK_ERR_INVALID_ARG;
@@ -8243,7 +8270,7 @@ int jsdk_ctx_request(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
         rc = jsdk_ctx_wait_response(ctx, rsp_msgtype, dest, out, timeout_ms);
         if (rc == JSDK_OK) break;
         if (rc != JSDK_ERR_TIMEOUT) return rc;      /* 协议错：重发没意义 */
-        ctx->bus.req_timeouts++;                    /* 观测：这一等没等到 */
+        if (flags & JSDK_REQ_COUNT) ctx->bus.req_timeouts++;
         if (attempt >= max_attempts) break;         /* 尝试用完 */
         if (!ctx->bus.link_up) break;               /* 链路本就不通 */
     }
@@ -8251,7 +8278,7 @@ int jsdk_ctx_request(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
     if (attempt > 1u) {
         ctx->bus.tx_retries     += (uint32_t)(attempt - 1u);
         ctx->bus.tx_retries_req += (uint32_t)(attempt - 1u);
-        jsdk_ctx_note_retry(ctx, 2u);              /* 2 = 幂等请求 */
+        if (flags & JSDK_REQ_COUNT) jsdk_ctx_note_retry(ctx, 2u);   /* 2 = 幂等请求 */
     }
     return rc;
 }
@@ -8262,7 +8289,7 @@ int jsdk_ctx_request_retry(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
                            jsdk_can_frame_t *out, uint32_t timeout_ms)
 {
     return jsdk_ctx_request(ctx, pri, msgtype, dest, payload, len, msgtype, out,
-                            timeout_ms, 1);
+                            timeout_ms, JSDK_REQ_RETRY | JSDK_REQ_COUNT);
 }
 
 

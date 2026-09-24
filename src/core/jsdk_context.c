@@ -384,10 +384,11 @@ void jsdk_ctx_note_retry(jsdk_context_t *ctx, uint8_t what)
 int jsdk_ctx_request(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
                      uint8_t dest, const uint8_t *payload, uint8_t len,
                      uint8_t rsp_msgtype, jsdk_can_frame_t *out,
-                     uint32_t timeout_ms, int allow_retry)
+                     uint32_t timeout_ms, unsigned flags)
 {
     unsigned attempt = 0u;
-    unsigned max_attempts = allow_retry ? (1u + (unsigned)JSDK_REQ_RETRY_MAX) : 1u;
+    unsigned max_attempts = (flags & JSDK_REQ_RETRY)
+                          ? (1u + (unsigned)JSDK_REQ_RETRY_MAX) : 1u;
     int      rc = JSDK_ERR_TIMEOUT;
 
     if (!jsdk_ctx_check(ctx)) return JSDK_ERR_INVALID_ARG;
@@ -402,7 +403,7 @@ int jsdk_ctx_request(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
         rc = jsdk_ctx_wait_response(ctx, rsp_msgtype, dest, out, timeout_ms);
         if (rc == JSDK_OK) break;
         if (rc != JSDK_ERR_TIMEOUT) return rc;      /* 协议错：重发没意义 */
-        ctx->bus.req_timeouts++;                    /* 观测：这一等没等到 */
+        if (flags & JSDK_REQ_COUNT) ctx->bus.req_timeouts++;
         if (attempt >= max_attempts) break;         /* 尝试用完 */
         if (!ctx->bus.link_up) break;               /* 链路本就不通 */
     }
@@ -410,7 +411,7 @@ int jsdk_ctx_request(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
     if (attempt > 1u) {
         ctx->bus.tx_retries     += (uint32_t)(attempt - 1u);
         ctx->bus.tx_retries_req += (uint32_t)(attempt - 1u);
-        jsdk_ctx_note_retry(ctx, 2u);              /* 2 = 幂等请求 */
+        if (flags & JSDK_REQ_COUNT) jsdk_ctx_note_retry(ctx, 2u);   /* 2 = 幂等请求 */
     }
     return rc;
 }
@@ -421,7 +422,7 @@ int jsdk_ctx_request_retry(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
                            jsdk_can_frame_t *out, uint32_t timeout_ms)
 {
     return jsdk_ctx_request(ctx, pri, msgtype, dest, payload, len, msgtype, out,
-                            timeout_ms, 1);
+                            timeout_ms, JSDK_REQ_RETRY | JSDK_REQ_COUNT);
 }
 
 

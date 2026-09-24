@@ -97,3 +97,18 @@ def test_desc_info_reports_request_resends():
         info = ctx.desc_info()
         assert info.retries >= 1
         assert info.complete
+
+
+def test_probes_and_polling_do_not_pollute_timeouts():
+    """扫描探测与轮询读**不计**超时：15 个空地址的“没人应答”不是链路故障。
+
+    （真机实测：一条正常的 `scan` 曾报 `超时=15` —— 全是 2..16 号空地址。）
+    """
+    with Context(VirtualHal(virtual_spec(1))) as ctx:
+        ctx.add_joint(1)
+        ctx.configure()
+
+        before = ctx.bus_state().req_timeouts
+        assert ctx.discover(max_probe=16)          # 只 node 1 在
+        ctx.joint(1).feedback()                    # 轮询读（内部走 _once）
+        assert ctx.bus_state().req_timeouts == before

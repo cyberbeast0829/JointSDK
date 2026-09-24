@@ -158,7 +158,7 @@ python -c "d=open('gbk.bin','rb').read();print(d[:4].hex(' '), d.decode('gbk')[:
 |---|---|
 | `scan` | 节点发现：被动听心跳 200 ms + 主动 `QUERY_STATUS` 探测 1..`--probe`。**不下载描述符**（省 41 KB 流量） |
 | `info` | `QUERY_DEVICE_INFO(0x46)`：hw / fw / serial。⚠ **Classic 链路下 `serial` 恒为 0 是协议如此** —— 真机实测 `0x46` 的响应只有 8 字节（`hw u32 + fw u32`，没有 serial 字段；FD 才是 16 字节）。要序列号用 `read serial_number`（描述符端点，u64，本机实测 `108005767394384`）|
-| `health` | 健康快照：模式、轴状态、错误码、心跳标志、温度、母线、`age_ms`、链路统计（含**丢帧/重发分类**：`req_timeouts` = 等超时的次数、`retries` = 预热 + 幂等请求的拆分、`last_retry_*` = 最近一次重发是哪类、多久之前 —— 排“这条链稳不稳”看这四个） |
+| `health` | 健康快照：模式、轴状态、错误码、心跳标志、温度、母线、`age_ms`、链路统计（含**丢帧/重发分类**：`req_timeouts` = 等超时的次数、`retries` = 预热 + 幂等请求的拆分、`last_retry_*` = 最近一次重发是哪类、多久之前 —— 排“这条链稳不稳”看这四个。⚠ `req_timeouts` **不含**“问了才知道”的扫描探测与“马上会再问”的轮询读：`scan` 逐个问空地址本来就是等超时，算进去会让一条健康扫描看起来像链路坏了） |
 | `mon` | 周期监控；`--csv` 换格式，`--csv-file` 同时落文件 |
 | `read <path>` | 按名读参数（类型随描述符） |
 | `batch-read <path>...` | 批量读：FD 下打包成单帧，Classic 下自动逐条 |

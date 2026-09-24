@@ -56,7 +56,8 @@ int jsdk_ctx_read_param_ex(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_id,
     rc = jsdk_ctx_request(ctx, CB_PRI_CONFIG, CB_MSG_PARAM_READ, node_id,
                             req, (uint8_t)n, CB_MSG_PARAM_READ, &rsp,
                             timeout_ms ? timeout_ms : JSDK_CFG_TIMEOUT_MS,
-                            allow_retry);
+                            allow_retry
+                                ? (JSDK_REQ_RETRY | JSDK_REQ_COUNT) : 0u);
     if (rc != JSDK_OK) return rc;
 
     {
@@ -275,6 +276,7 @@ int jsdk_ctx_write_param(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_id,
             }
             if (st == JSDK_OK) return JSDK_OK;
             if (st != JSDK_ERR_TIMEOUT) return st;
+            ctx->bus.req_timeouts++;                    /* 应用写：等不到也要记账 */
             if (!ctx->bus.link_up) return st;           /* 链路本就不通：别再耗时 */
             if (attempt + 1u < max_attempts) {          /* 真的还会再试一次 */
                 ctx->bus.tx_retries++;
@@ -943,10 +945,18 @@ static int probe_node_ex(jsdk_context_t *ctx, uint8_t node_id, int allow_retry)
 
     if (!jsdk_ctx_check(ctx) || node_id == 0u) return 0;
 
-    /* 回复一律以 MsgType 0x00 回来，靠 Source 区分设备（见协议手册）。 */
+    /*
+     * 回复一律以 MsgType 0x00 回来，靠 Source 区分设备（见协议手册）。
+     * ⚠ 扫描（`allow_retry == 0`）走 `flags = 0`：**既不重发也不记账** ——
+     *   “这个号上没人”是正常结果，算进超时统计只会让健康扫描看起来像链路坏了
+     *   （真机实测：一条正常的 `scan` 曾报 `超时=15`）。
+     */
     return (jsdk_ctx_request(ctx, CB_PRI_QUERY, CB_MSG_QUERY_STATUS, node_id,
                              NULL, 0u, CB_MSG_MIT_CONTROL, &rsp,
-                             JSDK_CFG_TIMEOUT_MS / 8u, allow_retry) == JSDK_OK) ? 1 : 0;
+                             JSDK_CFG_TIMEOUT_MS / 8u,
+                             allow_retry
+                                 ? (JSDK_REQ_RETRY | JSDK_REQ_COUNT) : 0u)
+            == JSDK_OK) ? 1 : 0;
 }
 
 /** 扫描用：**不重发**（“没人应答”就是正常结果，见 `probe_node_ex()`）。 */

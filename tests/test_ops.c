@@ -2211,8 +2211,38 @@ static void test_link_quality_observability(void)
         fx_close(&fx);
     }
 
-    printf("      retry classes split correctly; timeouts counted; last retry "
-           "reported; desc retries visible\n");
+    /* ---- ⑤ “问了才知道”的探测与“马上会再问”的轮询**不算超时** ----
+           （真机实测：一条正常的 `scan` 曾报 `超时=15` —— 全是 2..16 号
+             空地址的“没人应答”。那正是本轮想消灭的“误导数字”） */
+    {
+        uint8_t  ids[16];
+        unsigned found = 0u;
+        uint8_t  buf[8];
+        uint8_t  len = 0u;
+        uint32_t to;
+        uint32_t retries;
+        fix_t    fx2;
+
+        if (fx_open(&fx2, "0:id=1,hb=10,timeout=30000,fd", 1u) != 0
+            || fx_configure(&fx2) != 0) {
+            printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+        }
+        CHECK_EQ(jsdk_context_get_bus_state(fx2.ctx, &bs), JSDK_OK);
+        to      = bs.req_timeouts;
+        retries = bs.tx_retries;
+
+        CHECK_EQ(jsdk_context_discover(fx2.ctx, ids, 16u, &found, 16u), JSDK_OK);
+        CHECK_EQ(jsdk_ctx_probe_node(fx2.ctx, 9u), 0);      /* 空地址：正常结果 */
+        CHECK_EQ(jsdk_ctx_read_param_once(fx2.ctx, 1u, fx2.j->ep_current_state,
+                                          buf, &len, 100u), JSDK_OK);
+        CHECK_EQ(jsdk_context_get_bus_state(fx2.ctx, &bs), JSDK_OK);
+        CHECK_EQ(bs.req_timeouts, to);        /* 探测/轮询不计 */
+        CHECK_EQ(bs.tx_retries, retries);
+        fx_close(&fx2);
+    }
+
+    printf("      retry classes split correctly; timeouts counted (but not for "
+           "probes/polling); last retry reported; desc retries visible\n");
 }
 
 int main(void)

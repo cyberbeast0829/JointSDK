@@ -922,7 +922,7 @@ static void test_warmup(void)
      */
     RUN_CLI(&r, VIF, "-v", "--json", "scan");
     CHECK(r.rc == 0);
-    expect_has(&r, "err", "重发=0（预热 0 + 幂等请求 0）");
+    expect_has(&r, "err", "重发=0（预热 0 + 幂等请求 0）；超时=0");
 
     /* 全丢：必须**明确失败**（不能无限重试），且只多试一次 */
     RUN_CLI(&r, "--if", "virtual", "--channel",
