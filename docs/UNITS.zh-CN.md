@@ -51,7 +51,7 @@
 | `jsdk_joint_set_target_position_rad(j, rad)` | 输出端 rad | CSP/POS：内部换算成度 |
 | `jsdk_joint_set_target_velocity_rad_s(j, r)` | 输出端 rad/s | CSV/VEL：内部换算成 RPM |
 | `jsdk_joint_set_target_torque_Nm(j, Nm)` | **输出端** N·m | CST：内部 `÷ gear_ratio` 后发 `0x03` |
-| `jsdk_joint_set_mit(j, pos, vel, kp, kd, tau)` | 输出端 rad / rad·s⁻¹ / — / — / 输出端 N·m | `kp/kd` 是**线上值**（见 §5） |
+| `jsdk_joint_set_mit(j, pos, vel, kp, kd, tau)` | 输出端 rad / rad·s⁻¹ / — / — / 输出端 N·m | `kp/kd` 是**线上值**（见 §6） |
 | `jsdk_joint_set_mit_stiffness(j, pos, vel, K, D, tau)` | 输出端 rad、**N·m/rad**、**N·m·s/rad** | 内部 `kp = K × 2π / gear` |
 
 反馈结构体 `jsdk_joint_feedback_t`：
@@ -87,7 +87,81 @@
 
 ---
 
-## 5. kp / kd：最容易误解的一对参数
+## 5. `unit_scale_*`：什么时候**真的**需要它
+
+### 先给结论
+
+| 你打算怎么驱动电机 | 要不要 `unit_scale_*` |
+|---|---|
+| 用物理量 API（`set_target_position_rad()` / `_velocity_rad_s()` / `_torque_Nm()` / `set_mit*()`） | **不要**。线上量在模式映射之后**已经是物理量**，默认就是恒等映射 |
+| 用 raw 入口（`set_target_position(raw)`）传"自己约定的**编码器计数**" | **要** `jsdk_unit_scale_calc()` 拿到 `counts → rad` 的比例 |
+| 从 EtherCAT 版迁移过来（那里 `unit_scale_default()` 是 counts→rad 的真实比例） | 注意**同名不同义**，见下表 |
+
+### 与 EtherCAT 版的关键差异
+
+| | CAN / CyberBeast（本库） | EtherCAT 版 |
+|---|---|---|
+| 线上量 | 模式映射之后**已经是物理量**（MIT = 输出端 rad / rad·s⁻¹ / N·m） | 原始**编码器计数** |
+| `jsdk_unit_scale_default()` | **恒等映射**（三个比例都是 `1.0`） | counts → rad 的真实比例 |
+| 什么时候需要 `jsdk_unit_scale_calc()` | 只有你**按计数驱动**时，且换来的是给**你自己**用的比例 | 总是需要 |
+
+> ⚠ **本库内部不会用 `scale` 做任何换算** —— 逐帧换算在 `src/core/jsdk_units.c` 里
+> 已经按模式写死了（见 §2/§3）。`scale` 的实际作用只有两个：
+> 1. **报给调用方**：`jsdk_joint_get_scale()` 读回这台关节当前的 scale；
+> 2. **驱动一个可信度标志**：`valid` 控制 `JSDK_JF_SCALE_INVALID` 粘滞位
+>    （`valid == 0` 置位，`!= 0` 清位）—— 语义是"这台电机的标定**可信吗**"，
+>    不是"数据非法"。
+
+### 两个构造函数
+
+```c
+/* 默认：恒等映射。rated_trq 只用来判断"调用方是否真的知道这台电机" */
+void jsdk_unit_scale_default(jsdk_unit_scale_t *s, uint32_t rated_trq);
+/*   rated_trq > 0 → valid = 1；否则 valid = 0。三个比例恒为 1.0 */
+
+/* 按编码器计数换算（面向"按计数驱动"的场景） */
+void jsdk_unit_scale_calc(jsdk_unit_scale_t *s,
+                          uint32_t encoder_resolution,  /* CPR，正交后 */
+                          uint32_t motor_rev, uint32_t shaft_rev,  /* gear = shaft/motor */
+                          uint32_t rated_torque);
+```
+
+$$pos_{\text{counts}\to\text{rad}} = \frac{2\pi \times \text{motor\_rev}}{\text{encoder\_resolution} \times \text{shaft\_rev}}$$
+
+```
+vel_counts_to_rad_s = pos_counts_to_rad          （同一个位置/时间的比例）
+trq_to_Nm           = rated_torque / 1000        （线力矩单位 = 0.1% 额定）
+```
+
+> 公式假设编码器装在**电机**侧（`CYT` 系列如此）。装在输出侧时把 `shaft_rev` 设成 1、
+> `motor_rev` 设成 1，等价于"CPR 就是输出端 CPR"。
+
+### `valid == 0` 的两种来路（别混）
+
+| 来路 | 含义 |
+|---|---|
+| `jsdk_unit_scale_calc()` 任一入参为 0，或算出的比例不合理（`≤0` 或 `> 1e12`） | **算不出来**：三个比例**全部置 0**，绝不猜一个近似值 |
+| `jsdk_unit_scale_default(s, 0)` | 调用方**没给额定力矩**，即"不知道这是哪台电机" |
+
+两者都置位 `JSDK_JF_SCALE_INVALID`。若你手里有权威换算表（铭牌/出厂报告），
+直接填好 `jsdk_unit_scale_t` 再 `jsdk_joint_set_scale()` 即可解除该位 —— 这条路径
+是给"设备标定读不出来、但你知道正确值"的场景准备的（Python 侧即 `Joint.set_scale`）。
+
+> `> 1e12` 这条上界是**防呆**：位数写错一位（例如 CPR 写成 1 而不是 4096 的倒数）
+> 会得到一个天文数字比例，那比 `valid = 0` 危险得多 —— 它会被当成"有效"。
+> 与其给一个错的换算，不如让你看见"无效"。
+
+### 自查
+
+1. 打印 `jsdk_joint_get_scale()`：物理量驱动下应当是 `1.0 / 1.0 / 1.0` 且 `valid = 1`。
+2. 若你**没有**按计数驱动，却在代码里乘了 `pos_counts_to_rad` → 位置会差几千倍，
+   这是最容易复现的误用症状。
+3. `jsdk_joint_is_fault()` 里看到 `SCALE_INVALID` 粘滞位置起时，先确认
+   `configure()` 是否读到了可信的标定（见 §7 的第 1 条）。
+
+---
+
+## 6. kp / kd：最容易误解的一对参数
 
 ### 事实
 
@@ -129,7 +203,7 @@ $$
 
 ---
 
-## 6. 常见错误与症状
+## 7. 常见错误与症状
 
 | 错误 | 症状 | 怎么发现 |
 |---|---|---|
@@ -141,7 +215,7 @@ $$
 
 ---
 
-## 7. 自查三件套
+## 8. 自查三件套
 
 1. **打印一次量程**：`jsdk_joint_read_config_snapshot()` 的 `gear_ratio` / `mit_max_*`
    是否与你设备铭牌一致（不一致说明描述符或设备不对，先别动电机）。
@@ -153,7 +227,7 @@ $$
 
 ---
 
-## 8. 相关文档
+## 9. 相关文档
 
 - `PROTOCOL_NOTES.zh-CN.md` §4.7：逐帧单位对照（协议视角，含固件函数名）
 - `FIRMWARE_ISSUES.zh-CN.md`：F1（kp/kd 量纲）、F14（力矩端别）、F15（位置端别）

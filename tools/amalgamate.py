@@ -287,8 +287,11 @@ def build(with_opts, out_dir):
     print("内部头 %d 个，公开头 %d 个" % (len(INTERNAL_HEADERS), len(PUBLIC_HEADERS)))
     print("选项：%s" % (", ".join(sorted(with_opts)) if with_opts else "（无，纯核心）"))
     print("系统头：%s" % ", ".join(sorted(set(c_sys) | set(h_sys))))
-    print("写出 %s（%d 字节）" % (h_out, len(h_text)))
-    print("写出 %s（%d 字节）" % (c_out, len(c_text)))
+    # ⚠ `len()` 是**字符**数，不是字节数：文件里有中文，写出去是 UTF-8 ⇒
+    #   客户看到的"多少字节"会比实际小 40%（实测 .h 报 70964，实际 99976）。
+    #   单文件版的大小是会给客户看的数字（内存/Flash 预算），必须报真值。
+    print("写出 %s（%d 字节）" % (h_out, len(h_text.encode("utf-8"))))
+    print("写出 %s（%d 字节）" % (c_out, len(c_text.encode("utf-8"))))
 
 
 def main():

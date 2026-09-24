@@ -154,6 +154,12 @@ typedef struct {
     uint32_t    align;   /**< 对齐（C99 下用 offsetof 技巧求得） */
 } jsdk_abi_type_t;
 
+/**
+ * 返回公共结构体的 `sizeof`/对齐表（**ABI 自检**用；表是静态的，不要 free）。
+ *
+ * 用途：语言绑定/工具在**加载时**比对，把“库与头文件版本不一致”当场报出来，
+ * 而不是等到某个字段读出垃圾值。`count_out` 可传 `NULL`。
+ */
 JSDK_API const jsdk_abi_type_t *jsdk_abi_types(size_t *count_out);
 
 /* ==========================================================================
@@ -802,6 +808,14 @@ typedef struct {
     uint32_t last_retry_age_ms;/**< 距最近一次自动重发的毫秒数（`last_retry_what == 0` 时无意义） */
 } jsdk_bus_state_t;
 
+/**
+ * 读总线/链路统计快照（不产生总线交互；**MCU 侧建议周期调用做健康告警**）。
+ *
+ * @note 字段里“归零/回填”的差异：`nodes_online`、`last_rx_age_ms`、`last_retry_age_ms`
+ *       是按**当前时刻**现算的，其余是累计计数器。
+ * @note 判“链路稳不稳”看 `req_timeouts`（等超时的次数，含被重发救回的）与
+ *       `tx_retries{,_warm,_req}`（按类别拆分）；`last_retry_what` 说最近一次重发是哪类。
+ */
 JSDK_API jsdk_status_t jsdk_context_get_bus_state(jsdk_context_t *ctx, jsdk_bus_state_t *state);
 
 /** 最近一次错误的可读文本（含关节/给定量/量程，可直接读给工程师）。 */
@@ -843,9 +857,17 @@ typedef struct {
     int      valid;          /**< 本次数据来自新的有效帧 */
 } jsdk_joint_feedback_t;
 
+/**
+ * 读**缓存**的关节反馈（不产生总线交互）。
+ *
+ * @note `age_ms` 是距最近一次有效反馈的毫秒数：**先看它再看数据** ——
+ *       陈旧数据上的 `pos/vel` 不能当“当前状态”用（`JSDK_JF_STALE` 会置位）。
+ */
 JSDK_API jsdk_status_t jsdk_joint_get_feedback(const jsdk_joint_t *j, jsdk_joint_feedback_t *fb);
 
+/** 是否已使能（使能序列走完才算 `1`；只发控制帧但没走完序列时为 `0`）。不产生总线交互。 */
 JSDK_API int jsdk_joint_is_enabled(const jsdk_joint_t *j);
+/** 是否有故障（MIT 4-bit 错误码 / 心跳位 / 0x45 明细的**并集**）。不产生总线交互。 */
 JSDK_API int jsdk_joint_is_fault  (const jsdk_joint_t *j);
 
 /** 固件原始 ModeState nibble（不经归一化），用于排障。 */
@@ -1012,6 +1034,12 @@ typedef struct {
     uint8_t  classic;      /**< 1 = 设备工作在 Classic 模式 */
 } jsdk_device_info_t;
 
+/**
+ * 读设备信息（`QUERY_DEVICE_INFO` 0x46：hw/fw 版本 + 序列号；配置阶段 API，阻塞）。
+ *
+ * @note ⚠ **Classic 下响应只有 8 字节**（hw + fw），因此 `serial` 恒为 0 —— 那是协议
+ *       如此，不是设备没序列号（FD 下是 16 字节、含序列号）。
+ */
 JSDK_API jsdk_status_t jsdk_joint_get_device_info(jsdk_joint_t *j, jsdk_device_info_t *info);
 
 /* ==========================================================================
@@ -1086,10 +1114,17 @@ JSDK_API const char *jsdk_can_axis_state_name(uint8_t can_axis_state);
 JSDK_API int jsdk_joint_describe_fault(const jsdk_joint_t *j, char *buf, size_t cap);
 
 
-/** 故障回调：每次故障事件（边沿）触发一次，内部状态已更新。
- *  @warning RT 安全上下文：禁止 sleep / malloc / 加锁 / 打印。 */
+/** 故障回调函数类型（传给 @ref jsdk_context_set_fault_callback）。 */
 typedef void (*jsdk_fault_callback_t)(jsdk_joint_t *j, const jsdk_fault_info_t *info,
                                       void *user);
+
+/**
+ * 注册故障回调（**边沿触发**：只在“无故障 → 有故障”或故障位变化时调一次）。
+ *
+ * @param cb 传 `NULL` 即注销。
+ * @warning RT 安全上下文（可能在 `cycle_begin/end` 里被调用）：禁止 sleep / malloc /
+ *          加锁 / 打印，也不要回调 SDK 的阻塞 API。
+ */
 JSDK_API void jsdk_context_set_fault_callback(jsdk_context_t *ctx,
                                      jsdk_fault_callback_t cb, void *user);
 
@@ -1167,6 +1202,14 @@ typedef struct {
     jsdk_status_t status;  /**< 输出：本条的结果 */
 } jsdk_param_req_t;
 
+/**
+ * 批量读参数（**一次请求拿多个端点**，配置阶段 API，阻塞）。
+ *
+ * @param reqs 请求/结果数组（就地回填 `value` / `len` / `status`）；`n` ≤ 描述符
+ *             允许的批量上限（见 `jsdk_param_req_t`）。
+ * @note FD 下走设备原生批量读；**Classic 下无法批量**（一帧只能回 4 字节）⇒
+ *       **自动退化为逐条读**，语义不变、只是慢（原因写在 `jsdk_context_last_error()`）。
+ */
 JSDK_API jsdk_status_t jsdk_joint_param_get_batch(jsdk_joint_t *j, jsdk_param_req_t *reqs, unsigned n);
 
 /* ==========================================================================
@@ -1210,34 +1253,107 @@ typedef struct {
 JSDK_API jsdk_status_t jsdk_group_set_mit(jsdk_context_t *ctx, const jsdk_group_target_t *targets,
                                  unsigned n);
 
+/**
+ * 成组使能 / 失能（`node_ids` 里每个节点**逐个单播**）。
+ *
+ * @note ⚠ 协议**没有**广播版 `START_MOTOR`/`STOP_MOTOR`，所以这不是“一条帧驱动 N 台”
+ *       —— 与 @ref jsdk_group_set_mit() 的广播语义不同，别把它当同步使能。
+ *       “无法广播，已改为逐个单播”会写进 `jsdk_context_last_error()`。
+ * @note 返回 `JSDK_OK` 只表示**请求已排队**（`request_enable/disable` 语义），
+ *       真正的状态变化由调用者的 `cycle_begin/cycle_end` 推进，看
+ *       @ref jsdk_joint_is_enabled()。
+ */
 JSDK_API jsdk_status_t jsdk_group_enable (jsdk_context_t *ctx, const uint8_t *node_ids, unsigned n);
 JSDK_API jsdk_status_t jsdk_group_disable(jsdk_context_t *ctx, const uint8_t *node_ids, unsigned n);
 
 /* ==========================================================================
  * 16. 单位与标定
+ * ------------------------------------------------------------------------
+ * ⚠ **本后端的 scale 与 EtherCAT 版同名不同义**（迁移者最容易踩的一条）：
+ *
+ *   | | CAN / CyberBeast（本库） | EtherCAT 版 |
+ *   |---|---|---|
+ *   | 线上量 | 模式映射之后**已经是物理量**（MIT = 输出端 rad / rad·s⁻¹ / N·m） | 原始**编码器计数** |
+ *   | `unit_scale_default()` | **恒等映射**（三个比例都是 `1.0`） | counts → rad 的真实比例 |
+ *   | 什么时候需要 `_calc()` | 只有你**按计数驱动**时（例如用 `set_*_raw()` 下发自己约定的计数） | 总是需要 |
+ *
+ *   换句话说：**CAN 上基本不需要 scale** —— 只有在“把线上量当计数用”的时候才需要。
+ *   详见 `docs/UNITS.zh-CN.md`。
  * ======================================================================== */
 
 typedef struct {
-    double pos_counts_to_rad;    /**< 输出端：1 命令单位 = N rad */
-    double vel_counts_to_rad_s;  /**< 输出端：1 命令单位/s = N rad/s */
-    double trq_to_Nm;            /**< 1 力矩单位 = N N·m */
-    int    valid;                /**< 0 = 尚未从设备取得标定参数 */
+    double pos_counts_to_rad;    /**< 输出端：1 命令单位 = N rad（CAN 默认 1.0 = 恒等） */
+    double vel_counts_to_rad_s;  /**< 输出端：1 命令单位/s = N rad/s（CAN 默认 1.0） */
+    double trq_to_Nm;            /**< 1 力矩单位 = N N·m（CAN 默认 1.0） */
+    int    valid;                /**< 0 = 调用方并不知道这台电机的标定（**不是**“数据非法”）：
+                                      本后端只看 `rated_trq > 0` 就置 1（见 `_default()`），
+                                      `_calc()` 则在任一入参为 0 时置 0。
+                                      置 0 会把关节的 `JSDK_JF_SCALE_INVALID` 粘滞位置起。 */
 } jsdk_unit_scale_t;
 
+/**
+ * 取**本后端默认**的 scale（CAN 上是恒等映射）。
+ *
+ * @param rated_trq 额定力矩（N·m）；**只用来判断“调用方是否真的知道这台电机”**：
+ *                  `> 0` → `valid = 1`，否则 `valid = 0`。三个比例恒为 `1.0`。
+ * @note 为什么这里不是“从设备读标定”：本后端的线上量已经是物理量（`configure()`
+ *       读回的标定值用于量程校验，不是用来换算的）。所以恒等映射不是“没实现”。
+ * @note `scale == NULL` 时直接返回（不报错）。
+ */
 JSDK_API void jsdk_unit_scale_default(jsdk_unit_scale_t *scale, uint32_t rated_trq);
+
+/**
+ * 按**编码器计数**换算的 scale（面向“按计数驱动”的场景）。
+ *
+ * @param encoder_resolution 编码器每**电机**转的计数（CPR，正交后）
+ * @param motor_rev          齿轮箱电机侧转数
+ * @param shaft_rev          齿轮箱输出侧转数（`gear = shaft_rev / motor_rev`）
+ * @param rated_torque       额定力矩（N·m）
+ *
+ * 公式（编码器装在**电机**侧）：
+ * @verbatim
+ *   pos_counts_to_rad = 2π × motor_rev / (encoder_resolution × shaft_rev)
+ *   vel_counts_to_rad_s = pos_counts_to_rad
+ *   trq_to_Nm         = rated_torque / 1000      （线力矩单位 = 0.1% 额定）
+ * @endverbatim
+ *
+ * @note 任一参数为 0、或算出的比例不合理（≤0 或 > 1e12）→ `valid = 0`
+ *       且三个比例**全部置 0**（**绝不猜**：宁可让调用方看见“无效”，也不要给一个错的换算）。
+ * @note 常规用法（MIT/CSP/CSV/CST 的物理量 API）**不需要**调用本函数。
+ */
 JSDK_API void jsdk_unit_scale_calc(jsdk_unit_scale_t *scale,
                           uint32_t encoder_resolution,
                           uint32_t motor_rev,
                           uint32_t shaft_rev,
                           uint32_t rated_torque);
 
+/**
+ * 设置关节用的 scale，并同步 `JSDK_JF_SCALE_INVALID` 粘滞位。
+ *
+ * @param scale  `valid == 0` 时置位 `JSDK_JF_SCALE_INVALID`（提示“这个关节的标定不可信”），
+ *               非 0 时清除该位。**不改动任何线上量**：本后端的物理量入口本来就直通。
+ * @note 只是“告诉 SDK 你按什么比例在理解 raw 量”，不会触发总线交互。
+ */
 JSDK_API void jsdk_joint_set_scale(jsdk_joint_t *j, const jsdk_unit_scale_t *scale);
+
+/**
+ * 读回当前关节用的 scale（`configure()` 已按设备标定填好）。
+ *
+ * @param scale 输出；`j` 非法时写回 `jsdk_unit_scale_default(scale, 0)`（`valid = 0`），
+ *              **不会**留下未初始化的结构体。
+ */
 JSDK_API void jsdk_joint_get_scale(const jsdk_joint_t *j, jsdk_unit_scale_t *scale);
 
 /* ==========================================================================
  * 17. 文本与自检
  * ======================================================================== */
 
+/**
+ * 枚举 → 人类可读文本（诊断/日志用，**不在 RT 路径**）。
+ *
+ * @note 四个函数都**永不返回 NULL**：不认识的值返回 `"unknown-..."`，
+ *       所以可以直接 `printf("%s", ...)`。返回的是**静态**字符串，不要 free。
+ */
 JSDK_API const char *jsdk_status_string(jsdk_status_t status);
 JSDK_API const char *jsdk_axis_state_string(jsdk_axis_state_t state);
 JSDK_API const char *jsdk_mode_string(jsdk_mode_t mode);
@@ -1283,8 +1399,16 @@ JSDK_API jsdk_status_t jsdk_context_desc_fetch(jsdk_context_t *ctx);
 JSDK_API jsdk_status_t jsdk_context_desc_poll(jsdk_context_t *ctx, uint64_t app_time_ns);
 
 /** 下载进度回调（配置阶段调用；允许慢速操作）。 */
+/** 描述符下载进度回调函数类型（传给 @ref jsdk_context_set_desc_progress）。 */
 typedef void (*jsdk_desc_progress_fn)(jsdk_context_t *ctx, uint32_t bytes_done,
                                       uint32_t bytes_total, void *user);
+
+/**
+ * 注册下载进度回调（**可选**，仅配置阶段用）。
+ *
+ * @param fn 传 `NULL` 即注销。回调在下载过程中被周期调用，可以画进度条。
+ * @warning 回调内**不得**调用其它 SDK API（重入）。
+ */
 JSDK_API void jsdk_context_set_desc_progress(jsdk_context_t *ctx,
                                     jsdk_desc_progress_fn fn, void *user);
 
@@ -1308,6 +1432,14 @@ typedef struct {
                                     重发救回属于正常；**持续**增长才是问题 */
 } jsdk_desc_info_t;
 
+/**
+ * 读描述符元信息（不产生总线交互）。
+ *
+ * @note **描述符还没下载时返回 `JSDK_ERR_BAD_STATE`** —— 而不是给一份全 0 的
+ *       “看起来像空的描述符”（那会让“没下载”和“设备描述符是空的”分不清）。
+ * @note `retries` 是本次下载重发 `0x24` 请求的次数：非 0 说明**请求丢过**
+ *       （真机 slcan 上很常见），持续增长才说明链路有问题。
+ */
 JSDK_API jsdk_status_t jsdk_context_get_desc_info(jsdk_context_t *ctx, jsdk_desc_info_t *info);
 
 /** 名称 → 端点 ID / 类型 / 权限。未命中返回 JSDK_ERR_NOT_FOUND（**不猜、不近似**）。 */
@@ -1317,8 +1449,16 @@ JSDK_API jsdk_status_t jsdk_endpoint_lookup(jsdk_context_t *ctx, const char *pat
 
 /** 遍历已保留的端点（供 CLI `ep-list` / Python `Context.endpoints()` 使用）。
  *  回调返回非 0 即停止遍历。 */
+/** 端点遍历回调：返回非 0 即停止遍历。 */
 typedef int (*jsdk_endpoint_visit_fn)(void *user, const char *path, uint16_t ep_id,
                                       jsdk_ep_type_t type, uint8_t access);
+
+/**
+ * 遍历**已保留**的端点（顺序 = 描述符里的声明顺序，不保证字典序）。
+ *
+ * @param fn 回调；返回非 0 立即停止遍历（用于“找到就收工”）。
+ * @note 一次遍历**不产生**总线交互（表已在内存里）。
+ */
 JSDK_API jsdk_status_t jsdk_endpoint_enumerate(jsdk_context_t *ctx,
                                       jsdk_endpoint_visit_fn fn, void *user);
 
@@ -1360,8 +1500,25 @@ JSDK_API void jsdk_context_set_desc_raw_sink(jsdk_context_t *ctx,
  *      ⚠ 必须 stop_when_satisfied = 0，且事后校验 desc_info.complete == 1。
  */
 JSDK_API size_t        jsdk_desc_export_max_size(const jsdk_context_t *ctx);
+/**
+ * 把已解析的描述符导出成**紧凑格式**（路线 A：MCU 侧 Flash 缓存，免掉重复下载与解析）。
+ *
+ * @param buf 输出缓冲，`cap` 字节；不够返回 `JSDK_ERR_BUFFER_TOO_SMALL`（`out_len` 仍写需求值）。
+ * @note 导出是**版本/参数相关**的：缓存只能配**相同的 retain / filter / max_endpoints /
+ *       max_path_len** 组合用（这些写在缓存头里，@ref jsdk_context_desc_import() 会校验）。
+ */
 JSDK_API jsdk_status_t jsdk_context_desc_export(jsdk_context_t *ctx, void *buf, size_t cap,
                                        size_t *out_len);
+
+/**
+ * 导入 @ref jsdk_context_desc_export() 产出的**紧凑格式**（路线 A 的 Flash 缓存）。
+ *
+ * @note 只与**相同的 retain / filter / max_endpoints / max_path_len** 组合兼容
+ *       （这些都在缓存头里，不一致 → `JSDK_ERR_BAD_STATE`，**不会**给你半份表）。
+ * @note 导入成功后 `configure()` 不再下载描述符。
+ * @note 要导入**设备原始 JSON**（改 filter 无需重下）请用
+ *       @ref jsdk_context_desc_import_raw()。
+ */
 JSDK_API jsdk_status_t jsdk_context_desc_import(jsdk_context_t *ctx, const void *buf, size_t len);
 
 /** 原始 JSON 的元信息提示（路线 B 必需）。由应用从自己的缓存头提供（PORTING §3.2）。 */

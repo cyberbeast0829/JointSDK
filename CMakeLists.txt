@@ -340,6 +340,22 @@ endif()
 # 测试
 # ---------------------------------------------------------------------------
 if(JSDK_BUILD_TESTS)
+  # 测试套件**整体**跑在虚拟后端的设备模型上（tests/*.c 直接用 sim_* 与
+  # jsdk_hal_virtual_sim 注入丢帧/不回包这类真实链路故障），而虚拟后端是唯一
+  # "不需要硬件"的 HAL。
+  #
+  # 不提这个的话，TESTS=ON + HAL_VIRTUAL=OFF 会在**链接阶段**末尾炸出一堆
+  # "undefined reference to `sim_set_desc`"，谁都看不出是配置矛盾（BACKLOG B6）。
+  # 与 JSDK_BUILD_CLI 同一原则：宁可在这里拒绝，也不给一个"少跑一半、却报 100% 通过"
+  # 的测试套件 —— 那正是最危险的假绿灯。
+  if(NOT JSDK_BUILD_HAL_VIRTUAL)
+    message(FATAL_ERROR
+      "JSDK_BUILD_TESTS=ON 需要 JSDK_BUILD_HAL_VIRTUAL=ON：\n"
+      "  测试套件全部依赖虚拟后端的设备模型（tests/*.c 直接使用 sim_* 注入故障）。\n"
+      "  目标平台不带虚拟后端时，请用 -DJSDK_BUILD_TESTS=OFF；\n"
+      "  只想跑回归可加 -DJSDK_BUILD_HAL_VIRTUAL=ON（它不引入任何硬件依赖）。")
+  endif()
+
   enable_testing()
 
   add_executable(test_jsondesc tests/test_jsondesc.c)
@@ -536,6 +552,14 @@ if(JSDK_BUILD_CLI)
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_cli_text.py"
                 "${CMAKE_CURRENT_SOURCE_DIR}")
       message(STATUS "CLI text: 'cli_text_lint' ctest registered")
+
+      # 公共 API 文档守卫（BACKLOG A12）：
+      # 没有注释的声明，对客户等于不存在 —— 而 `jsdk_unit_scale_*` 的语义
+      # 与 EtherCAT 版**同名不同义**，照搬就会写出错的换算。
+      add_test(NAME api_docs_lint
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_api_docs.py")
+      message(STATUS "API docs: 'api_docs_lint' ctest registered")
     else()
       message(STATUS "CLI text: Python3 未找到 → 'cli_text_lint' 跳过")
     endif()
