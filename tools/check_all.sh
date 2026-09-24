@@ -33,7 +33,7 @@ cd "$ROOT" || exit 2
 
 LOG_DIR="$ROOT/build/check_all"
 WIN_SUM="$LOG_DIR/win-summary.txt"
-WSL_SUM="$LOG_DIR/wsl-summary.txt"
+WSL_SUM="$LOG_DIR/linux-summary.txt"
 JOBS="${JSDK_JOBS:-4}"
 DISTRO="${JSDK_WSL_DISTRO:-Ubuntu-20.04}"
 
@@ -235,9 +235,9 @@ if selected wsl; then
     MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' \
       wsl.exe -d "$DISTRO" -u root -e bash "$WSL_SRC/tools/_check_all_body.sh" \
       "$WSL_SRC" "$JOBS" "$NO_TOUCH" \
-      > "$LOG_DIR/wsl.log" 2>&1
+      > "$LOG_DIR/linux.log" 2>&1
     # wsl.exe 的退出码只说明"主体跑完了"；每一步的真实结果在 wsl-summary.txt 里
-    if [ -s "$WSL_SUM" ]; then echo "完成（4 步见下表）"; else echo "失败（见 wsl.log）"; fi
+    if [ -s "$WSL_SUM" ]; then echo "完成（4 步见下表）"; else echo "失败（见 linux.log）"; fi
 fi
 
 # ── 汇总表 ─────────────────────────────────────────────────────────────────
@@ -271,12 +271,12 @@ if bad:
     for name, rc, detail in rows:
         if rc != '0':
             for cand in (os.path.join(log_dir, name + '.log'),
-                         os.path.join(log_dir, 'wsl-' + name + '.log')):
+                         os.path.join(log_dir, 'linux-' + name + '.log')):
                 if os.path.exists(cand):
                     lines.append('  %-16s %s' % (name, cand))
     lines.append('')
     lines.append('提示：Windows 侧的 MINGW/MSVC 失败先看日志里第一条 error；')
-    lines.append('      WSL 侧的四步共用 build/check_all/wsl.log 与 wsl-<步骤>.log。')
+    lines.append('      Linux/WSL 侧的四步共用 build/check_all/linux.log 与 linux-<步骤>.log。')
 
 # ⚠ 直接写 UTF-8 字节：默认 stdout 在 Windows 上是 cp936（见 tools/wsl_build.sh）
 sys.stdout.buffer.write(('\n'.join(lines) + '\n').encode('utf-8', 'replace'))

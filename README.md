@@ -351,6 +351,7 @@ for (;;) {                                /* 控制循环：RT 安全 */
 | [`docs/MIGRATION.zh-CN.md`](docs/MIGRATION.zh-CN.md) | **从 EtherCAT 版迁移**：逐符号对照、六处必改语义、迁移检查表 |
 | `docs/BACKLOG.zh-CN.md`](docs/BACKLOG.zh-CN.md) | **待办与审计台账**：未完成项（A12、B6）、已完成项对照、已知限制与“记录缺失”的诚实交代 |
 | [`examples/README.md`](examples/README.md) | 8 个可跑示例（虚拟后端，无需硬件）与“换真机要改什么” |
+| [`docs/CI.zh-CN.md`](docs/CI.zh-CN.md) | CI 怎么接（GitHub Actions + 云效 Codeup）、runner 前置条件、**哪些永不进 CI**（真机） |
 | [`docs/PROTOCOL_NOTES.zh-CN.md`](docs/PROTOCOL_NOTES.zh-CN.md) | 帧级协议手册 + JSON 描述符解析算法 + 实现检查表（固件问题已移至 `FIRMWARE_ISSUES.zh-CN.md`） |
 | [`docs/CLI.zh-CN.md`](docs/CLI.zh-CN.md) | `jsdk-cli` 全部子命令、`--json` 字段契约、安全闸、退出码、演练 |
 | [`docs/PORTING.zh-CN.md`](docs/PORTING.zh-CN.md) | HAL 实现契约、arena 选型、Flash 缓存两条路线、桌面后端与冒烟清单 |
@@ -383,7 +384,7 @@ tools/                夹具/黄金向量生成、构建与验证脚本（`wsl_b
 | C 测试 | **11 套 / 30710 项断言**，0 失败（Windows MinGW gcc 13；Windows MSVC 19.44；Linux WSL gcc 9；ASan+UBSan 同样全过） |
 | ctest | **22 项**（11 套 C + 8 个示例 + `cli_text_lint` + `api_docs_lint` + `hw_verify_virtual`；共享库构建为 23 项，多一个 `python_bindings`） |
 | Python | **242 passed / 2 skipped**（Windows 3.12 与 Linux 3.8 结果一致）；公共 C API **114/114 已绑定，0 缺口**；`python -m jsdk_can` 与 `jsdk-cli` **25 个子命令对齐**（同款安全闸、同款退出码、同款 JSON 字段与 CSV 列） |
-| 一键回归 | **`./tools/check_all.sh`** → **14 步全过**（Windows 三套构建 + Python、WSL 四步、3 冒烟、3 静态守卫），日志在 `build/check_all/` |
+| 一键回归 | **`./tools/check_all.sh`** → **14 步全过**（Windows 三套构建 + Python、WSL 四步、3 冒烟、3 静态守卫），日志在 `build/check_all/`；已接 CI（**只读验证型**，不含真机）：`.github/workflows/verify.yml` + 云效接法见 [`docs/CI.zh-CN.md`](docs/CI.zh-CN.md) |
 | 真机 | slcan + CyberBeast USB2CAN + 一台关节（node 1，hw 262711 / fw 1545，1 Mbps **Classic**）：`scan`/`info`/`desc-*`/`read`/`batch-read`/`health`/`dump-config`/`mon` **与写路径**（原值回写 / 写探针后恢复，实测 `100 → 150 → 恢复 100`）逐条验证；**`calibrate` 全流程 + `save` 落 Flash**（软复位后 `pre_calibrated` 仍为 true）、`tools/hw_verify.sh --runs 3 --write-probe` **45/45**、`tools/py_hw_smoke.py` **10/10**；**36 个独立进程 0 失败**（含一次预热丢帧被真实吸收）、12/12 条 `scan` 行 `超时=0` |
 
 **链路自愈与观测（v0.31~v0.33）**：slcan 适配器打开端口时会丢掉主站**头一两帧**，

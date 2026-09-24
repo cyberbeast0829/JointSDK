@@ -1,0 +1,106 @@
+# CI（只读验证型）：把 tools/check_all.sh 作为**唯一入口**跑起来
+#
+# 设计原则（与仓库其他脚本一致）：
+#   1. **CI 里不出现第二份命令清单** —— 否则“CI 绿了但本地红”这种偏差迟早出现。
+#      这里只调 `tools/check_all.sh`（Windows 自托管机上跑全 14 步）或
+#      手工列出的 Linux 步骤（ubuntu-latest 上没有 WSL，见下）。
+#   2. **不碰真机**：`hw_verify.sh` / `py_hw_smoke.py` 需要适配器 + 关节 + 上位机
+#      （终端电阻、总线仲裁、急停确认都有人为因素）⇒ 永不进 CI，保持人工。
+#      这里也不做任何“写设备”的动作 —— CI 跑的是虚拟后端与纯离线冒烟。
+#   3. **失败要能查**：日志一律上传成 artifact（build/check_all/）。
+#
+# 两个 job：
+#   full-matrix  Windows **自托管** runner：本机已装 MSYS2 gcc + VS 2022 + WSL(Ubuntu)
+#                + Python，因此可以直接跑完整矩阵（含 WSL 的 Linux/ASan/Python 四步）。
+#                自托管 runner 的注册见 docs/CI.zh-CN.md。
+#   linux-native ubuntu-latest：给没有自托管 runner 时的一份兜底覆盖
+#                （Linux gcc + ASan + 共享库 + Python 两平台里的一边）。
+#
+# ⚠ 云效 codeup 流水线的接法见 docs/CI.zh-CN.md（也是“Shell 执行”里调同一个脚本，
+#   不重复维护第二套命令）。
+
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── 完整矩阵：Windows 自托管 runner（本机 = 开发机，已具备全部工具链）────────
+  full-matrix:
+    name: 全矩阵（Windows 自托管，14 步）
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 跑一键回归（Windows 三套构建 + Python + 冒烟 + 守卫 + WSL 四步）
+        # ⚠ 必须显式 shell: bash：Windows runner 的默认 shell 是 pwsh，而脚本是 bash 写的
+        shell: bash
+        run: ./tools/check_all.sh
+
+      - name: 上传日志（无论成败）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: check-all-logs
+          path: build/check_all/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ── 兜底：没有自托管 runner 时，至少把 Linux 侧与 Python 覆盖掉 ────────────────
+  linux-native:
+    name: Linux + ASan + Python（ubuntu-latest）
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake build-essential
+          python -m pip install --upgrade pip
+          python -m pip install -e "bindings/python[test]"
+
+      - name: Linux：gcc + -Werror 的常规构建与 ctest
+        run: |
+          cmake -S . -B build-linux -DJSDK_WERROR=ON -DJSDK_ENABLE_HEAP=ON
+          cmake --build build-linux -j"$(nproc)"
+          ctest --test-dir build-linux --output-on-failure
+
+      - name: Linux：ASan + UBSan（内存问题的唯一可靠防线）
+        run: |
+          cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
+                -DCMAKE_C_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer -g' \
+                -DJSDK_WERROR=ON -DJSDK_ENABLE_HEAP=ON
+          cmake --build build-asan -j"$(nproc)"
+          ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
+            ctest --test-dir build-asan --output-on-failure
+
+      - name: Linux：共享库（Python 用；**不开** JSDK_BUILD_PYTHON）
+        run: |
+          cmake -S . -B bsh-linux -DJSDK_WERROR=ON -DJSDK_ENABLE_HEAP=ON \
+                -DJSDK_BUILD_SHARED=ON -DJSDK_BUILD_PYTHON=OFF
+          cmake --build bsh-linux -j"$(nproc)"
+
+      - name: Python 用例（Linux）
+        env:
+          JSDK_LIB_PATH: ${{ github.workspace }}/bsh-linux
+        run: cd bindings/python && python -m pytest tests/ -q
+
+      - name: 静态守卫（CLI 文本 / 公共 API 文档 / Python 绑定缺口）
+        run: |
+          PYTHONIOENCODING=utf-8 python tools/check_cli_text.py .
+          PYTHONIOENCODING=utf-8 python tools/check_api_docs.py
+          PYTHONIOENCODING=utf-8 python tools/_abi_gap.py

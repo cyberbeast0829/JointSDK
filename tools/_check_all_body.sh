@@ -6,8 +6,13 @@
 # （与 tools/wsl_build.sh 同一个坑）。所以这里把结果写成**机器可读的一行行**，
 # 由 Windows 侧读文件汇总；详细输出留在各自的日志里。
 #
-# 输出：$SRC/build/check_all/wsl-summary.txt —— 每行 `名称|rc|详情`
-# 日志：$SRC/build/check_all/wsl-<名称>.log
+# 输出：$SRC/build/check_all/linux-summary.txt —— 每行 `名称|rc|详情`
+# 日志：$SRC/build/check_all/linux-<名称>.log
+#
+# ⚠ 它**也能在原生 Linux 上直接跑**（CI 的 ubuntu 任务就是这么用的）：
+#   `bash tools/_check_all_body.sh "$PWD" "$(nproc)" 1`
+#   这样 Windows（经 WSL）与 Linux 共享**同一份命令清单** —— CI 里不会再出现
+#   第二套命令而慢慢与本地跑偏。
 #
 # 四个步骤（都是**纯离线**，不需要任何硬件）：
 #   linux      gcc + -Werror 的常规构建与 ctest（socketcan 后端只在这里被编译器看到）
@@ -25,7 +30,7 @@ NO_TOUCH="${3:-0}"
 OUT="$SRC/build/check_all"
 
 mkdir -p "$OUT"
-SUM="$OUT/wsl-summary.txt"
+SUM="$OUT/linux-summary.txt"
 : > "$SUM"
 
 # ⚠ 防"构建被静默跳过"：文件内容改了但 mtime 没变时，make 会认为无需重建，
@@ -51,7 +56,7 @@ detail_err() {     # 失败时给一条最有信息量的行
 
 run() {            # 名称 命令...
     local name="$1"; shift
-    local log="$OUT/wsl-$name.log"
+    local log="$OUT/linux-$name.log"
     "$@" > "$log" 2>&1
     local rc=$?
     local d
@@ -102,4 +107,4 @@ run asan      step_asan
 run bsh-linux step_bsh_linux
 run py-linux  step_py_linux
 
-echo "wsl 侧完成，汇总：$SUM"
+echo "linux 侧完成，汇总：$SUM"

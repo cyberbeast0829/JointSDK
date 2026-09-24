@@ -698,6 +698,7 @@ A12 与 B6 是 BACKLOG 里最后两个**未完成项**（B5/B7 属"记录缺失"
 | **B6** | 矛盾构建组合改为 configure 期 `FATAL_ERROR`（"宁可拒绝也不静默"）—— 详见 §3.2 |
 | **一键回归** | 新增 `tools/check_all.sh`：一条命令跑完 Windows（MinGW 堆+CLI、共享库、MSVC）+ WSL（Linux、ASan、Linux 共享库）+ Python（两平台）+ 三个冒烟 + 三个静态守卫，末尾汇总表，任一失败即非 0 退出 |
 | **状态同步** | README「当前状态」、本文件 §1/§3 与 DESIGN 版本行按 v0.33/v0.34 实际数字同步 |
+| **CI（只读验证型）** | `.github/workflows/verify.yml`：① `full-matrix` 在 **Windows 自托管 runner** 上跑 `./tools/check_all.sh` 全 14 步；② `linux-native` 在 `ubuntu-latest` 上跑 **同一个** `tools/_check_all_body.sh`（Linux 四步）+ `check_all.sh --only` 的三个守卫。接法、runner 前置条件、以及**哪些永不进 CI**（真机：`hw_verify.sh`/`py_hw_smoke.py`）见 `docs/CI.zh-CN.md` |
 
 **结果（可复现，`./tools/check_all.sh` 的汇总表）**
 
