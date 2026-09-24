@@ -73,34 +73,21 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e "bindings/python[test]"
 
-      - name: Linux：gcc + -Werror 的常规构建与 ctest
-        run: |
-          cmake -S . -B build-linux -DJSDK_WERROR=ON -DJSDK_ENABLE_HEAP=ON
-          cmake --build build-linux -j"$(nproc)"
-          ctest --test-dir build-linux --output-on-failure
+      # ⚠ 这里**不抄命令**：CI 与本地、Windows 与 Linux 共用同一份脚本与同一份命令表。
+      #   抄一份迟早与本地跑偏（“CI 绿了、本地红了”），而“命令清单只有一个来源”
+      #   正是 check_all.sh 取代“每轮手工敲十几条命令”的理由。
+      - name: 跑 Linux 四步（linux / asan / bsh-linux / py-linux）
+        # 第 3 个参数 = NO_TOUCH=1：CI 是全新 checkout，本来就全量编译
+        run: bash tools/_check_all_body.sh "$PWD" "$(nproc)" 1
 
-      - name: Linux：ASan + UBSan（内存问题的唯一可靠防线）
-        run: |
-          cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
-                -DCMAKE_C_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer -g' \
-                -DJSDK_WERROR=ON -DJSDK_ENABLE_HEAP=ON
-          cmake --build build-asan -j"$(nproc)"
-          ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
-            ctest --test-dir build-asan --output-on-failure
+      - name: 静态守卫（走 check_all.sh 的同一份命令表）
+        run: ./tools/check_all.sh --only lint-cli-text,lint-api-docs,abi-gap
 
-      - name: Linux：共享库（Python 用；**不开** JSDK_BUILD_PYTHON）
-        run: |
-          cmake -S . -B bsh-linux -DJSDK_WERROR=ON -DJSDK_ENABLE_HEAP=ON \
-                -DJSDK_BUILD_SHARED=ON -DJSDK_BUILD_PYTHON=OFF
-          cmake --build bsh-linux -j"$(nproc)"
-
-      - name: Python 用例（Linux）
-        env:
-          JSDK_LIB_PATH: ${{ github.workspace }}/bsh-linux
-        run: cd bindings/python && python -m pytest tests/ -q
-
-      - name: 静态守卫（CLI 文本 / 公共 API 文档 / Python 绑定缺口）
-        run: |
-          PYTHONIOENCODING=utf-8 python tools/check_cli_text.py .
-          PYTHONIOENCODING=utf-8 python tools/check_api_docs.py
-          PYTHONIOENCODING=utf-8 python tools/_abi_gap.py
+      - name: 上传日志（无论成败）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-logs
+          path: build/check_all/
+          if-no-files-found: warn
+          retention-days: 14

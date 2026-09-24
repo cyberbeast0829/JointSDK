@@ -37,6 +37,10 @@ WSL_SUM="$LOG_DIR/linux-summary.txt"
 JOBS="${JSDK_JOBS:-4}"
 DISTRO="${JSDK_WSL_DISTRO:-Ubuntu-20.04}"
 
+# ⚠ `python` 不是到处都有：Git-Bash / setup-python 有，而不少 Linux 只有 `python3`
+#   （本脚本在 ubuntu-latest 上也被调）⇒ 先探一次，别写死。
+if command -v python > /dev/null 2>&1; then PY=python; else PY=python3; fi
+
 ONLY=""; SKIP=""; DO_WSL=1; DO_MSVC=1; NO_TOUCH=0; LIST=0
 
 while [ $# -gt 0 ]; do
@@ -151,7 +155,7 @@ run_step() {  # 名称 命令...
             py-win)     d="$(detail_pytest "$log")" ;;
             abi-gap)    # ⚠ 别用 grep 判“缺口 0”：Windows 的 Python 默认按 cp936 写 stdout，
                         #   用 UTF-8 的中文去 grep 会**匹配不到**（而“匹配不到”看起来像失败）。
-                        d="$(python - "$log" <<'PY2'
+                        d="$("$PY" - "$log" <<'PY2'
 import io, re, sys
 # ⚠ 直接写 UTF-8 字节：Windows 控制台/管道的默认编码是 cp936，走 print() 会把中文
 #   变成乱码（tools/wsl_build.sh 里同一个坑，当时现象是“结果一个字都看不到”）。
@@ -197,7 +201,7 @@ step_msvc() {
 }
 step_py_win() {
     ( cd bindings/python && JSDK_LIB_PATH=../../bsh PYTHONIOENCODING=utf-8 \
-        python -m pytest tests/ -q )
+        "$PY" -m pytest tests/ -q )
 }
 
 echo "=== check_all：一键回归（日志在 $LOG_DIR/）==="
@@ -209,9 +213,9 @@ selected py-win          && run_step py-win          step_py_win
 selected smoke-amalgam   && run_step smoke-amalgam   ./tools/amalgam_smoke.sh
 selected smoke-arduino   && run_step smoke-arduino   ./tools/arduino_smoke.sh
 selected smoke-packaging && run_step smoke-packaging ./tools/packaging_smoke.sh
-selected lint-cli-text   && run_step lint-cli-text   env PYTHONIOENCODING=utf-8 python tools/check_cli_text.py .
-selected lint-api-docs   && run_step lint-api-docs   env PYTHONIOENCODING=utf-8 python tools/check_api_docs.py
-selected abi-gap         && run_step abi-gap         env PYTHONIOENCODING=utf-8 python tools/_abi_gap.py
+selected lint-cli-text   && run_step lint-cli-text   env PYTHONIOENCODING=utf-8 "$PY" tools/check_cli_text.py .
+selected lint-api-docs   && run_step lint-api-docs   env PYTHONIOENCODING=utf-8 "$PY" tools/check_api_docs.py
+selected abi-gap         && run_step abi-gap         env PYTHONIOENCODING=utf-8 "$PY" tools/_abi_gap.py
 
 # ── WSL 侧：一次 wsl.exe 调用里跑 4 步，结果写成机器可读文件 ────────────────
 if selected wsl; then
@@ -241,7 +245,7 @@ if selected wsl; then
 fi
 
 # ── 汇总表 ─────────────────────────────────────────────────────────────────
-python - "$WIN_SUM" "$WSL_SUM" "$LOG_DIR" <<'PY'
+"$PY" - "$WIN_SUM" "$WSL_SUM" "$LOG_DIR" <<'PY'
 import io, os, sys
 win_sum, wsl_sum, log_dir = sys.argv[1], sys.argv[2], sys.argv[3]
 rows = []
@@ -253,12 +257,10 @@ for path in (win_sum, wsl_sum):
         if len(parts) == 3:
             rows.append(parts)
 
-print()
-print('=' * 78)
-print('一键回归汇总')
-print('=' * 78)
+# ⚠ 表头**也**要一起走 UTF-8 字节：只要有一行走 print()（Windows 默认 cp936），
+#   汇总里就会出现“一半正常、一半乱码”—— 之前的版本就是这样（表头成了 ????）。
+lines = ['', '=' * 78, '一键回归汇总', '=' * 78]
 bad = 0
-lines = []
 for name, rc, detail in rows:
     ok = (rc == '0')
     bad += 0 if ok else 1
