@@ -113,6 +113,10 @@ if not ctx.warmup():
     print("链路没应答：", ctx.last_error())
 print(ctx.bus_state().tx_retries)      # 总共重发了几次（会话预热 + 幂等请求）
 print(ctx.bus_state().tx_retries_req)  # 其中“**运行中途**丢帧”那部分（持续非 0 = 链路有问题）
+print(ctx.bus_state().tx_retries_warm) # 会话预热那部分（开头丢帧，已知无害）
+print(ctx.bus_state().req_timeouts)    # 等超时的次数（含被重发救回的 —— 那才是丢过帧的证据）
+print(ctx.bus_state().last_retry_what, ctx.bus_state().last_retry_age_ms)  # 最近一次重发
+print(ctx.desc_info().retries)         # 描述符下载重发 0x24 的次数（请求丢了的直接证据）
 ```
 
 ⚠ SDK 已经把它**自动挂在发帧之前**（`Context` 内部，覆盖库用户），所以不调用也不会
@@ -340,6 +344,7 @@ $ python tools/_abi_gap.py
 
 | 能力 | Python 入口 | 说明 |
 |---|---|---|
+| **链路质量观测** | `Context.bus_state()`（`tx_retries*` / `req_timeouts` / `last_retry_*`）、`Context.desc_info().retries` | 丢帧/重发按类别计数，`health` 的 `bus` 里也全有 —— 现场排“链路稳不稳”不用再靠猜 |
 | **会话预热** | `Context.warmup(timeout_ms=0)` → `bool` | 幂等重发，挡掉 slcan 的**首帧丢失**（现场：第一条命令随机超时、再敲一次就好）。`False` = 预算内没应答（不致命）；次数在 `ctx.bus_state().tx_retries`。SDK 已自动挂在发帧之前，显式调用是为了**尽早**发现链路坏 |
 | **SDO 风格端点访问** | `Joint.sdo(path_or_ep, *, subindex, size)` → `Sdo` 对象：`.state/.data/.size/.start_read()/.start_write()/.read()/.write()/.read_value()/.write_value()` | 非阻塞启动 + 阻塞等（内部抽 `cycle_begin/end`）；`.data` 是**裸线上字节**，参数值**小端**（见 `PROTOCOL_NOTES` §3.1）；`.read_value()/.write_value()` 按 `size` 帮你解成 int/float。同一个端点会**复用**句柄（`sdo_slots_used` 可查） |
 | **单位与标度** | `units.UnitScale`、`unit_scale_default()`、`unit_scale_calc(enc, motor_rev, shaft_rev, rated)`、`Joint.set_scale()/get_scale()` | CAN 上一般不需要（线上量已是物理量，默认标度是恒等映射）——但工具类/换算场景现在不用自己手算 |

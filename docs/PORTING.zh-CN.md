@@ -900,7 +900,8 @@ ls -l /dev/ttyACM0                # 3) 看一眼权限：通常是 root:dialout 
     SDK 里它拿 `timeout_ms = 0` 写（不等 ACK），所以天然不重发；
   * **轮询**读（每 `pace_ms` 再问一次的那种）：那里需要的是“下一次”，不是“重试这一次”，
     重发只会把节奏拖成一个额外超时（真机 3 s 级）—— SDK 用 `jsdk_ctx_read_param_once()` 区分。
-  计数：`tx_retries`（总数）与 `tx_retries_req`（其中“运行中途丢帧”那部分）。
+  计数：`tx_retries`（总数）、`tx_retries_warm`（会话预热那类，已知无害）、`tx_retries_req`（**运行中途**丢帧那类）、`req_timeouts`（等超时的次数，含被救回的）、`last_retry_what` + `last_retry_age_ms`（最近一次重发是哪类、多久之前）——
+  MCU 侧可以定期读 `jsdk_context_get_bus_state()` 做链路健康告警（`req_timeouts` 持续涨而重发不涨 = 重发也救不回，查设备/线缆）。
 - 描述符下载在 Classic 下是 **1+6906 帧**（FD 是 1+662，10.4 倍）。`--timeout` 是
   “**多久没有新字节**”的静默预算（不是总时长），默认 5 s/CLI 3 s 都够；实现见
   `jsdk_desc.c` 的 `desc_fetch_from()`（外加 120 s 总时长兜底）。

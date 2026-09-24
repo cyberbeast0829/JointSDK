@@ -307,7 +307,8 @@ def _cmd_health(ctx: Context, args) -> int:
         f"  flags={fb.has_flag!r}",
         f"总线: link_up={bs.link_up} nodes={bs.nodes_online} "
         f"tx={bs.tx_frames} rx={bs.rx_frames} "
-        f"retries={bs.tx_retries}(req {bs.tx_retries_req}) "
+        f"retries={bs.tx_retries}(预热 {bs.tx_retries_warm} + 幂等请求 {bs.tx_retries_req}) "
+        f"超时={bs.req_timeouts} "
         f"errors={bs.link_errors}",
     ]
     if j.is_fault():
@@ -809,7 +810,8 @@ def _cmd_desc_info(ctx: Context, args) -> int:
     info = ctx.desc_info()
     _emit(args, info.as_dict(),
           [f"描述符: {info.total_len} 字节, crc=0x{info.crc:04X}, "
-           f"{info.endpoint_count} 端点, complete={info.complete}"])
+           f"{info.endpoint_count} 端点, complete={info.complete}"
+           + (f", 0x24 请求重发 {info.retries} 次" if info.retries else "")])
     return 0
 
 

@@ -765,6 +765,17 @@ typedef struct {
     uint32_t link_errors;    /**< HAL `recv()` 报错次数（总线抖动/掉线） */
     uint8_t  nodes_online;   /**< 在线节点数（按收到的 Source 统计） */
     uint8_t  link_up;        /**< 1 = 链路当前可用（曾成功收发且无未恢复的链路错误） */
+
+    /* ---- 链路质量观测（v0.33 新增；都是“只读计数器”，不影响任何协议行为） ---- */
+    uint32_t tx_retries_warm;  /**< 其中属于**会话预热**的部分（`jsdk_context_warmup()`）。
+                                    会话开头丢帧是已知行为、重发即可，看到非 0 不必惊慌 */
+    uint32_t req_timeouts;     /**< 请求**等待超时**的次数（含后来被重发救回的）。
+                                    判“链路到底稳不稳”看这个：
+                                    `req_timeouts` 持续增长而 `tx_retries_req` 不增长 =
+                                    重发也救不回（设备/线缆问题）；两个一起长 = 偶发丢帧 */
+    uint8_t  last_retry_what;  /**< 最近一次自动重发的类别：0 从未 / 1 会话预热 / 2 幂等请求 */
+    uint8_t  _reserved[3];     /**< 对齐占位（保持字段偏移稳定，不要写） */
+    uint32_t last_retry_age_ms;/**< 距最近一次自动重发的毫秒数（`last_retry_what == 0` 时无意义） */
 } jsdk_bus_state_t;
 
 JSDK_API jsdk_status_t jsdk_context_get_bus_state(jsdk_context_t *ctx, jsdk_bus_state_t *state);
@@ -1268,6 +1279,9 @@ typedef struct {
     uint8_t  mode_used;        /**< 实际生效的 jsdk_desc_mode_t */
     uint8_t  shared_hit;       /**< 1 = 复用了同总线其它节点已解析的结果 */
     uint8_t  raw_sink_failed;  /**< 1 = 原始字节流出出错或未安装（raw 缓存不可用） */
+    unsigned retries;          /**< 本次下载**重发** `0x24` 请求的次数（“请求丢了”的直接证据）。
+                                    ⚠ 大概率不是 0：真机 slcan 实测第一条请求会丢，
+                                    重发救回属于正常；**持续**增长才是问题 */
 } jsdk_desc_info_t;
 
 JSDK_API jsdk_status_t jsdk_context_get_desc_info(jsdk_context_t *ctx, jsdk_desc_info_t *info);

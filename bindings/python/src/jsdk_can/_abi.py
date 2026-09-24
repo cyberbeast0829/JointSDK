@@ -226,6 +226,12 @@ class BusState(ctypes.Structure):
         ("link_errors", c_uint32),
         ("nodes_online", c_uint8),
         ("link_up", c_uint8),
+        # v0.33：链路质量观测（见 C 头 joint_sdk.h 的同名注释）
+        ("tx_retries_warm", c_uint32),
+        ("req_timeouts", c_uint32),
+        ("last_retry_what", c_uint8),
+        ("_reserved", c_uint8 * 3),
+        ("last_retry_age_ms", c_uint32),
     ]
 
 
@@ -328,6 +334,7 @@ class DescInfo(ctypes.Structure):
         ("mode_used", c_uint8),
         ("shared_hit", c_uint8),
         ("raw_sink_failed", c_uint8),
+        ("retries", c_int),          # 本次下载重发 0x24 次数（v0.33）
     ]
 
 

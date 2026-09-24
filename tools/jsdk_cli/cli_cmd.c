@@ -343,6 +343,12 @@ static void print_health_json(cli_app_t *a, const jsdk_joint_feedback_t *fb,
     cli_json_i64(&j, "tx_failed", (long long)bs->tx_failed);
     cli_json_i64(&j, "rx_dropped", (long long)bs->rx_dropped);
     cli_json_i64(&j, "keepalive_sent", (long long)bs->keepalive_sent);
+    cli_json_i64(&j, "tx_retries", (long long)bs->tx_retries);
+    cli_json_i64(&j, "tx_retries_warm", (long long)bs->tx_retries_warm);
+    cli_json_i64(&j, "tx_retries_req", (long long)bs->tx_retries_req);
+    cli_json_i64(&j, "req_timeouts", (long long)bs->req_timeouts);
+    cli_json_i64(&j, "last_retry_what", (long long)bs->last_retry_what);
+    cli_json_i64(&j, "last_retry_age_ms", (long long)bs->last_retry_age_ms);
     cli_json_i64(&j, "last_rx_age_ms", (long long)bs->last_rx_age_ms);
     cli_json_i64(&j, "link_errors", (long long)bs->link_errors);
     cli_json_i64(&j, "hal_bus_flags", (long long)bs->hal_bus_flags);
@@ -411,6 +417,15 @@ static int health_common(cli_app_t *a, int with_json_wrapper)
     out_kv(a, "tx_failed", "%lu", (unsigned long)bs.tx_failed);
     out_kv(a, "rx_dropped", "%lu", (unsigned long)bs.rx_dropped);
     out_kv(a, "keepalive_sent", "%lu", (unsigned long)bs.keepalive_sent);
+    out_kv(a, "req_timeouts", "%lu", (unsigned long)bs.req_timeouts);
+    out_kv(a, "retries", "%lu（预热 %lu + 幂等请求 %lu）",
+           (unsigned long)bs.tx_retries, (unsigned long)bs.tx_retries_warm,
+           (unsigned long)bs.tx_retries_req);
+    if (bs.last_retry_what != 0u) {
+        out_kv(a, "last_retry", "%s，%lu ms 前",
+               bs.last_retry_what == 1u ? "会话预热" : "幂等请求",
+               (unsigned long)bs.last_retry_age_ms);
+    }
     out_kv(a, "last_rx_age_ms", "%lu", (unsigned long)bs.last_rx_age_ms);
     out_kv(a, "link_errors", "%lu", (unsigned long)bs.link_errors);
     out_kv(a, "hal_bus_flags", "0x%08lX", (unsigned long)bs.hal_bus_flags);
@@ -833,6 +848,7 @@ static int cmd_desc_info(cli_app_t *a)
         cli_json_i64(&j, "endpoint_count", (long long)di.endpoint_count);
         cli_json_i64(&j, "parsed_total", (long long)di.parsed_total);
         cli_json_i64(&j, "frames_rx", (long long)di.frames_rx);
+        cli_json_i64(&j, "retries", (long long)di.retries);
         cli_json_i64(&j, "bytes_scanned", (long long)di.bytes_scanned);
         cli_json_bool(&j, "complete", di.complete);
         cli_json_i64(&j, "mode_used", (long long)di.mode_used);
@@ -848,6 +864,10 @@ static int cmd_desc_info(cli_app_t *a)
         out_kv(a, "endpoint_count", "%u（已保留）", di.endpoint_count);
         out_kv(a, "parsed_total", "%u（解析到）", di.parsed_total);
         out_kv(a, "frames_rx", "%u", di.frames_rx);
+        if (di.retries != 0u) {
+            out_kv(a, "retries", "%u（0x24 请求重发；首帧丢失时非 0 是正常的）",
+                   di.retries);
+        }
         out_kv(a, "bytes_scanned", "%lu", (unsigned long)di.bytes_scanned);
         out_kv(a, "complete", "%s", di.complete ? "yes" : "NO (提前终止)");
         out_kv(a, "shared_hit", "%s", di.shared_hit ? "yes" : "no");
@@ -1857,20 +1877,30 @@ int jsdk_cli_run(int argc, char **argv, FILE *out, FILE *err)
             jsdk_bus_state_t bs;
             uint32_t retries = 0u;
             uint32_t retries_req = 0u;
+            uint32_t retries_warm = 0u;
+            uint32_t timeouts = 0u;
 
+            /*
+             * ⚠ `jsdk_context_get_bus_state()` 失败时下面照样要打印，所以四个数
+             *   必须**先给默认值**再用 —— 直接读 `bs.xxx` 会让 MSVC 报
+             *   C4701“使用了可能未初始化的局部变量”（gcc 不报，是它看漏了）。
+             */
             if (a.ctx && jsdk_context_get_bus_state(a.ctx, &bs) == JSDK_OK) {
-                retries     = bs.tx_retries;
-                retries_req = bs.tx_retries_req;
+                retries      = bs.tx_retries;
+                retries_req  = bs.tx_retries_req;
+                retries_warm = bs.tx_retries_warm;
+                timeouts     = bs.req_timeouts;
             }
 
             cli_fprintf(err, "jsdk-cli: 帧格式：%s%s；framing_learned=%d；"
-                            "首发=%s；重发=%u（预热 %u + 幂等请求 %u）；tx=%u rx=%u\n",
+                            "首发=%s；重发=%u（预热 %u + 幂等请求 %u）；"
+                            "超时=%u；tx=%u rx=%u\n",
                     eff_fd ? "CAN FD" : "Classic",
                     a.fd_auto ? "（探测决定）" : "（显式/已定）", got,
                     a.first_tx_fd < 0 ? "none"
                                       : (a.first_tx_fd ? "CAN FD" : "Classic"),
-                    (unsigned)retries,
-                    (unsigned)(retries - retries_req), (unsigned)retries_req,
+                    (unsigned)retries, (unsigned)retries_warm,
+                    (unsigned)retries_req, (unsigned)timeouts,
                     (unsigned)a.tx_frames, (unsigned)a.rx_frames);
             if (a.hal && a.o.ifname && strcmp(a.o.ifname, "slcan") == 0) {
                 uint32_t tx = 0u, rx = 0u, bad = 0u, acks = 0u, nacks = 0u;

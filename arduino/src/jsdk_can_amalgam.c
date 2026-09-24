@@ -2301,6 +2301,15 @@ struct jsdk_context {
     /* ---- 记账 ---- */
     jsdk_bus_state_t bus;
     uint32_t         last_rx_ms;      /**< 最近一次收到与本主站相关帧的时刻 */
+    /**
+     * 最近一次**自动重发**的时刻与类别（只为观测；`jsdk_context_get_bus_state()`
+     * 把它们换算成 `last_retry_what` / `last_retry_age_ms` 报出去）。
+     * 类别：0 从未 / 1 会话预热 / 2 幂等请求。
+     */
+    uint32_t         last_retry_ms;
+    uint8_t          last_retry_what;
+    /** 描述符下载中重发 `0x24` 请求的次数（每次下载开始时清零，见 `jsdk_desc.c`）。 */
+    uint32_t         desc_retries;
 
     /**
      * 堆模式（`heap_optional.c`）下由 SDK 自己分配的 arena；零 malloc 模式下为 NULL。
@@ -2338,6 +2347,12 @@ static inline uint32_t jsdk_elapsed(uint32_t now, uint32_t then)
  */
 int jsdk_ctx_send(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
                   uint8_t dest, const uint8_t *payload, uint8_t len);
+
+/**
+ * 记下“最近一次重发”的时刻与类别（纯观测；见 `jsdk_bus_state_t.last_retry_what`）。
+ * 类别：1 = 会话预热；2 = 幂等请求。
+ */
+void jsdk_ctx_note_retry(jsdk_context_t *ctx, uint8_t what);
 
 /** 不含自动预热的发送：控制帧 / 急停专用（延迟敏感，不能等）。 */
 int jsdk_ctx_send_raw(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
@@ -8201,6 +8216,12 @@ size_t jsdk_context_joint_size(void) { return sizeof(jsdk_joint_t); }
  * @param timeout_ms 每次尝试的等待窗口（不是总时长）。
  * @return `JSDK_OK` / 前一次尝试的状态码。
  */
+void jsdk_ctx_note_retry(jsdk_context_t *ctx, uint8_t what)
+{
+    ctx->last_retry_ms   = ctx->cfg.hal.now_ms(ctx->cfg.hal.user);
+    ctx->last_retry_what = what;
+}
+
 int jsdk_ctx_request(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
                      uint8_t dest, const uint8_t *payload, uint8_t len,
                      uint8_t rsp_msgtype, jsdk_can_frame_t *out,
@@ -8222,6 +8243,7 @@ int jsdk_ctx_request(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
         rc = jsdk_ctx_wait_response(ctx, rsp_msgtype, dest, out, timeout_ms);
         if (rc == JSDK_OK) break;
         if (rc != JSDK_ERR_TIMEOUT) return rc;      /* 协议错：重发没意义 */
+        ctx->bus.req_timeouts++;                    /* 观测：这一等没等到 */
         if (attempt >= max_attempts) break;         /* 尝试用完 */
         if (!ctx->bus.link_up) break;               /* 链路本就不通 */
     }
@@ -8229,6 +8251,7 @@ int jsdk_ctx_request(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
     if (attempt > 1u) {
         ctx->bus.tx_retries     += (uint32_t)(attempt - 1u);
         ctx->bus.tx_retries_req += (uint32_t)(attempt - 1u);
+        jsdk_ctx_note_retry(ctx, 2u);              /* 2 = 幂等请求 */
     }
     return rc;
 }
@@ -8541,6 +8564,12 @@ jsdk_status_t jsdk_context_get_bus_state(jsdk_context_t *ctx, jsdk_bus_state_t *
     *state = ctx->bus;
     state->nodes_online = online;
     state->last_rx_age_ms = jsdk_elapsed(ctx->now_ms, ctx->last_rx_ms);
+    /* 拆开“哪一类重发”：预热那类是已知无害，运行途中那类才值得追。
+       实现上用“总数 - 幂等请求”会在将来新增重发类别时**静默说谎**，所以这里直接维护两个计数器。 */
+    state->tx_retries_warm = ctx->bus.tx_retries - ctx->bus.tx_retries_req;
+    state->last_retry_what = ctx->last_retry_what;
+    state->last_retry_age_ms = ctx->last_retry_what
+        ? jsdk_elapsed(ctx->now_ms, ctx->last_retry_ms) : 0u;
     if (ctx->cfg.hal.bus_status) {
         uint32_t flags = 0u;
         if (ctx->cfg.hal.bus_status(ctx->cfg.hal.user, &flags) == 0) {
@@ -8696,6 +8725,7 @@ static jsdk_status_t desc_fetch_from(jsdk_context_t *ctx, uint8_t node)
         return JSDK_ERR_INVALID_ARG;
     }
     ctx->fetch_active = 1;
+    ctx->desc_retries = 0u;                  /* 本次下载的重发计数从 0 开始 */
     cb_desc_fetch_set_raw_sink(&ctx->fetch, ctx->raw_sink, ctx->raw_sink_user);
     cb_desc_fetch_set_progress(&ctx->fetch, ctx->progress, ctx->progress_user);
 
@@ -8777,6 +8807,7 @@ static jsdk_status_t desc_fetch_from(jsdk_context_t *ctx, uint8_t node)
                 && !cb_desc_fetch_started(&ctx->fetch)
                 && jsdk_elapsed(ctx->now_ms, req_at) >= jsdk_desc_retry_delay_ms(retries)) {
                 retries++;
+                ctx->desc_retries++;
                 req_at = ctx->now_ms;
                 if (jsdk_ctx_send(ctx, CB_PRI_CONFIG, CB_MSG_JSON_DESC_READ, node,
                                   req, (uint8_t)req_len) == 0) {
@@ -9041,6 +9072,7 @@ jsdk_status_t jsdk_context_desc_poll(jsdk_context_t *ctx, uint64_t app_time_ns)
         cb_desc_fetch_set_raw_sink(&ctx->fetch, ctx->raw_sink, ctx->raw_sink_user);
         cb_desc_fetch_set_progress(&ctx->fetch, ctx->progress, ctx->progress_user);
         ctx->fetch_active = 1;
+        ctx->desc_retries = 0u;              /* 非阻塞路径同理 */
 
         req_len = cb_desc_build_request(req, sizeof req, 0u);
         if (req_len == 0u) return JSDK_ERR_INVALID_ARG;
@@ -9145,6 +9177,7 @@ jsdk_status_t jsdk_context_get_desc_info(jsdk_context_t *ctx, jsdk_desc_info_t *
     *info = ctx->desc;
     info->endpoint_count = jsdk_ep_store_count(&ctx->store);
     info->parsed_total   = ctx->store.parsed_total;
+    info->retries        = ctx->desc_retries;
     return JSDK_OK;
 }
 
@@ -10846,6 +10879,7 @@ jsdk_status_t jsdk_context_warmup(jsdk_context_t *ctx, uint32_t timeout_ms)
             ctx->warmed     = 1u;
             ctx->in_warmup  = 0u;
             ctx->bus.tx_retries += (uint32_t)(attempts - 1u);
+            if (attempts > 1u) jsdk_ctx_note_retry(ctx, 1u);   /* 1 = 预热 */
             return JSDK_OK;
         }
 

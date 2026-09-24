@@ -52,9 +52,10 @@ class BusState:
     """``jsdk_bus_state_t`` 的 Python 视图。"""
 
     __slots__ = ("tx_frames", "rx_frames", "tx_failed", "rx_dropped",
-                 "keepalive_sent", "tx_retries", "tx_retries_req",
-                 "last_rx_age_ms", "hal_bus_flags", "link_errors",
-                 "nodes_online", "link_up")
+                 "keepalive_sent", "tx_retries", "tx_retries_warm",
+                 "tx_retries_req", "req_timeouts", "last_retry_what",
+                 "last_retry_age_ms", "last_rx_age_ms", "hal_bus_flags",
+                 "link_errors", "nodes_online", "link_up")
 
     def __init__(self, c: _abi.BusState) -> None:
         self.tx_frames = c.tx_frames
@@ -63,7 +64,11 @@ class BusState:
         self.rx_dropped = c.rx_dropped
         self.keepalive_sent = c.keepalive_sent
         self.tx_retries = c.tx_retries
+        self.tx_retries_warm = c.tx_retries_warm
         self.tx_retries_req = c.tx_retries_req
+        self.req_timeouts = c.req_timeouts
+        self.last_retry_what = c.last_retry_what
+        self.last_retry_age_ms = c.last_retry_age_ms
         self.last_rx_age_ms = c.last_rx_age_ms
         self.hal_bus_flags = c.hal_bus_flags
         self.link_errors = c.link_errors
@@ -84,7 +89,8 @@ class DescInfo:
 
     __slots__ = ("total_len", "crc", "fw_version", "hw_version",
                  "endpoint_count", "parsed_total", "frames_rx", "bytes_scanned",
-                 "complete", "mode_used", "shared_hit", "raw_sink_failed")
+                 "complete", "mode_used", "shared_hit", "raw_sink_failed",
+                 "retries")
 
     def __init__(self, c: _abi.DescInfo) -> None:
         self.total_len = c.total_len
@@ -99,6 +105,9 @@ class DescInfo:
         self.mode_used = c.mode_used
         self.shared_hit = bool(c.shared_hit)
         self.raw_sink_failed = bool(c.raw_sink_failed)
+        #: 本次下载**重发** `0x24` 请求的次数（“请求丢了”的直接证据）。
+        #: ⚠ 大概率不是 0：真机 slcan 实测第一条请求会丢，重发救回属于正常。
+        self.retries = c.retries
 
     def as_dict(self) -> dict:
         return {k: getattr(self, k) for k in self.__slots__}

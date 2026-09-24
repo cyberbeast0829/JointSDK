@@ -950,6 +950,50 @@ static void test_warmup(void)
            "all dropped -> reported\n");
 }
 
+/**
+ * [15] 链路质量观测（v0.33）：现场排“链路稳不稳”时，一条命令就能看到全部证据。
+ *
+ * - `health --json` 的 `bus` 里必须有分类计数器（预热 / 幂等请求 / 超时 / 最近重发）；
+ * - `desc-info` 必须报出描述符请求（`0x24`）的重发次数 —— 它就是“请求丢了”的直接证据。
+ */
+static void test_link_quality_report(void)
+{
+    run_t r;
+
+    printf("[15] link-quality report: health carries the counters, desc-info the "
+           "request retries\n");
+
+    RUN_CLI(&r, VIF, "--json", "health");
+    CHECK(r.rc == 0);
+    expect_has(&r, "out", "\"tx_retries\"");
+    expect_has(&r, "out", "\"tx_retries_warm\"");
+    expect_has(&r, "out", "\"tx_retries_req\"");
+    expect_has(&r, "out", "\"req_timeouts\"");
+    expect_has(&r, "out", "\"last_retry_what\"");
+
+    /* 人读输出也要有这一行（现场多半是肉眼看，不是解析 JSON） */
+    RUN_CLI(&r, VIF, "health");
+    CHECK(r.rc == 0);
+    expect_has(&r, "out", "retries");
+
+    /*
+     * 描述符请求丢一帧（`0x24`）→ 下载重发一次并成功，`desc-info` 如实报出来。
+     * ⚠ 预热用的是 `0x46`，不是 `0x24`，所以这一帧确实落在描述符请求上。
+     */
+    RUN_CLI(&r, "--if", "virtual", "--channel", CH ",dropmsg=0x24:1",
+            "--json", "desc-info");
+    CHECK(r.rc == 0);
+    expect_has(&r, "out", "\"retries\":1");
+
+    RUN_CLI(&r, "--if", "virtual", "--channel", CH ",dropmsg=0x24:1", "desc-info");
+    CHECK(r.rc == 0);
+    /* 人读行的对齐空格不固定，只断言“这行出现了”（值由上面的 JSON 断言钉） */
+    expect_has(&r, "out", "0x24 请求重发");
+
+    printf("      health carries warm/req/timeout/last-retry; desc-info reports "
+           "the 0x24 re-sends\n");
+}
+
 int main(void)
 {
     printf("=== WP7 tests (jsdk-cli) ===\n\n");
@@ -981,6 +1025,8 @@ int main(void)
     test_framing_adopt();
     printf("\n");
     test_warmup();
+    printf("\n");
+    test_link_quality_report();
 
     printf("\n=== %u checks, %u failures ===\n", g_checks, g_fail);
     return (g_fail == 0u) ? 0 : 1;

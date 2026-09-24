@@ -375,6 +375,12 @@ size_t jsdk_context_joint_size(void) { return sizeof(jsdk_joint_t); }
  * @param timeout_ms 每次尝试的等待窗口（不是总时长）。
  * @return `JSDK_OK` / 前一次尝试的状态码。
  */
+void jsdk_ctx_note_retry(jsdk_context_t *ctx, uint8_t what)
+{
+    ctx->last_retry_ms   = ctx->cfg.hal.now_ms(ctx->cfg.hal.user);
+    ctx->last_retry_what = what;
+}
+
 int jsdk_ctx_request(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
                      uint8_t dest, const uint8_t *payload, uint8_t len,
                      uint8_t rsp_msgtype, jsdk_can_frame_t *out,
@@ -396,6 +402,7 @@ int jsdk_ctx_request(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
         rc = jsdk_ctx_wait_response(ctx, rsp_msgtype, dest, out, timeout_ms);
         if (rc == JSDK_OK) break;
         if (rc != JSDK_ERR_TIMEOUT) return rc;      /* 协议错：重发没意义 */
+        ctx->bus.req_timeouts++;                    /* 观测：这一等没等到 */
         if (attempt >= max_attempts) break;         /* 尝试用完 */
         if (!ctx->bus.link_up) break;               /* 链路本就不通 */
     }
@@ -403,6 +410,7 @@ int jsdk_ctx_request(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
     if (attempt > 1u) {
         ctx->bus.tx_retries     += (uint32_t)(attempt - 1u);
         ctx->bus.tx_retries_req += (uint32_t)(attempt - 1u);
+        jsdk_ctx_note_retry(ctx, 2u);              /* 2 = 幂等请求 */
     }
     return rc;
 }
@@ -715,6 +723,12 @@ jsdk_status_t jsdk_context_get_bus_state(jsdk_context_t *ctx, jsdk_bus_state_t *
     *state = ctx->bus;
     state->nodes_online = online;
     state->last_rx_age_ms = jsdk_elapsed(ctx->now_ms, ctx->last_rx_ms);
+    /* 拆开“哪一类重发”：预热那类是已知无害，运行途中那类才值得追。
+       实现上用“总数 - 幂等请求”会在将来新增重发类别时**静默说谎**，所以这里直接维护两个计数器。 */
+    state->tx_retries_warm = ctx->bus.tx_retries - ctx->bus.tx_retries_req;
+    state->last_retry_what = ctx->last_retry_what;
+    state->last_retry_age_ms = ctx->last_retry_what
+        ? jsdk_elapsed(ctx->now_ms, ctx->last_retry_ms) : 0u;
     if (ctx->cfg.hal.bus_status) {
         uint32_t flags = 0u;
         if (ctx->cfg.hal.bus_status(ctx->cfg.hal.user, &flags) == 0) {

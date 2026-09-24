@@ -158,7 +158,7 @@ python -c "d=open('gbk.bin','rb').read();print(d[:4].hex(' '), d.decode('gbk')[:
 |---|---|
 | `scan` | 节点发现：被动听心跳 200 ms + 主动 `QUERY_STATUS` 探测 1..`--probe`。**不下载描述符**（省 41 KB 流量） |
 | `info` | `QUERY_DEVICE_INFO(0x46)`：hw / fw / serial。⚠ **Classic 链路下 `serial` 恒为 0 是协议如此** —— 真机实测 `0x46` 的响应只有 8 字节（`hw u32 + fw u32`，没有 serial 字段；FD 才是 16 字节）。要序列号用 `read serial_number`（描述符端点，u64，本机实测 `108005767394384`）|
-| `health` | 健康快照：模式、轴状态、错误码、心跳标志、温度、母线、`age_ms`、链路统计 |
+| `health` | 健康快照：模式、轴状态、错误码、心跳标志、温度、母线、`age_ms`、链路统计（含**丢帧/重发分类**：`req_timeouts` = 等超时的次数、`retries` = 预热 + 幂等请求的拆分、`last_retry_*` = 最近一次重发是哪类、多久之前 —— 排“这条链稳不稳”看这四个） |
 | `mon` | 周期监控；`--csv` 换格式，`--csv-file` 同时落文件 |
 | `read <path>` | 按名读参数（类型随描述符） |
 | `batch-read <path>...` | 批量读：FD 下打包成单帧，Classic 下自动逐条 |
@@ -271,14 +271,14 @@ jsdk-cli --if socketcan --channel can0 --yes --hold 5 mit --pos 0.0 --stiffness 
 
 | 命令 | 顶层字段 |
 |---|---|
-| `health` | `joint{ node, pos_rad, vel_rad_s, current_A, torque_Nm, t_motor_C, t_fet_C, vbus_V, ibus_A, axis_state, mode, mode_state_nibble, err_code, err_name, hb_error, axis_error, age_ms, tx_frames, tx_rejected, status_flags, online, enabled, fault }`、`bus{ tx_frames, rx_frames, tx_failed, rx_dropped, keepalive_sent, last_rx_age_ms, link_errors, hal_bus_flags, nodes_online, link_up }` |
+| `health` | `joint{ node, pos_rad, vel_rad_s, current_A, torque_Nm, t_motor_C, t_fet_C, vbus_V, ibus_A, axis_state, mode, mode_state_nibble, err_code, err_name, hb_error, axis_error, age_ms, tx_frames, tx_rejected, status_flags, online, enabled, fault }`、`bus{ tx_frames, rx_frames, tx_failed, rx_dropped, keepalive_sent, **tx_retries, tx_retries_warm, tx_retries_req, req_timeouts, last_retry_what, last_retry_age_ms**, last_rx_age_ms, link_errors, hal_bus_flags, nodes_online, link_up }` |
 | `dump-config` | `valid, gear_ratio, mit_max_pos, mit_max_vel, mit_max_torque, mit_max_kp, mit_max_kd, torque_constant, node_id, heartbeat_rate_ms, break_timeout_ms` |
 | `read` | `path, type, value, value_text` |
 | `batch-read` | `values[]{ path, value｜error, type }, status, single_frame` |
 | `ep-list` | `endpoints[]{ path, id, type, access }, count, status` |
 | `ep-lookup` | `path, id, type, readable, writable` |
 | `scan` | `nodes[], count` |
-| `desc-info` | `total_len, crc, fw_version, hw_version, endpoint_count, parsed_total, frames_rx, bytes_scanned, complete, mode_used, shared_hit, raw_sink_failed` |
+| `desc-info` | `total_len, crc, fw_version, hw_version, endpoint_count, parsed_total, frames_rx, **retries**, bytes_scanned, complete, mode_used, shared_hit, raw_sink_failed` |
 | `hb-dump` | `heartbeats[]{ src, len, bytes, life, err_flags, state, control_mode }, count, waited_ms` |
 | `desc-export` | `file, bytes` |
 | `desc-import` | `file, bytes, imported, endpoint_count, downloaded:false` |
@@ -435,7 +435,7 @@ jsdk-cli --if virtual scan --json
 | 现象 | 原因 | 现在的处理 |
 |---|---|---|
 | **Linux**：`打开 slcan(/dev/ttyACM0) 失败：invalid-argument` | 一个字面信息都没有的返回码，真因通常是**权限**（`/dev/ttyACM0` 属 `dialout`，而 `slcand` 是 `sudo` 起的，容易忘了 SDK 这条也要）、设备不存在、或**被 `slcand`/`candump` 占着** | 失败时多打一行 `原因：…`（`jsdk_hal_slcan_last_open_error()` 带着 errno 与建议）：`EACCES → 加进 dialout 组或用 sudo`、`ENOENT → ls /dev/ttyACM*`、`EBUSY → 先 pkill slcand`。切换步骤见 `PORTING.zh-CN.md` §7.5.2 |
-| 第一次跑 `configure()/desc-info` 超时，再跑一次就好 | 适配器打开端口后头几帧被丢（`acks/nacks` 恒 0，主机侧**没有任何可观测信号**） | ① **发帧前自动做一次“会话预热”**：`jsdk_context_warmup()` 反复发一条只读的 `QUERY_DEVICE_INFO(0x46)`（每轮等 50 ms、默认预算 500 ms），丢几帧都无所谓 —— **用户可见的第一条命令不再莫名失败**（去掉它，`info` 这类只发一帧的命令在 `drophead=1` 时就会失败）；`-v` 报 `重发=N（预热）`，`tx_retries` 也能从 `health` 读到；② `hal_slcan` 的 `C`/`Y<n>`/`O` **等适配器 ACK，没 ACK 就重发**；③ 描述符请求按 **0.25/0.6/1.2 s** 递增间隔**重发 3 次**（设备对 `0x24` 幂等）。修后实测：`desc-info` **20/20**、`health` **12/12**（修前约 1/10 失败） |
+| 第一次跑 `configure()/desc-info` 超时，再跑一次就好 | 适配器打开端口后头几帧被丢（`acks/nacks` 恒 0，主机侧**没有任何可观测信号**） | ① **发帧前自动做一次“会话预热”**：`jsdk_context_warmup()` 反复发一条只读的 `QUERY_DEVICE_INFO(0x46)`（每轮等 50 ms、默认预算 500 ms），丢几帧都无所谓 —— **用户可见的第一条命令不再莫名失败**（去掉它，`info` 这类只发一帧的命令在 `drophead=1` 时就会失败）；`-v` 报 `重发=N（预热 X + 幂等请求 Y）；超时=Z`，同样能从 `health` 的 `bus` 读到；② `hal_slcan` 的 `C`/`Y<n>`/`O` **等适配器 ACK，没 ACK 就重发**；③ 描述符请求按 **0.25/0.6/1.2 s** 递增间隔**重发 3 次**（设备对 `0x24` 幂等）。修后实测：`desc-info` **20/20**、`health` **12/12**（修前约 1/10 失败） |
 | 超时信息里有 `0/0 bytes, 0 frames received` | 通道层面：一帧都没收到 | 这是**明确诊断**，不是"设备慢"：查端口/终端电阻/bitrate/上电 |
 | 超时信息里有 `0/0 bytes, N frames received`（N>0） | 通道是通的，但请求没到达设备 | 重发已用尽：查适配器固件、或设备是否在过滤该 MsgType |
 | **Linux/Classic 设备**：`desc-info` 报 `0/0 bytes, 198 frames received`，而 `candump` 能看到心跳 | **对端是 Classic，而我们默认发 FD**（协议没有运行时协商，设备用哪种 格式由它自己的 `can.config.baud_rate` 决定） | SDK 现在会**自动对齐**到对端格式并在 stderr 提醒（`jsdk_context_framing_learned()`：1 = 改学 Classic / 2 = 改学 FD / 3 = 一致 / 4 = 你显式指定的与对端冲突）。**不传** `--classic`/`--data-bitrate` 时才会自动对齐；显式写错只警告不改（你说了算） |

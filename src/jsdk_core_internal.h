@@ -285,6 +285,15 @@ struct jsdk_context {
     /* ---- 记账 ---- */
     jsdk_bus_state_t bus;
     uint32_t         last_rx_ms;      /**< 最近一次收到与本主站相关帧的时刻 */
+    /**
+     * 最近一次**自动重发**的时刻与类别（只为观测；`jsdk_context_get_bus_state()`
+     * 把它们换算成 `last_retry_what` / `last_retry_age_ms` 报出去）。
+     * 类别：0 从未 / 1 会话预热 / 2 幂等请求。
+     */
+    uint32_t         last_retry_ms;
+    uint8_t          last_retry_what;
+    /** 描述符下载中重发 `0x24` 请求的次数（每次下载开始时清零，见 `jsdk_desc.c`）。 */
+    uint32_t         desc_retries;
 
     /**
      * 堆模式（`heap_optional.c`）下由 SDK 自己分配的 arena；零 malloc 模式下为 NULL。
@@ -322,6 +331,12 @@ static inline uint32_t jsdk_elapsed(uint32_t now, uint32_t then)
  */
 int jsdk_ctx_send(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
                   uint8_t dest, const uint8_t *payload, uint8_t len);
+
+/**
+ * 记下“最近一次重发”的时刻与类别（纯观测；见 `jsdk_bus_state_t.last_retry_what`）。
+ * 类别：1 = 会话预热；2 = 幂等请求。
+ */
+void jsdk_ctx_note_retry(jsdk_context_t *ctx, uint8_t what);
 
 /** 不含自动预热的发送：控制帧 / 急停专用（延迟敏感，不能等）。 */
 int jsdk_ctx_send_raw(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,

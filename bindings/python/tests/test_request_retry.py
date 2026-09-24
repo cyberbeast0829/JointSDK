@@ -56,3 +56,44 @@ def test_all_dropped_fails_bounded():
         with pytest.raises(Exception):
             ctx.configure()
         assert ctx.bus_state().tx_retries_req == 1
+
+
+# ---------------------------------------------------------------------------
+# 观测（v0.33）：计数分类 + 不变式 + 最近一次重发 + 描述符请求重发次数
+# ---------------------------------------------------------------------------
+
+
+def test_retry_counters_and_invariant():
+    """`tx_retries == tx_retries_warm + tx_retries_req`，且“运行中途丢帧”单独计量。"""
+    with Context(VirtualHal(virtual_spec(1) + f",dropmsg={MT_PARAM_READ}:1")) as ctx:
+        ctx.add_joint(1)
+        ctx.configure()
+
+        bs = ctx.bus_state()
+        assert bs.tx_retries == bs.tx_retries_warm + bs.tx_retries_req
+        assert bs.tx_retries_req == 1
+        assert bs.req_timeouts >= 1          # 救回来了也要记账（那才是“丢过帧”的证据）
+        assert bs.last_retry_what == 2       # 2 = 幂等请求
+        assert bs.last_retry_age_ms >= 0
+
+
+def test_warmup_retries_are_classified_as_warmup():
+    """会话开头丢帧归到 `tx_retries_warm`，不算“运行中途丢帧”。"""
+    with Context(VirtualHal(virtual_spec(1) + ",drophead=2")) as ctx:
+        ctx.add_joint(1)
+        ctx.warmup()
+        bs = ctx.bus_state()
+        assert bs.tx_retries == bs.tx_retries_warm + bs.tx_retries_req
+        assert bs.tx_retries_warm >= 2
+        assert bs.tx_retries_req == 0
+        assert bs.last_retry_what == 1       # 1 = 会话预热
+
+
+def test_desc_info_reports_request_resends():
+    """`desc_info().retries` = 0x24 请求重发次数（“请求丢了”的直接证据）。"""
+    with Context(VirtualHal(virtual_spec(1) + ",dropmsg=0x24:1")) as ctx:
+        ctx.add_joint(1)
+        ctx.configure()
+        info = ctx.desc_info()
+        assert info.retries >= 1
+        assert info.complete

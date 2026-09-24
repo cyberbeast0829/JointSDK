@@ -128,6 +128,7 @@ static jsdk_status_t desc_fetch_from(jsdk_context_t *ctx, uint8_t node)
         return JSDK_ERR_INVALID_ARG;
     }
     ctx->fetch_active = 1;
+    ctx->desc_retries = 0u;                  /* 本次下载的重发计数从 0 开始 */
     cb_desc_fetch_set_raw_sink(&ctx->fetch, ctx->raw_sink, ctx->raw_sink_user);
     cb_desc_fetch_set_progress(&ctx->fetch, ctx->progress, ctx->progress_user);
 
@@ -209,6 +210,7 @@ static jsdk_status_t desc_fetch_from(jsdk_context_t *ctx, uint8_t node)
                 && !cb_desc_fetch_started(&ctx->fetch)
                 && jsdk_elapsed(ctx->now_ms, req_at) >= jsdk_desc_retry_delay_ms(retries)) {
                 retries++;
+                ctx->desc_retries++;
                 req_at = ctx->now_ms;
                 if (jsdk_ctx_send(ctx, CB_PRI_CONFIG, CB_MSG_JSON_DESC_READ, node,
                                   req, (uint8_t)req_len) == 0) {
@@ -473,6 +475,7 @@ jsdk_status_t jsdk_context_desc_poll(jsdk_context_t *ctx, uint64_t app_time_ns)
         cb_desc_fetch_set_raw_sink(&ctx->fetch, ctx->raw_sink, ctx->raw_sink_user);
         cb_desc_fetch_set_progress(&ctx->fetch, ctx->progress, ctx->progress_user);
         ctx->fetch_active = 1;
+        ctx->desc_retries = 0u;              /* 非阻塞路径同理 */
 
         req_len = cb_desc_build_request(req, sizeof req, 0u);
         if (req_len == 0u) return JSDK_ERR_INVALID_ARG;
@@ -577,6 +580,7 @@ jsdk_status_t jsdk_context_get_desc_info(jsdk_context_t *ctx, jsdk_desc_info_t *
     *info = ctx->desc;
     info->endpoint_count = jsdk_ep_store_count(&ctx->store);
     info->parsed_total   = ctx->store.parsed_total;
+    info->retries        = ctx->desc_retries;
     return JSDK_OK;
 }
 

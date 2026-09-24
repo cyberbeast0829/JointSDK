@@ -76,6 +76,7 @@ jsdk_status_t jsdk_context_warmup(jsdk_context_t *ctx, uint32_t timeout_ms)
             ctx->warmed     = 1u;
             ctx->in_warmup  = 0u;
             ctx->bus.tx_retries += (uint32_t)(attempts - 1u);
+            if (attempts > 1u) jsdk_ctx_note_retry(ctx, 1u);   /* 1 = 预热 */
             return JSDK_OK;
         }
 

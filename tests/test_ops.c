@@ -2118,6 +2118,103 @@ static void test_idempotent_request_retry(void)
     fx_close(&fx);
 }
 
+/**
+ * [17] 链路质量观测（v0.33）：**让现场不用靠猜**。
+ *
+ * 断言三件事：
+ *   1. 三个计数器的**不变式**：`tx_retries == tx_retries_warm + tx_retries_req`；
+ *   2. `req_timeouts` 数的是“等过但没等到”的次数（含后来被重发救回的 —— 那才是
+ *      “链路偶发丢帧”的证据；只看“失败”是看不到丢帧的）；
+ *   3. `last_retry_what` / `last_retry_age_ms` 说得出“最近一次重发是哪一类、多久之前”。
+ *   另外把描述符下载的重发次数（`desc_info.retries`）也钉住 —— 它就是
+ *   “0x24 请求丢了”的直接证据（v0.23 那次真机排查全靠它）。
+ */
+static void test_link_quality_observability(void)
+{
+    fix_t fx;
+    jsdk_bus_state_t bs;
+
+    printf("[17] link-quality observability: retry classes, timeouts, last-retry, "
+           "desc retries\n");
+
+    if (fx_open(&fx, "0:id=1,gear=16.0,tconst=0.0385,pmax=12.5,vmax=65,tmax=50,"
+                     "kpmax=500,kdmax=5,hb=10,timeout=30000,fd", 1u) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+
+    /* ---- ① 会话预热丢帧 → 归类为“预热”，并且不变式成立 ---- */
+    fx.drop_tx_head = 2u;
+    CHECK_EQ(fx_configure(&fx), 0);
+    CHECK_EQ(jsdk_context_get_bus_state(fx.ctx, &bs), JSDK_OK);
+    CHECK_EQ(bs.tx_retries, bs.tx_retries_warm + bs.tx_retries_req);
+    CHECK(bs.tx_retries_warm >= 2u);
+    CHECK_EQ(bs.tx_retries_req, 0u);              /* 预热丢帧不算“运行中途丢帧” */
+    CHECK_EQ(bs.last_retry_what, 1u);             /* 1 = 会话预热 */
+    CHECK(bs.last_retry_age_ms < 10000u);
+
+    /* ---- ② 运行中途丢一条读 → 归类为“幂等请求”，且超时计数 +1 ---- */
+    fx.drop_tx_head    = 0u;
+    fx.dropped         = 0u;
+    fx.drop_msgtype    = (uint8_t)CB_MSG_PARAM_READ;
+    fx.drop_msgtype_n  = 1u;
+    fx.dropped_msgtype = 0u;
+    {
+        jsdk_value_t v;
+        uint32_t to_before;
+
+        CHECK_EQ(jsdk_context_get_bus_state(fx.ctx, &bs), JSDK_OK);
+        to_before = bs.req_timeouts;
+
+        CHECK_EQ(jsdk_joint_param_get(fx.j, "axis0.motor.config.gear_ratio", &v), JSDK_OK);
+        CHECK_EQ(jsdk_context_get_bus_state(fx.ctx, &bs), JSDK_OK);
+        CHECK_EQ(bs.tx_retries, bs.tx_retries_warm + bs.tx_retries_req);
+        CHECK_EQ(bs.tx_retries_req, 1u);
+        CHECK_EQ(bs.req_timeouts, to_before + 1u);   /* 救回来了也要记账 */
+        CHECK_EQ(bs.last_retry_what, 2u);            /* 2 = 幂等请求 */
+    }
+
+    /* ---- ③ 全丢 → 超时继续累加（这才是“链路真不稳”的判据） ---- */
+    fx.drop_msgtype_n = 1000u;
+    {
+        jsdk_value_t v;
+        uint32_t to_before;
+
+        CHECK_EQ(jsdk_context_get_bus_state(fx.ctx, &bs), JSDK_OK);
+        to_before = bs.req_timeouts;
+
+        CHECK_EQ(jsdk_joint_param_get(fx.j, "axis0.motor.config.gear_ratio", &v),
+                 JSDK_ERR_TIMEOUT);
+        CHECK_EQ(jsdk_context_get_bus_state(fx.ctx, &bs), JSDK_OK);
+        CHECK(bs.req_timeouts >= to_before + 1u);
+        fx.drop_msgtype_n = 0u;
+        fx.drop_msgtype   = 0u;
+    }
+    fx_close(&fx);
+
+    /* ---- ④ 描述符下载的 0x24 重发次数（丢首帧时必须 >= 1） ---- */
+    if (fx_open(&fx, "0:id=1,gear=16.0,tconst=0.0385,pmax=12.5,vmax=65,tmax=50,"
+                     "kpmax=500,kdmax=5,hb=10,timeout=30000,fd", 1u) == 0) {
+        jsdk_desc_info_t di;
+
+        /* 注意：会话预热会先发一帧 0x46（不是 0x24），所以这里的丢帧正好落在
+           描述符请求上 —— 那是 0x24 重发逻辑唯一的入口。 */
+        fx.drop_msgtype    = (uint8_t)CB_MSG_JSON_DESC_READ;
+        fx.drop_msgtype_n  = 1u;
+        fx.dropped_msgtype = 0u;
+
+        CHECK_EQ(fx_configure(&fx), 0);
+        CHECK_EQ(jsdk_context_get_desc_info(fx.ctx, &di), JSDK_OK);
+        CHECK(di.retries >= 1u);
+        CHECK_EQ(di.complete, 1u);
+        printf("      descriptor request re-sent %u time(s) after the injected drop\n",
+               di.retries);
+        fx_close(&fx);
+    }
+
+    printf("      retry classes split correctly; timeouts counted; last retry "
+           "reported; desc retries visible\n");
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -2144,6 +2241,7 @@ int main(void)
     test_framing_semantics(); printf("\n");
     test_warmup();       printf("\n");
     test_idempotent_request_retry(); printf("\n");
+    test_link_quality_observability(); printf("\n");
     test_robustness();   printf("\n");
 
     free(g_json);
