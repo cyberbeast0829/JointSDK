@@ -414,14 +414,8 @@ jsdk_status_t jsdk_joint_param_get_batch(jsdk_joint_t *j, jsdk_param_req_t *reqs
             rq_len = cb_param_pack_batch_req(req, sizeof req, eps, (uint8_t)cnt);
             if (rq_len == 0u) { batch_serial(j, reqs, n); return JSDK_OK; }
 
-            if (jsdk_ctx_send(j->ctx, CB_PRI_CONFIG, CB_MSG_PARAM_READ,
-                              j->cfg.node_id, req, (uint8_t)rq_len) != 0) {
-                batch_serial(j, reqs, n);
-                return JSDK_OK;
-            }
-            j->ctx->tx_seq = cb_seq_next(j->ctx->tx_seq);
-
-            if (jsdk_ctx_wait_response(j->ctx, CB_MSG_PARAM_READ, j->cfg.node_id,
+            if (jsdk_ctx_request_retry(j->ctx, CB_PRI_CONFIG, CB_MSG_PARAM_READ,
+                                       j->cfg.node_id, req, (uint8_t)rq_len,
                                        &frame, JSDK_CFG_TIMEOUT_MS) != JSDK_OK) {
                 batch_serial(j, reqs, n);
                 return JSDK_OK;

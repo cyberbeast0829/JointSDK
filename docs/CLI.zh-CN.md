@@ -439,6 +439,7 @@ jsdk-cli --if virtual scan --json
 | 超时信息里有 `0/0 bytes, 0 frames received` | 通道层面：一帧都没收到 | 这是**明确诊断**，不是"设备慢"：查端口/终端电阻/bitrate/上电 |
 | 超时信息里有 `0/0 bytes, N frames received`（N>0） | 通道是通的，但请求没到达设备 | 重发已用尽：查适配器固件、或设备是否在过滤该 MsgType |
 | **Linux/Classic 设备**：`desc-info` 报 `0/0 bytes, 198 frames received`，而 `candump` 能看到心跳 | **对端是 Classic，而我们默认发 FD**（协议没有运行时协商，设备用哪种 格式由它自己的 `can.config.baud_rate` 决定） | SDK 现在会**自动对齐**到对端格式并在 stderr 提醒（`jsdk_context_framing_learned()`：1 = 改学 Classic / 2 = 改学 FD / 3 = 一致 / 4 = 你显式指定的与对端冲突）。**不传** `--classic`/`--data-bitrate` 时才会自动对齐；显式写错只警告不改（你说了算） |
+| **运行中途**丢帧导致单发命令超时（`err`/`info`/`read`/`batch-read`/`scan` …）| 适配器/线束抽了一下；slcan 对帧行不回报结果（`acks/nacks` 恒 0）⇒ 主机侧零信号，而这些命令**只发一帧就等**，以前丢了就是一条超时 | **幂等请求自动重发一次**（同一帧；见 `jsdk_ctx_request_retry()`）：读（`QUERY_*`/`PARAM_READ`）与“等 ACK 的写”都属于幂等类，重发前后设备状态不变。`-v` 报 `重发=N（预热 X + 幂等请求 Y）` —— **X 是会话开头（已知无害），Y 才是运行中途丢帧**，后者持续非 0 说明链路/适配器有问题。⚠ `axis0.requested_state` 那类“写一下就跳状态机”的端点**不重发**（重发=重复触发标定/回零），它本来就不等 ACK |
 | 显式 `--classic` 打 FD 设备（或反过来） | 自动对齐**不允许**改显式配置（否则你看到的 cfg 与实际发出的帧不一致；8 字节参数的分块读就靠 `is_fd`） | FD 对端 + `--classic`：命令能跑（FD 控制器收得下经典帧），但 8 字节参数退化成两次请求；Classic 对端 + `--data-bitrate`：**必失败**（设备收不到 FD 帧，且**描述符加载失败时警告照样会打**） |
 
 ---

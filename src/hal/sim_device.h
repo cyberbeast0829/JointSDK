@@ -243,6 +243,11 @@ typedef struct {
         头一两帧上不了总线）。`dropped_tx_head` 是实际丢掉的计数。 */
     uint32_t drop_tx_head;
     uint32_t dropped_tx_head;
+    /** 运行中途丢帧注入：丢掉主站发出的**某个 MsgType** 的前 `drop_msgtype_n` 帧。
+        与 `drop_tx_head` 的区别是“发生在会话中间” —— 用来验证幂等请求重发。 */
+    uint32_t drop_msgtype;
+    uint32_t drop_msgtype_n;
+    uint32_t dropped_msgtype;
 
     /* JSON 描述符（0x24 / 0x25） */
     struct {

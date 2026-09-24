@@ -220,6 +220,7 @@ class BusState(ctypes.Structure):
         ("rx_dropped", c_uint32),
         ("keepalive_sent", c_uint32),
         ("tx_retries", c_uint32),
+        ("tx_retries_req", c_uint32),
         ("last_rx_age_ms", c_uint32),
         ("hal_bus_flags", c_uint32),
         ("link_errors", c_uint32),

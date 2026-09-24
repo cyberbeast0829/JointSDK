@@ -328,6 +328,40 @@ int jsdk_ctx_send_raw(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
                       uint8_t dest, const uint8_t *payload, uint8_t len);
 
 /**
+ * 幂等请求的**额外**尝试次数（总尝试 = 1 + 本值）。
+ *
+ * ⚠ 刻意取 1：目标是“单发命令不再随机失败”，不是“无限重试直到成功”。
+ *   每多一次尝试，设备真不在时就要多等一个完整超时（现场 3 s 级），
+ *   而“设备不在”和“这一帧丢了”在超时这一层本来就分不开。
+ */
+#define JSDK_REQ_RETRY_MAX 1u
+
+/**
+ * 幂等的“请求 → 响应”：`allow_retry` 非 0 时超时后重发同一帧
+ * （最多 `JSDK_REQ_RETRY_MAX` 次）。
+ *
+ * ⚠ **只能用于幂等请求**：读，以及“同一个值再写一遍”的写。
+ *   定义与理由见 `jsdk_context.c` 的完整注释。
+ */
+/**
+ * @param msgtype     请求的 MsgType。
+ * @param rsp_msgtype **应答**的 MsgType：多数查询与请求同号（0x20/0x21/0x45/0x46），
+ *                    但 `QUERY_STATUS(0x40)` 等的应答是 MIT 响应（**0x00**）——
+ *                    写错了就是“永远等不到应答”（本函数无法替你猜）。
+ * @param allow_retry 非 0 = 允许幂等重发；0 = 只发一次。
+ */
+int jsdk_ctx_request(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
+                     uint8_t dest, const uint8_t *payload, uint8_t len,
+                     uint8_t rsp_msgtype, jsdk_can_frame_t *out,
+                     uint32_t timeout_ms, int allow_retry);
+
+/** 幂等请求 + 自动重发（面向用户的命令走这个）。 */
+int jsdk_ctx_request_retry(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
+                           uint8_t dest, const uint8_t *payload, uint8_t len,
+                           jsdk_can_frame_t *out, uint32_t timeout_ms);
+
+
+/**
  * 阻塞等待某个 `(msgtype, source)` 的响应，同时把所有收到的帧分派给
  * 反馈解复用器（否则会丢掉期间的心跳）。
  *
@@ -503,9 +537,24 @@ void jsdk_joint__apply_calibration(jsdk_joint_t *j);
  *
  * @param out     输出缓冲（≥ 8 字节）
  * @param out_len 输出实际字节数（可 NULL）
+ * @param allow_retry 非 0 = 允许幂等重发（面向用户的命令）；0 = 只发一次（轮询）。
  */
+int jsdk_ctx_read_param_ex(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_id,
+                           uint8_t *out, uint8_t *out_len, uint32_t timeout_ms,
+                           int allow_retry);
+
+/** 读参数 + 幂等重发（面向用户的命令走这个）。 */
 int jsdk_ctx_read_param(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_id,
                         uint8_t *out, uint8_t *out_len, uint32_t timeout_ms);
+
+/**
+ * 读参数，**只发一次**。
+ *
+ * ⚠ 用于**轮询**（标定/回零期间隔 `pace_ms` 重问）：那里不需要重发，
+ *   多等一个超时（真机 3 s 级）只会把节奏拖坏，而且下一次问马上就要发。
+ */
+int jsdk_ctx_read_param_once(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_id,
+                             uint8_t *out, uint8_t *out_len, uint32_t timeout_ms);
 
 /**
  * 阻塞读一个参数值：**精确读满 `want` 字节**，必要时分块。

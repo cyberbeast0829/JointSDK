@@ -347,6 +347,76 @@ int jsdk_ctx_send(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
  */
 size_t jsdk_context_joint_size(void) { return sizeof(jsdk_joint_t); }
 
+/**
+ * **幂等的“请求 → 响应”重发**。
+ *
+ * @par 为什么需要
+ *  会话预热（`jsdk_context_warmup()`）只能把“**会话开头**丢帧”挡在用户命令之前；
+ *  运行中途适配器/线束抽一下、设备忙着处理上一帧时，**单发即等**的请求照样会
+ *  静默丢掉（slcan 对帧行不回报结果：`acks/nacks` 恒 0 ⇒ 主机侧零信号）。
+ *  而这类命令（`err` / `info` / `read` / `batch-read` / `scan` …）以前**没有任何兜底**：
+ *  丢了就是一条超时，用户再敲一次就好了 —— 与“首帧丢失”一模一样的现场症状。
+ *
+ * @par 为什么“重发”是安全的（**只能用于幂等请求**）
+ *  这里只重发**同一帧**：读（`QUERY_*` / `PARAM_READ`）与“同一个值再写一遍”的写。
+ *  语义上重发前后设备状态**不可能变坏**，所以可以无条件重发。
+ *  ⚠ **写的时候要格外小心**：`axis0.requested_state` 这类“写一下就让状态机跳转”
+ *    的端点**不能**走这里（重发等于重复触发标定/回零）。
+ *    实现上它拿 `timeout_ms = 0` 调 `jsdk_ctx_write_param()`（不等 ACK），
+ *    因此天然不走重发路径 —— 这条规则由 `jsdk_ctx_write_param()` 的注释钉住。
+ *
+ * @par 策略
+ *  - 只在**超时**（一帧响应都没等到）时重发；协议错（应答串味、长度不对）不重发；
+ *  - 最多 `JSDK_REQ_RETRY_MAX` 次额外尝试（默认 1 次，即总共 2 次）；
+ *  - 链路本来就不通（`link_up == 0`，例如 `recv()` 报错后未恢复）时**不**重发：
+ *    那种情形下多等一个超时只是更慢地告诉你同一个结论；
+ *  - 重发计入 `bus.tx_retries`（总数）与 `bus.tx_retries_req`（本类）。
+ *
+ * @param timeout_ms 每次尝试的等待窗口（不是总时长）。
+ * @return `JSDK_OK` / 前一次尝试的状态码。
+ */
+int jsdk_ctx_request(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
+                     uint8_t dest, const uint8_t *payload, uint8_t len,
+                     uint8_t rsp_msgtype, jsdk_can_frame_t *out,
+                     uint32_t timeout_ms, int allow_retry)
+{
+    unsigned attempt = 0u;
+    unsigned max_attempts = allow_retry ? (1u + (unsigned)JSDK_REQ_RETRY_MAX) : 1u;
+    int      rc = JSDK_ERR_TIMEOUT;
+
+    if (!jsdk_ctx_check(ctx)) return JSDK_ERR_INVALID_ARG;
+
+    for (;;) {
+        attempt++;
+
+        rc = jsdk_ctx_send(ctx, pri, msgtype, dest, payload, len);
+        if (rc != 0) return JSDK_ERR_TRANSPORT;
+        ctx->tx_seq = cb_seq_next(ctx->tx_seq);
+
+        rc = jsdk_ctx_wait_response(ctx, rsp_msgtype, dest, out, timeout_ms);
+        if (rc == JSDK_OK) break;
+        if (rc != JSDK_ERR_TIMEOUT) return rc;      /* 协议错：重发没意义 */
+        if (attempt >= max_attempts) break;         /* 尝试用完 */
+        if (!ctx->bus.link_up) break;               /* 链路本就不通 */
+    }
+
+    if (attempt > 1u) {
+        ctx->bus.tx_retries     += (uint32_t)(attempt - 1u);
+        ctx->bus.tx_retries_req += (uint32_t)(attempt - 1u);
+    }
+    return rc;
+}
+
+/** 幂等请求 + 自动重发（面向用户的命令走这个）。 */
+int jsdk_ctx_request_retry(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
+                           uint8_t dest, const uint8_t *payload, uint8_t len,
+                           jsdk_can_frame_t *out, uint32_t timeout_ms)
+{
+    return jsdk_ctx_request(ctx, pri, msgtype, dest, payload, len, msgtype, out,
+                            timeout_ms, 1);
+}
+
+
 /* ==========================================================================
  * 接收解复用
  * ======================================================================== */

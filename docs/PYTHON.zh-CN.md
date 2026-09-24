@@ -111,7 +111,8 @@ ctx.close()                      # 或 with Context(...) as ctx:
 ```python
 if not ctx.warmup():
     print("链路没应答：", ctx.last_error())
-print(ctx.bus_state().tx_retries)   # 预热吸收了几次丢帧（正常 0，非 0 说明确实丢过）
+print(ctx.bus_state().tx_retries)      # 总共重发了几次（会话预热 + 幂等请求）
+print(ctx.bus_state().tx_retries_req)  # 其中“**运行中途**丢帧”那部分（持续非 0 = 链路有问题）
 ```
 
 ⚠ SDK 已经把它**自动挂在发帧之前**（`Context` 内部，覆盖库用户），所以不调用也不会

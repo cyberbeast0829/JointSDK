@@ -52,8 +52,9 @@ class BusState:
     """``jsdk_bus_state_t`` 的 Python 视图。"""
 
     __slots__ = ("tx_frames", "rx_frames", "tx_failed", "rx_dropped",
-                 "keepalive_sent", "tx_retries", "last_rx_age_ms",
-                 "hal_bus_flags", "link_errors", "nodes_online", "link_up")
+                 "keepalive_sent", "tx_retries", "tx_retries_req",
+                 "last_rx_age_ms", "hal_bus_flags", "link_errors",
+                 "nodes_online", "link_up")
 
     def __init__(self, c: _abi.BusState) -> None:
         self.tx_frames = c.tx_frames
@@ -62,6 +63,7 @@ class BusState:
         self.rx_dropped = c.rx_dropped
         self.keepalive_sent = c.keepalive_sent
         self.tx_retries = c.tx_retries
+        self.tx_retries_req = c.tx_retries_req
         self.last_rx_age_ms = c.last_rx_age_ms
         self.hal_bus_flags = c.hal_bus_flags
         self.link_errors = c.link_errors

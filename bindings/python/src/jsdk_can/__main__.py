@@ -306,7 +306,8 @@ def _cmd_health(ctx: Context, args) -> int:
         f"tMot={fb.t_motor_C:.1f} vbus={fb.vbus_V:.2f} age={fb.age_ms}ms",
         f"  flags={fb.has_flag!r}",
         f"总线: link_up={bs.link_up} nodes={bs.nodes_online} "
-        f"tx={bs.tx_frames} rx={bs.rx_frames} retries={bs.tx_retries} "
+        f"tx={bs.tx_frames} rx={bs.rx_frames} "
+        f"retries={bs.tx_retries}(req {bs.tx_retries_req}) "
         f"errors={bs.link_errors}",
     ]
     if j.is_fault():

@@ -879,12 +879,14 @@ static void test_warmup(void)
 
         for (k = 0u; k < sizeof drops / sizeof drops[0]; ++k) {
             char ch[128];
-            char want[32];
+            char want[96];   /* ⚠ gcc 会按 UTF-8 字节数算 `-Wformat-truncation`：
+                                中文标签 + 两个数字，32 字节不够（Linux 上直接编译失败） */
 
             snprintf(ch, sizeof ch,
                      "0:id=1,gear=16.5,hb=10,timeout=30000,fd,drophead=%u",
                      drops[k]);
-            snprintf(want, sizeof want, "重发=%u（预热）", drops[k]);
+            snprintf(want, sizeof want, "重发=%u（预热 %u + 幂等请求 0）",
+                     drops[k], drops[k]);
 
             RUN_CLI(&r, "--if", "virtual", "--channel", ch, "-v", "--json", "info");
             CHECK(r.rc == 0);
@@ -893,13 +895,40 @@ static void test_warmup(void)
         }
     }
 
+    /*
+     * --- ② 幂等请求重发（**运行中途**丢帧，不是会话开头）---
+     *      丢掉 `err` 的第一条 0x45：预热盖不住这种情况（它只保护会话开头
+     *     那几帧），而 `err` 本身是“单发即等”——修前就是一条超时。
+     *     ⚠ `0x45` 与预热用的 `0x46` 不同，所以这里测的确实是 ② 而不是预热。
+     */
+    RUN_CLI(&r, "--if", "virtual", "--channel",
+            "0:id=1,gear=16.5,hb=10,timeout=30000,fd,dropmsg=0x45:1", "-v",
+            "--json", "err");
+    CHECK(r.rc == 0);
+    expect_has(&r, "err", "幂等请求 1");          /* 重发 1 次、且归类正确 */
+
+    /* 同理，参数读（0x20）丢一帧也必须自愈 */
+    RUN_CLI(&r, "--if", "virtual", "--channel",
+            "0:id=1,gear=16.5,hb=10,timeout=30000,fd,dropmsg=0x20:1", "-v",
+            "--json", "read", "axis0.motor.config.gear_ratio");
+    CHECK(r.rc == 0);
+    expect_has(&r, "out", "\"value\":16.5");
+    expect_has(&r, "err", "幂等请求 1");
+
+    /* 全丢：必须**明确失败**（不能无限重试），且只多试一次 */
+    RUN_CLI(&r, "--if", "virtual", "--channel",
+            "0:id=1,gear=16.5,hb=10,timeout=30000,fd,dropmsg=0x45:100000", "-v",
+            "--json", "err");
+    CHECK(r.rc != 0);
+    expect_has(&r, "err", "幂等请求 1");
+
     /* --- `read`：错误注入下也要成功（这条另有描述符重发兜底，用来钉住报告值） --- */
     RUN_CLI(&r, "--if", "virtual", "--channel",
             "0:id=1,gear=16.5,hb=10,timeout=30000,fd,drophead=2", "-v",
             "--json", "read", "axis0.motor.config.gear_ratio");
     CHECK(r.rc == 0);
     expect_has(&r, "out", "\"value\":16.5");
-    expect_has(&r, "err", "重发=2（预热）");
+    expect_has(&r, "err", "重发=2（预热 2 + 幂等请求 0）");
 
     /* --- 全丢：必须**明确失败**（不能“静静地什么也没做”），并说明预热没等到应答 --- */
     RUN_CLI(&r, "--if", "virtual", "--channel",

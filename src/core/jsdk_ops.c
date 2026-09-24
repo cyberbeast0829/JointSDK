@@ -114,8 +114,13 @@ static int read_current_state(jsdk_joint_t *j, uint8_t *out)
             return -1;
         }
     }
-    if (jsdk_ctx_read_param(j->ctx, j->cfg.node_id, j->ep_current_state,
-                            buf, &len, 0u) != JSDK_OK) {
+    /*
+     * ⚠ 用 `_once`：这是标定/回零期间的**轮询**读（每 `pace_ms` 再问一次）。
+     *   重发在这里等价于把节奏拖成一个额外的超时（真机 3 s 级），
+     *   而“下一次问”马上就要发 —— 轮询需要的是下一次，不是重试这一次。
+     */
+    if (jsdk_ctx_read_param_once(j->ctx, j->cfg.node_id, j->ep_current_state,
+                                 buf, &len, 0u) != JSDK_OK) {
         return -1;
     }
     if (len < 1u) return -1;

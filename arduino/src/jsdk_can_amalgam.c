@@ -2344,6 +2344,40 @@ int jsdk_ctx_send_raw(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
                       uint8_t dest, const uint8_t *payload, uint8_t len);
 
 /**
+ * 幂等请求的**额外**尝试次数（总尝试 = 1 + 本值）。
+ *
+ * ⚠ 刻意取 1：目标是“单发命令不再随机失败”，不是“无限重试直到成功”。
+ *   每多一次尝试，设备真不在时就要多等一个完整超时（现场 3 s 级），
+ *   而“设备不在”和“这一帧丢了”在超时这一层本来就分不开。
+ */
+#define JSDK_REQ_RETRY_MAX 1u
+
+/**
+ * 幂等的“请求 → 响应”：`allow_retry` 非 0 时超时后重发同一帧
+ * （最多 `JSDK_REQ_RETRY_MAX` 次）。
+ *
+ * ⚠ **只能用于幂等请求**：读，以及“同一个值再写一遍”的写。
+ *   定义与理由见 `jsdk_context.c` 的完整注释。
+ */
+/**
+ * @param msgtype     请求的 MsgType。
+ * @param rsp_msgtype **应答**的 MsgType：多数查询与请求同号（0x20/0x21/0x45/0x46），
+ *                    但 `QUERY_STATUS(0x40)` 等的应答是 MIT 响应（**0x00**）——
+ *                    写错了就是“永远等不到应答”（本函数无法替你猜）。
+ * @param allow_retry 非 0 = 允许幂等重发；0 = 只发一次。
+ */
+int jsdk_ctx_request(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
+                     uint8_t dest, const uint8_t *payload, uint8_t len,
+                     uint8_t rsp_msgtype, jsdk_can_frame_t *out,
+                     uint32_t timeout_ms, int allow_retry);
+
+/** 幂等请求 + 自动重发（面向用户的命令走这个）。 */
+int jsdk_ctx_request_retry(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
+                           uint8_t dest, const uint8_t *payload, uint8_t len,
+                           jsdk_can_frame_t *out, uint32_t timeout_ms);
+
+
+/**
  * 阻塞等待某个 `(msgtype, source)` 的响应，同时把所有收到的帧分派给
  * 反馈解复用器（否则会丢掉期间的心跳）。
  *
@@ -2519,9 +2553,24 @@ void jsdk_joint__apply_calibration(jsdk_joint_t *j);
  *
  * @param out     输出缓冲（≥ 8 字节）
  * @param out_len 输出实际字节数（可 NULL）
+ * @param allow_retry 非 0 = 允许幂等重发（面向用户的命令）；0 = 只发一次（轮询）。
  */
+int jsdk_ctx_read_param_ex(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_id,
+                           uint8_t *out, uint8_t *out_len, uint32_t timeout_ms,
+                           int allow_retry);
+
+/** 读参数 + 幂等重发（面向用户的命令走这个）。 */
 int jsdk_ctx_read_param(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_id,
                         uint8_t *out, uint8_t *out_len, uint32_t timeout_ms);
+
+/**
+ * 读参数，**只发一次**。
+ *
+ * ⚠ 用于**轮询**（标定/回零期间隔 `pace_ms` 重问）：那里不需要重发，
+ *   多等一个超时（真机 3 s 级）只会把节奏拖坏，而且下一次问马上就要发。
+ */
+int jsdk_ctx_read_param_once(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_id,
+                             uint8_t *out, uint8_t *out_len, uint32_t timeout_ms);
 
 /**
  * 阻塞读一个参数值：**精确读满 `want` 字节**，必要时分块。
@@ -2989,6 +3038,11 @@ typedef struct {
         头一两帧上不了总线）。`dropped_tx_head` 是实际丢掉的计数。 */
     uint32_t drop_tx_head;
     uint32_t dropped_tx_head;
+    /** 运行中途丢帧注入：丢掉主站发出的**某个 MsgType** 的前 `drop_msgtype_n` 帧。
+        与 `drop_tx_head` 的区别是“发生在会话中间” —— 用来验证幂等请求重发。 */
+    uint32_t drop_msgtype;
+    uint32_t drop_msgtype_n;
+    uint32_t dropped_msgtype;
 
     /* JSON 描述符（0x24 / 0x25） */
     struct {
@@ -6772,8 +6826,9 @@ const char *cb_error_type_name(uint8_t err_type)
  * 前 4 字节。适合值 ≤ 4 字节的场景（float/u32/u16/u8/bool，即全部标定量程）。
  * 要读满 8 字节的类型用 @ref jsdk_ctx_read_param_exact。
  */
-int jsdk_ctx_read_param(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_id,
-                        uint8_t *out, uint8_t *out_len, uint32_t timeout_ms)
+int jsdk_ctx_read_param_ex(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_id,
+                           uint8_t *out, uint8_t *out_len, uint32_t timeout_ms,
+                           int allow_retry)
 {
     uint8_t  req[CB_PARAM_READ_REQ_MIN];
     jsdk_can_frame_t rsp;
@@ -6785,13 +6840,10 @@ int jsdk_ctx_read_param(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_id,
     n = cb_param_pack_read_req(req, sizeof req, ep_id, 4u, 0u, 0);
     if (n == 0u) return JSDK_ERR_INVALID_ARG;
 
-    rc = jsdk_ctx_send(ctx, CB_PRI_CONFIG, CB_MSG_PARAM_READ, node_id,
-                       req, (uint8_t)n);
-    if (rc != 0) return JSDK_ERR_TRANSPORT;
-    ctx->tx_seq = cb_seq_next(ctx->tx_seq);
-
-    rc = jsdk_ctx_wait_response(ctx, CB_MSG_PARAM_READ, node_id, &rsp,
-                               timeout_ms ? timeout_ms : JSDK_CFG_TIMEOUT_MS);
+    rc = jsdk_ctx_request(ctx, CB_PRI_CONFIG, CB_MSG_PARAM_READ, node_id,
+                            req, (uint8_t)n, CB_MSG_PARAM_READ, &rsp,
+                            timeout_ms ? timeout_ms : JSDK_CFG_TIMEOUT_MS,
+                            allow_retry);
     if (rc != JSDK_OK) return rc;
 
     {
@@ -6805,6 +6857,20 @@ int jsdk_ctx_read_param(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_id,
         if (out_len) *out_len = r.data_len;
     }
     return JSDK_OK;
+}
+
+/** 读参数 + 幂等重发（面向用户的命令走这个）。 */
+int jsdk_ctx_read_param(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_id,
+                        uint8_t *out, uint8_t *out_len, uint32_t timeout_ms)
+{
+    return jsdk_ctx_read_param_ex(ctx, node_id, ep_id, out, out_len, timeout_ms, 1);
+}
+
+/** 读参数，只发一次（轮询路径用，见内部头注释）。 */
+int jsdk_ctx_read_param_once(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_id,
+                             uint8_t *out, uint8_t *out_len, uint32_t timeout_ms)
+{
+    return jsdk_ctx_read_param_ex(ctx, node_id, ep_id, out, out_len, timeout_ms, 0);
 }
 
 /**
@@ -6856,13 +6922,9 @@ int jsdk_ctx_read_param_exact(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_
                                    with_offset);
         if (n == 0u) return JSDK_ERR_INVALID_ARG;
 
-        rc = jsdk_ctx_send(ctx, CB_PRI_CONFIG, CB_MSG_PARAM_READ, node_id,
-                           req, (uint8_t)n);
-        if (rc != 0) return JSDK_ERR_TRANSPORT;
-        ctx->tx_seq = cb_seq_next(ctx->tx_seq);
-
-        rc = jsdk_ctx_wait_response(ctx, CB_MSG_PARAM_READ, node_id, &rsp,
-                                   timeout_ms ? timeout_ms : JSDK_CFG_TIMEOUT_MS);
+        rc = jsdk_ctx_request_retry(ctx, CB_PRI_CONFIG, CB_MSG_PARAM_READ, node_id,
+                                    req, (uint8_t)n, &rsp,
+                                    timeout_ms ? timeout_ms : JSDK_CFG_TIMEOUT_MS);
         if (rc != JSDK_OK) return rc;
 
         if (cb_param_unpack_read_rsp(rsp.data, rsp.len, &r) != 0) {
@@ -6933,63 +6995,95 @@ int jsdk_ctx_write_param(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_id,
         n = cb_param_pack_write_req(req, sizeof req, ep_id, p, len);
         if (n == 0u) return JSDK_ERR_INVALID_ARG;
 
+        /*
+         * ⚠ **等 ACK 时才谈得上重发**，而“等 ACK 的写”都是“同一个值再写一遍”
+         *   （幂等）—— 所以这里可以放心走 `jsdk_ctx_request_retry()`。
+         *   `axis0.requested_state` 那类“写一下就跳转状态机”的端点传的是
+         *   `timeout_ms = 0`（不等 ACK），因此**永远**走不到重发分支；
+         *   将来改调用方时**不能**给它加非 0 超时（重发 = 重复触发标定/回零）。
+         */
+        if (timeout_ms != 0u) {
+            jsdk_can_frame_t ack;
+            return jsdk_ctx_request_retry(ctx, CB_PRI_CONFIG, CB_MSG_PARAM_WRITE,
+                                          node_id, req, (uint8_t)n, &ack,
+                                          timeout_ms);
+        }
+
         rc = jsdk_ctx_send(ctx, CB_PRI_CONFIG, CB_MSG_PARAM_WRITE, node_id,
                            req, (uint8_t)n);
         if (rc != 0) return JSDK_ERR_TRANSPORT;
         ctx->tx_seq = cb_seq_next(ctx->tx_seq);
-
-        if (timeout_ms != 0u) {
-            /* 写确认（8 B 静默 ACK）；等一等能立刻发现"端点不存在" */
-            jsdk_can_frame_t ack;
-            return jsdk_ctx_wait_response(ctx, CB_MSG_PARAM_WRITE, node_id,
-                                          &ack, timeout_ms);
-        }
         return JSDK_OK;
     }
 
-    /* --- Classic 且 > 4 B：分块写，末块必须恰好补齐值 --- */
+    /*
+     * --- Classic 且 > 4 B：分块写（末块必须恰好补齐值）---
+     *
+     * 重发时重发的是**整条写**（从 offset 0 再走一遍），不是只补最后一块：
+     * 设备的分段装配器可能已经把状态收尾了，从头发一遍才是幂等且语义明确的
+     * （同一个值覆盖写）。
+     */
     {
-        uint8_t off = 0u;
+        /* ⚠ 用 `attempt < max_attempts`（而不是 `attempt >= 常量`）：后者在
+           `JSDK_REQ_RETRY_MAX` 被改成 0 时会触发 `-Wtype-limits`，
+           让“把重试关掉”这种调试/变异变成编译错误。 */
+        const unsigned max_attempts = 1u + (unsigned)JSDK_REQ_RETRY_MAX;
+        unsigned attempt;
 
-        while (off < len) {
-            uint8_t chunk = (uint8_t)(len - off);
-            int     more;
+        for (attempt = 0u; attempt < max_attempts; ++attempt) {
+            uint8_t off = 0u;
+            int     st;
 
-            if (chunk > CB_PARAM_CHUNK_BYTES) chunk = CB_PARAM_CHUNK_BYTES;
-            more = (off + chunk < len) ? 1 : 0;
+            while (off < len) {
+                uint8_t chunk = (uint8_t)(len - off);
+                int     more;
 
-            n = cb_param_pack_write_chunk(req, sizeof req, ep_id, len, off,
-                                          p + off, chunk, more);
-            if (n == 0u) return JSDK_ERR_INVALID_ARG;
-            if (jsdk_ctx_send(ctx, CB_PRI_CONFIG, CB_MSG_PARAM_WRITE, node_id,
-                              req, (uint8_t)n) != 0) {
-                return JSDK_ERR_TRANSPORT;
+                if (chunk > CB_PARAM_CHUNK_BYTES) chunk = CB_PARAM_CHUNK_BYTES;
+                more = (off + chunk < len) ? 1 : 0;
+
+                n = cb_param_pack_write_chunk(req, sizeof req, ep_id, len, off,
+                                              p + off, chunk, more);
+                if (n == 0u) return JSDK_ERR_INVALID_ARG;
+                if (jsdk_ctx_send(ctx, CB_PRI_CONFIG, CB_MSG_PARAM_WRITE, node_id,
+                                  req, (uint8_t)n) != 0) {
+                    return JSDK_ERR_TRANSPORT;
+                }
+                ctx->tx_seq = cb_seq_next(ctx->tx_seq);
+                off = (uint8_t)(off + chunk);
             }
-            ctx->tx_seq = cb_seq_next(ctx->tx_seq);
-            off = (uint8_t)(off + chunk);
-        }
-    }
 
-    if (timeout_ms != 0u) {
-        jsdk_can_frame_t ack;      /* 装配完成时设备回一次 ACK */
-        return jsdk_ctx_wait_response(ctx, CB_MSG_PARAM_WRITE, node_id,
-                                      &ack, timeout_ms);
+            if (timeout_ms == 0u) return JSDK_OK;      /* 不等 ACK：发完就算 */
+
+            {
+                jsdk_can_frame_t ack;      /* 装配完成时设备回一次 ACK */
+
+                st = jsdk_ctx_wait_response(ctx, CB_MSG_PARAM_WRITE, node_id, &ack,
+                                           timeout_ms);
+            }
+            if (st == JSDK_OK) return JSDK_OK;
+            if (st != JSDK_ERR_TIMEOUT) return st;
+            if (!ctx->bus.link_up) return st;           /* 链路本就不通：别再耗时 */
+            if (attempt + 1u < max_attempts) {          /* 真的还会再试一次 */
+                ctx->bus.tx_retries++;
+                ctx->bus.tx_retries_req++;
+            }
+        }
+        return JSDK_ERR_TIMEOUT;
     }
-    return JSDK_OK;
 }
 
-/** 写一个参数并等待设备的 8 字节静默 ACK（用于需要确认的场景）。 */
+/**
+ * 写一个参数并等待设备确认（用于“写完必须确认”的场景）。
+ *
+ * 现在直接复用 `jsdk_ctx_write_param()` 的等待/重发（同一个值覆盖写 ⇒ 幂等），
+ * 不再自己再等一遍 ACK —— 以前那两次等待里第二次等的是**下一条** ACK，
+ * 既多花一个超时，又可能被上一次写的残留 ACK 骗过。
+ */
 static int write_param_sync(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_id,
                             const void *val, uint8_t len, uint32_t timeout_ms)
 {
-    jsdk_can_frame_t ack;
-    int rc = jsdk_ctx_write_param(ctx, node_id, ep_id, val, len, timeout_ms);
-    if (rc != JSDK_OK) return rc;
-
-    /* 设备对写入回 8 B 的 `[0]=0, [1]=0, [2..3]=ep_id`；不等它也不会出错，
-       但等一等能立刻发现"端点不存在"。 */
-    return jsdk_ctx_wait_response(ctx, CB_MSG_PARAM_WRITE, node_id, &ack,
-                                 timeout_ms ? timeout_ms : JSDK_CFG_TIMEOUT_MS);
+    return jsdk_ctx_write_param(ctx, node_id, ep_id, val, len,
+                                timeout_ms ? timeout_ms : JSDK_CFG_TIMEOUT_MS);
 }
 
 /* ==========================================================================
@@ -7517,13 +7611,9 @@ jsdk_status_t jsdk_joint_get_device_info(jsdk_joint_t *j, jsdk_device_info_t *in
     if (!jsdk_joint_check(j) || !info) return JSDK_ERR_INVALID_ARG;
     memset(info, 0, sizeof *info);
 
-    rc = jsdk_ctx_send(j->ctx, CB_PRI_QUERY, CB_MSG_QUERY_DEVICE_INFO,
-                       j->cfg.node_id, NULL, 0u);
-    if (rc != 0) return JSDK_ERR_TRANSPORT;
-    j->ctx->tx_seq = cb_seq_next(j->ctx->tx_seq);
-
-    rc = jsdk_ctx_wait_response(j->ctx, CB_MSG_QUERY_DEVICE_INFO, j->cfg.node_id,
-                                &rsp, JSDK_CFG_TIMEOUT_MS);
+    rc = jsdk_ctx_request_retry(j->ctx, CB_PRI_QUERY, CB_MSG_QUERY_DEVICE_INFO,
+                                j->cfg.node_id, NULL, 0u, &rsp,
+                                JSDK_CFG_TIMEOUT_MS);
     if (rc != JSDK_OK) return (jsdk_status_t)rc;
 
     if (cb_query_decode_device(rsp.data, rsp.len, &d) != 0) {
@@ -7555,12 +7645,9 @@ jsdk_status_t jsdk_joint_query_error_detail(jsdk_joint_t *j, jsdk_fault_info_t *
         int rc;
 
         req[0] = types[i];
-        if (jsdk_ctx_send(j->ctx, CB_PRI_QUERY, CB_MSG_QUERY_ERROR, j->cfg.node_id,
-                          req, 1u) != 0) return JSDK_ERR_TRANSPORT;
-        j->ctx->tx_seq = cb_seq_next(j->ctx->tx_seq);
-
-        rc = jsdk_ctx_wait_response(j->ctx, CB_MSG_QUERY_ERROR, j->cfg.node_id,
-                                    &rsp, JSDK_CFG_TIMEOUT_MS);
+        rc = jsdk_ctx_request_retry(j->ctx, CB_PRI_QUERY, CB_MSG_QUERY_ERROR,
+                                    j->cfg.node_id, req, 1u, &rsp,
+                                    JSDK_CFG_TIMEOUT_MS);
         if (rc != JSDK_OK) return (jsdk_status_t)rc;
         if (cb_query_decode_error(rsp.data, rsp.len, &e) != 0) return JSDK_ERR_PROTOCOL;
         vals[i] = e.err_value;
@@ -7631,15 +7718,12 @@ int jsdk_ctx_probe_node(jsdk_context_t *ctx, uint8_t node_id)
     jsdk_can_frame_t rsp;
 
     if (!jsdk_ctx_check(ctx) || node_id == 0u) return 0;
-    if (jsdk_ctx_send(ctx, CB_PRI_QUERY, CB_MSG_QUERY_STATUS, node_id,
-                      NULL, 0u) != 0) {
-        return 0;
-    }
-    ctx->tx_seq = cb_seq_next(ctx->tx_seq);
 
-    /* 回复一律以 MsgType 0x00 回来，靠 Source 区分设备（见协议手册） */
-    return (jsdk_ctx_wait_response(ctx, CB_MSG_MIT_CONTROL, node_id, &rsp,
-                                   JSDK_CFG_TIMEOUT_MS / 8u) == JSDK_OK) ? 1 : 0;
+    /* 回复一律以 MsgType 0x00 回来，靠 Source 区分设备（见协议手册）。
+       探测是只读的（`QUERY_STATUS` 不改任何状态）⇒ 幂等，可重发。 */
+    return (jsdk_ctx_request(ctx, CB_PRI_QUERY, CB_MSG_QUERY_STATUS, node_id,
+                             NULL, 0u, CB_MSG_MIT_CONTROL, &rsp,
+                             JSDK_CFG_TIMEOUT_MS / 8u, 1) == JSDK_OK) ? 1 : 0;
 }
 
 jsdk_status_t jsdk_context_discover(jsdk_context_t *ctx, uint8_t *ids, unsigned cap,
@@ -8062,6 +8146,76 @@ int jsdk_ctx_send(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
  * （`jsdk_context_size()` 只是个运行时包装，这里给出各部分的分解。）
  */
 size_t jsdk_context_joint_size(void) { return sizeof(jsdk_joint_t); }
+
+/**
+ * **幂等的“请求 → 响应”重发**。
+ *
+ * @par 为什么需要
+ *  会话预热（`jsdk_context_warmup()`）只能把“**会话开头**丢帧”挡在用户命令之前；
+ *  运行中途适配器/线束抽一下、设备忙着处理上一帧时，**单发即等**的请求照样会
+ *  静默丢掉（slcan 对帧行不回报结果：`acks/nacks` 恒 0 ⇒ 主机侧零信号）。
+ *  而这类命令（`err` / `info` / `read` / `batch-read` / `scan` …）以前**没有任何兜底**：
+ *  丢了就是一条超时，用户再敲一次就好了 —— 与“首帧丢失”一模一样的现场症状。
+ *
+ * @par 为什么“重发”是安全的（**只能用于幂等请求**）
+ *  这里只重发**同一帧**：读（`QUERY_*` / `PARAM_READ`）与“同一个值再写一遍”的写。
+ *  语义上重发前后设备状态**不可能变坏**，所以可以无条件重发。
+ *  ⚠ **写的时候要格外小心**：`axis0.requested_state` 这类“写一下就让状态机跳转”
+ *    的端点**不能**走这里（重发等于重复触发标定/回零）。
+ *    实现上它拿 `timeout_ms = 0` 调 `jsdk_ctx_write_param()`（不等 ACK），
+ *    因此天然不走重发路径 —— 这条规则由 `jsdk_ctx_write_param()` 的注释钉住。
+ *
+ * @par 策略
+ *  - 只在**超时**（一帧响应都没等到）时重发；协议错（应答串味、长度不对）不重发；
+ *  - 最多 `JSDK_REQ_RETRY_MAX` 次额外尝试（默认 1 次，即总共 2 次）；
+ *  - 链路本来就不通（`link_up == 0`，例如 `recv()` 报错后未恢复）时**不**重发：
+ *    那种情形下多等一个超时只是更慢地告诉你同一个结论；
+ *  - 重发计入 `bus.tx_retries`（总数）与 `bus.tx_retries_req`（本类）。
+ *
+ * @param timeout_ms 每次尝试的等待窗口（不是总时长）。
+ * @return `JSDK_OK` / 前一次尝试的状态码。
+ */
+int jsdk_ctx_request(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
+                     uint8_t dest, const uint8_t *payload, uint8_t len,
+                     uint8_t rsp_msgtype, jsdk_can_frame_t *out,
+                     uint32_t timeout_ms, int allow_retry)
+{
+    unsigned attempt = 0u;
+    unsigned max_attempts = allow_retry ? (1u + (unsigned)JSDK_REQ_RETRY_MAX) : 1u;
+    int      rc = JSDK_ERR_TIMEOUT;
+
+    if (!jsdk_ctx_check(ctx)) return JSDK_ERR_INVALID_ARG;
+
+    for (;;) {
+        attempt++;
+
+        rc = jsdk_ctx_send(ctx, pri, msgtype, dest, payload, len);
+        if (rc != 0) return JSDK_ERR_TRANSPORT;
+        ctx->tx_seq = cb_seq_next(ctx->tx_seq);
+
+        rc = jsdk_ctx_wait_response(ctx, rsp_msgtype, dest, out, timeout_ms);
+        if (rc == JSDK_OK) break;
+        if (rc != JSDK_ERR_TIMEOUT) return rc;      /* 协议错：重发没意义 */
+        if (attempt >= max_attempts) break;         /* 尝试用完 */
+        if (!ctx->bus.link_up) break;               /* 链路本就不通 */
+    }
+
+    if (attempt > 1u) {
+        ctx->bus.tx_retries     += (uint32_t)(attempt - 1u);
+        ctx->bus.tx_retries_req += (uint32_t)(attempt - 1u);
+    }
+    return rc;
+}
+
+/** 幂等请求 + 自动重发（面向用户的命令走这个）。 */
+int jsdk_ctx_request_retry(jsdk_context_t *ctx, uint8_t pri, uint8_t msgtype,
+                           uint8_t dest, const uint8_t *payload, uint8_t len,
+                           jsdk_can_frame_t *out, uint32_t timeout_ms)
+{
+    return jsdk_ctx_request(ctx, pri, msgtype, dest, payload, len, msgtype, out,
+                            timeout_ms, 1);
+}
+
 
 /* ==========================================================================
  * 接收解复用
@@ -10656,6 +10810,7 @@ jsdk_status_t jsdk_context_warmup(jsdk_context_t *ctx, uint32_t timeout_ms)
         if (jsdk_ctx_send_raw(ctx, CB_PRI_QUERY, CB_MSG_QUERY_DEVICE_INFO, node,
                               NULL, 0u) != 0) {
             ctx->in_warmup = 0u;
+            ctx->bus.tx_retries += (uint32_t)(attempts - 1u);   /* 之前那几轮是真重发 */
             return JSDK_ERR_TRANSPORT;
         }
         ctx->tx_seq = cb_seq_next(ctx->tx_seq);
@@ -10703,8 +10858,13 @@ static int read_current_state(jsdk_joint_t *j, uint8_t *out)
             return -1;
         }
     }
-    if (jsdk_ctx_read_param(j->ctx, j->cfg.node_id, j->ep_current_state,
-                            buf, &len, 0u) != JSDK_OK) {
+    /*
+     * ⚠ 用 `_once`：这是标定/回零期间的**轮询**读（每 `pace_ms` 再问一次）。
+     *   重发在这里等价于把节奏拖成一个额外的超时（真机 3 s 级），
+     *   而“下一次问”马上就要发 —— 轮询需要的是下一次，不是重试这一次。
+     */
+    if (jsdk_ctx_read_param_once(j->ctx, j->cfg.node_id, j->ep_current_state,
+                                 buf, &len, 0u) != JSDK_OK) {
         return -1;
     }
     if (len < 1u) return -1;
@@ -11663,14 +11823,8 @@ jsdk_status_t jsdk_joint_param_get_batch(jsdk_joint_t *j, jsdk_param_req_t *reqs
             rq_len = cb_param_pack_batch_req(req, sizeof req, eps, (uint8_t)cnt);
             if (rq_len == 0u) { batch_serial(j, reqs, n); return JSDK_OK; }
 
-            if (jsdk_ctx_send(j->ctx, CB_PRI_CONFIG, CB_MSG_PARAM_READ,
-                              j->cfg.node_id, req, (uint8_t)rq_len) != 0) {
-                batch_serial(j, reqs, n);
-                return JSDK_OK;
-            }
-            j->ctx->tx_seq = cb_seq_next(j->ctx->tx_seq);
-
-            if (jsdk_ctx_wait_response(j->ctx, CB_MSG_PARAM_READ, j->cfg.node_id,
+            if (jsdk_ctx_request_retry(j->ctx, CB_PRI_CONFIG, CB_MSG_PARAM_READ,
+                                       j->cfg.node_id, req, (uint8_t)rq_len,
                                        &frame, JSDK_CFG_TIMEOUT_MS) != JSDK_OK) {
                 batch_serial(j, reqs, n);
                 return JSDK_OK;

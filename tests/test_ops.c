@@ -1993,6 +1993,107 @@ static void test_warmup(void)
     fx_close(&fx);
 }
 
+/**
+ * [16] **幂等的“请求 → 响应”重发**（运行中途丢帧，不是会话开头）。
+ *
+ * 会话预热只保护“开头那几帧”；适配器中途抽一下时，`err`/`info`/`read` 这类
+ * **单发即等**的命令以前没有任何兜底 —— 丢了就是一条超时（与首帧丢失同症状）。
+ * 这里在 HAL 层按 MsgType 注入丢帧，断言：
+ *   - 丢 1 帧 → 自动重发一次，命令成功，计数进 `tx_retries_req`；
+ *   - 全丢 → **有界失败**（只多试一次，不是无限重试）；
+ *   - 轮询路径（`jsdk_ctx_read_param_once`）**不**重发（节奏优先）；
+ *   - 写（等 ACK）也重发；⚠ 但**不等 ACK 的写**（`timeout_ms = 0`，如
+ *     `axis0.requested_state`）**绝不重发** —— 重发等于重复触发标定/回零。
+ */
+static void test_idempotent_request_retry(void)
+{
+    fix_t fx;
+    uint32_t before;
+
+    printf("[16] idempotent request retry: a dropped read/ACK is re-sent once\n");
+
+    if (fx_open(&fx, "0:id=1,gear=16.0,tconst=0.0385,pmax=12.5,vmax=65,tmax=50,"
+                     "kpmax=500,kdmax=5,hb=10,timeout=30000,fd", 1u) != 0
+        || fx_configure(&fx) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+
+    /* ---- ① 丢 1 条 PARAM_READ → 读自愈，且归类到“幂等请求” ---- */
+    {
+        jsdk_value_t v;
+
+        fx.drop_msgtype    = (uint8_t)CB_MSG_PARAM_READ;
+        fx.drop_msgtype_n  = 1u;
+        fx.dropped_msgtype = 0u;
+        CHECK_EQ(jsdk_joint_param_get(fx.j, "axis0.motor.config.gear_ratio", &v), JSDK_OK);
+        CHECK_EQ(fx.dropped_msgtype, 1u);
+        CHECK_EQ(fx.ctx->bus.tx_retries_req, 1u);
+        CHECK_EQ(fx.ctx->bus.tx_retries, 1u);
+
+        /* 再读一次：没有丢帧 → 不应产生任何重发 */
+        before = fx.ctx->bus.tx_retries;
+        CHECK_EQ(jsdk_joint_param_get(fx.j, "axis0.motor.config.gear_ratio", &v), JSDK_OK);
+        CHECK_EQ(fx.ctx->bus.tx_retries, before);
+    }
+
+    /* ---- ② 全丢 → 有界失败：只多试 1 次（总共 2 次），计数 +1 ---- */
+    {
+        jsdk_value_t v;
+
+        fx.drop_msgtype_n = 1000u;
+        before = fx.ctx->bus.tx_retries_req;
+        CHECK_EQ(jsdk_joint_param_get(fx.j, "axis0.motor.config.gear_ratio", &v),
+                 JSDK_ERR_TIMEOUT);
+        CHECK_EQ(fx.ctx->bus.tx_retries_req, before + 1u);
+        fx.drop_msgtype_n = 0u;
+        fx.drop_msgtype   = 0u;
+    }
+
+    /* ---- ③ 轮询路径只发一次（不重发）：帧数增加恰好 1 ---- */
+    {
+        uint8_t buf[8];
+        uint8_t len = 0u;
+        uint32_t tx;
+
+        fx.drop_msgtype    = (uint8_t)CB_MSG_PARAM_READ;
+        fx.drop_msgtype_n  = 1u;
+        fx.dropped_msgtype = 0u;      /* 重新上弦：计数器也要归零 */
+        tx = fx.ctx->bus.tx_frames;
+        CHECK_EQ(jsdk_ctx_read_param_once(fx.ctx, 1u, fx.j->ep_current_state,
+                                          buf, &len, 100u), JSDK_ERR_TIMEOUT);
+        CHECK_EQ(fx.ctx->bus.tx_frames, tx + 1u);        /* 只发了一次 */
+        CHECK_EQ(fx.ctx->bus.tx_retries_req, before + 1u);  /* 没涨 */
+        fx.drop_msgtype_n = 0u;
+        fx.drop_msgtype   = 0u;
+    }
+
+    /* ---- ④ 写：等 ACK 的会重发，不等 ACK 的**绝**重发 ---- */
+    {
+        uint8_t one[1] = { 0u };
+
+        fx.drop_msgtype    = (uint8_t)CB_MSG_PARAM_WRITE;
+        fx.drop_msgtype_n  = 1u;
+        fx.dropped_msgtype = 0u;
+        before = fx.ctx->bus.tx_retries_req;
+        CHECK_EQ(jsdk_ctx_write_param(fx.ctx, 1u, fx.j->ep_current_state, one, 1u,
+                                      500u), JSDK_OK);
+        CHECK_EQ(fx.ctx->bus.tx_retries_req, before + 1u);
+
+        fx.drop_msgtype_n = 1000u;               /* 全丢 */
+        before = fx.ctx->bus.tx_retries_req;
+        /* timeout_ms = 0 = 不等 ACK（`requested_state` 那类）：发完就算，不重发 */
+        CHECK_EQ(jsdk_ctx_write_param(fx.ctx, 1u, fx.j->ep_current_state, one, 1u,
+                                      0u), JSDK_OK);
+        CHECK_EQ(fx.ctx->bus.tx_retries_req, before);
+        fx.drop_msgtype_n = 0u;
+        fx.drop_msgtype   = 0u;
+    }
+
+    printf("      dropped 1 read -> retried once (tx_retries_req=1); "
+           "all dropped -> bounded failure; polling/no-ACK paths never retry\n");
+    fx_close(&fx);
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -2018,6 +2119,7 @@ int main(void)
     test_desc_stall_budget(); printf("\n");
     test_framing_semantics(); printf("\n");
     test_warmup();       printf("\n");
+    test_idempotent_request_retry(); printf("\n");
     test_robustness();   printf("\n");
 
     free(g_json);

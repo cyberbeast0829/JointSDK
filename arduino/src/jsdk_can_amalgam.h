@@ -776,9 +776,14 @@ typedef struct {
     uint32_t tx_failed;      /**< 发送失败次数 */
     uint32_t rx_dropped;     /**< 解析失败/未知消息丢弃数 */
     uint32_t keepalive_sent; /**< 自动补喂狗帧数 */
-    uint32_t tx_retries;     /**< 因**无响应**而重发的请求次数（会话预热 + 幂等请求重发）。
+    uint32_t tx_retries;     /**< 因**无响应**而重发的次数（会话预热 + 幂等请求重发）。
                                   非 0 就说明这条链丢过帧——正常（slcan 首帧丢失是已知行为），
                                   但值得看一眼：它只花掉一个往返，语义不变。 */
+    uint32_t tx_retries_req; /**< 上面那个总数里属于**幂等请求重发**的部分（运行中途丢帧）。
+                                  预热那种“会话开头丢帧”是已知且无害的；**运行中途**
+                                  还在持续丢帧则说明链路/适配器有问题，所以单独计数、
+                                  便于区分（`err`/`info`/`read` 这类单发命令现在会
+                                  自动重发一次 —— 见 `jsdk_ctx_request_retry()`）。 */
     uint32_t last_rx_age_ms; /**< 距最后一次成功接收的毫秒数 */
     uint32_t hal_bus_flags;  /**< HAL 自报链路状态（JSDK_HAL_BUS_*；无回调则 0） */
     uint32_t link_errors;    /**< HAL `recv()` 报错次数（总线抖动/掉线） */

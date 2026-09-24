@@ -1182,6 +1182,16 @@ void sim_rx(sim_bus_t *b, const jsdk_can_frame_t *f)
         return;
     }
 
+    /*
+     * 运行中途丢帧：丢掉某个 MsgType 的前 N 帧（总线级、与节点无关）。
+     * 用来端到端验证“幂等请求重发” —— 比如让 `err` 的第一条 0x45 上不了总线。
+     */
+    if (b->drop_msgtype != 0u && cb_id_msgtype(f->id) == (uint8_t)b->drop_msgtype
+        && b->dropped_msgtype < b->drop_msgtype_n) {
+        b->dropped_msgtype++;
+        return;
+    }
+
     for (i = 0u; i < b->n_nodes; ++i) {
         sim_node_t *n = &b->nodes[i];
         if (n->node_id == 0u) continue;         /* 节点被禁用 */
@@ -1460,6 +1470,21 @@ int sim_configure(sim_bus_t *b, const char *spec)
                     if (p[adv] != '=') return -1;
                     b->drop_tx_head = (uint32_t)strtoul(p + adv + 1, &end, 10);
                     if (end == p + adv + 1) return -1;
+                    p = end;
+                } }
+            /* 故障注入：丢掉主站**某个 MsgType** 的前 N 帧（`dropmsg=0x45:1`）。
+               用于端到端验证幂等请求重发（与 `drophead` 的区别：这个发生在
+               会话中间，预热盖不住）。 */
+            if (!matched) { TRY_KEY("dropmsg");
+                if (matched) {
+                    unsigned long mt;
+                    if (p[adv] != '=') return -1;
+                    mt = strtoul(p + adv + 1, &end, 0);
+                    if (end == p + adv + 1 || *end != ':' || mt == 0ul || mt > 255ul) {
+                        return -1;
+                    }
+                    b->drop_msgtype   = (uint32_t)mt;
+                    b->drop_msgtype_n = (uint32_t)strtoul(end + 1, &end, 10);
                     p = end;
                 } }
 
