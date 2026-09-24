@@ -183,7 +183,7 @@ jsdk_context_init(ctx, &cfg);                        /* cfg 必须与 arena 同�
 | EtherCAT 有分布式时钟，CAN 没有 | 多关节的**时间一致性**只能靠广播帧（一条帧同时到达）+ 各自的本地时基 |
 | EtherCAT 周期是"总线周期"，CAN 是"帧" | 周期越短帧越多；1 kHz × 7 关节若各自单播 = 7000 帧/s，请用广播同步 |
 | 设备掉线语义不同 | EtherCAT 靠 AL state / 工作计数器；CAN 靠 `age_ms` + `link_errors` + 设备自己的 `break_timeout` |
-| `jsdk_joint_set_scale/get_scale` 在 CAN 版**语义不同且没有文档** | CAN 上是**恒等映射**（线上已是物理量），而 EtherCAT 版是 counts→rad 换算；两者同名 —— 直接照搬会写出错的换算。细节与修法见 **`BACKLOG.zh-CN.md` §1.2（A12）** |
+| `jsdk_joint_set_scale/get_scale` 在 CAN 版**语义不同**（同名不同义） | CAN 上是**恒等映射**（线上已是物理量），而 EtherCAT 版是 counts→rad 换算；两者同名 —— 直接照搬会写出错的换算。✅ **已文档化（v0.34 / A12）**：头文件 §16 有对照表、`UNITS.zh-CN.md` §5 有“什么时候真的需要 scale（答案：CAN 上基本不需要）”、`tools/check_api_docs.py` 守住不再出现无文档的公共声明 |
 
 ---
 

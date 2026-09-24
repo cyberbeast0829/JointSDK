@@ -253,6 +253,10 @@ python -m twine upload dist/*.whl
 
 发布前（在构建机上）：
 
+- [ ] **一条命令跑完全矩阵**：`./tools/check_all.sh` → 汇总表应 **14 步全过（退出码 0）**。
+      它把 Windows（MinGW 堆+CLI / 共享库 / MSVC）+ WSL（常规 / ASan / Linux 共享库）+
+      Python 两平台 + 三个冒烟 + 三个静态守卫一次跑完 —— 其中**冒烟会拦“合并件/Arduino 副本过期”**
+      （改了公开头却忘了重生成，客户拿到的单文件版就会落后一版）
 - [ ] `pyproject.toml` 的 `version` == `CMakeLists.txt` 的 `project(... VERSION ...)`
       （目前都是 `0.1.0`；**靠手工同步**，见 §9）
 - [ ] `bindings/python/src/jsdk_can/lib/` 里是**本平台**的库，且只有本平台的

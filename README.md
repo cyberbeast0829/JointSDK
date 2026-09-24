@@ -89,10 +89,10 @@ python -m pytest bindings/python/tests -q
 
 | 环境 | 工具链实测版本 | 生成器 | 结果 |
 |---|---|---|---|
-| Windows | gcc 13.2.0（MSYS2）+ CMake 4.4.3 | `MinGW Makefiles` | ctest **21/21**（共享库构建 22/22）、11 套 C 测试 **30504 项 0 失败**、`-Werror` 0 告警 |
-| Windows | MSVC 19.44（VS 2022 Build Tools）+ CMake 4.4.3 | `Visual Studio 17 2022` | ctest **21/21**（共享库构建 22/22）、`/W4 /WX` **0 告警** |
-| Linux / WSL | gcc 9.4.0 + CMake 3.16（Ubuntu 20.04） | 默认 | ctest **21/21**；ASan + UBSan **21/21** |
-| Python 绑定 | 3.12（Windows）/ 3.8.10（Linux） | — | 两平台各 **217 通过 / 2 跳过** |
+| Windows | gcc 13.2.0（MSYS2）+ CMake 4.4.3 | `MinGW Makefiles` | ctest **22/22**（共享库构建 23/23）、11 套 C 测试 **30710 项 0 失败**、`-Werror` 0 告警 |
+| Windows | MSVC 19.44（VS 2022 Build Tools）+ CMake 4.4.3 | `Visual Studio 17 2022` | ctest **22/22**（共享库构建 23/23）、`/W4 /WX` **0 告警** |
+| Linux / WSL | gcc 9.4.0 + CMake 3.16（Ubuntu 20.04） | 默认 | ctest **22/22**；ASan + UBSan **22/22** |
+| Python 绑定 | 3.12（Windows）/ 3.8.10（Linux） | — | 两平台各 **242 通过 / 2 跳过** |
 | macOS | — | — | **未实测** |
 | 真机 | CANable（slcan）+ 一台关节 | — | 见下文「真机（硬件）常用命令」 |
 
@@ -102,9 +102,9 @@ python -m pytest bindings/python/tests -q
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
-| `JSDK_BUILD_TESTS` | ON | 单元测试（**11 套 / 30504 项断言**） |
+| `JSDK_BUILD_TESTS` | ON | 单元测试（**11 套 / 30710 项断言**）。⚠ 它**需要** `JSDK_BUILD_HAL_VIRTUAL=ON`：测试套件全部跑在虚拟后端的设备模型上（靠它注入丢帧/不回包），两者同时关闭会在配置期报错 |
 | `JSDK_WERROR` | OFF | 把告警当错误（MSVC 下是 `/WX`） |
-| `JSDK_BUILD_HAL_VIRTUAL` | ON | 虚拟总线 + 驱动器模型（自带描述符，CI/离线用） |
+| `JSDK_BUILD_HAL_VIRTUAL` | ON | 虚拟总线 + 驱动器模型（自带描述符，CI/离线用；也是测试套件唯一的无硬件底座） |
 | `JSDK_BUILD_HAL_SOCKETCAN` | Linux ON | Linux SocketCAN（CAN FD + BRS） |
 | `JSDK_BUILD_HAL_PCAN` | Win/macOS ON | PEAK PCAN-Basic（**运行期**加载，不需链接 `.lib`） |
 | `JSDK_BUILD_HAL_SLCAN` | ON | 串口 slcan（CANable 等；支持 CAN FD，见下文） |
@@ -120,6 +120,7 @@ MCU 构建：`-DJSDK_BUILD_HAL_*=OFF -DJSDK_BUILD_CLI=OFF -DJSDK_ENABLE_HEAP=OFF
 
 | 脚本 | 用途 |
 |---|---|
+| **`tools/check_all.sh`** | **一键回归**：Windows（MinGW 堆+CLI / 共享库 / MSVC）+ WSL（常规 / ASan / 共享库 / Python）+ Python 两平台 + 3 个冒烟 + 3 个静态守卫，末尾给汇总表，任一失败即非 0 退出。`--list` 看步骤，`--only/--skip` 选跑 |
 | `tools/wsl_build.sh {configure\|build\|ctest\|all\|asan\|pcan}` | 在 WSL 里配置/构建/跑测试/跑 ASan/强制编 PCAN 后端 |
 | `tools/hw_verify.sh --if slcan --channel COM3` | **真机分层自检**（L1~L8b，含写路径探针；`--if virtual` 可无硬件自检脚本本身） |
 | `tools/packaging_smoke.sh` | 真装到临时前缀，用 pkg-config / 静态链接 / `find_package` 三个真实消费者验一遍 |
@@ -373,24 +374,30 @@ tools/                夹具/黄金向量生成、构建与验证脚本（`wsl_b
 
 ## 当前状态
 
-**WP1 ~ WP9 全部实现并通过回归**，交付面 **A1~A13**、审计项 **B1~B4 / B8~B10** 已完成。
+**WP1 ~ WP9 全部实现并通过回归**，交付面 **A1~A13**、审计项 **B1~B4 / B6 / B8~B10** 已完成
+（`A1~A13` 与 `B*` 里唯一还敷着的只有 **B5/B7「记录缺失」** —— 编号保留不复用，见 BACKLOG §3.2）。
 
 | 维度 | 现状（可复现） |
 |---|---|
 | 构建 | **两套工具链都干净**：gcc（`-Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes` + `-Werror`）与 MSVC（`/W4 /WX /std:c11 /utf-8`） |
-| C 测试 | **11 套 / 30504 项断言**，0 失败（Windows MinGW gcc 13；Windows MSVC 19.44；Linux WSL gcc 9；ASan+UBSan 同样全过） |
-| ctest | **21 项**（11 套 C + 8 个示例 + `cli_text_lint` + `hw_verify_virtual`；共享库构建为 22 项，多一个 `python_bindings`） |
-| Python | **224 passed / 2 skipped**（Windows 3.12 与 Linux 3.8 结果一致）；公共 C API **114/114 已绑定，0 缺口**；`python -m jsdk_can` 与 `jsdk-cli` **25 个子命令对齐**（同款安全闸、同款退出码、同款 JSON 字段与 CSV 列） |
-| 真机 | slcan + CyberBeast USB2CAN + 一台关节（node 1，hw 262711 / fw 1545，1 Mbps **Classic**）：`scan`/`info`/`desc-*`/`read`/`batch-read`/`health`/`dump-config`/`mon` **与写路径**（原值回写 / 写探针后恢复，实测 `100 → 150 → 恢复 100`）逐条验证；**`calibrate` 全流程 + `save` 落 Flash**（软复位后 `pre_calibrated` 仍为 true）、`tools/hw_verify.sh --runs 3 --write-probe` **45/45**、`tools/py_hw_smoke.py` **10/10**；**会话预热**（`jsdk_context_warmup()`）把 slcan“首帧丢失”挡在第一条命令之前（真机复现 1/10 → 现为 0） |
+| C 测试 | **11 套 / 30710 项断言**，0 失败（Windows MinGW gcc 13；Windows MSVC 19.44；Linux WSL gcc 9；ASan+UBSan 同样全过） |
+| ctest | **22 项**（11 套 C + 8 个示例 + `cli_text_lint` + `api_docs_lint` + `hw_verify_virtual`；共享库构建为 23 项，多一个 `python_bindings`） |
+| Python | **242 passed / 2 skipped**（Windows 3.12 与 Linux 3.8 结果一致）；公共 C API **114/114 已绑定，0 缺口**；`python -m jsdk_can` 与 `jsdk-cli` **25 个子命令对齐**（同款安全闸、同款退出码、同款 JSON 字段与 CSV 列） |
+| 一键回归 | **`./tools/check_all.sh`** → **14 步全过**（Windows 三套构建 + Python、WSL 四步、3 冒烟、3 静态守卫），日志在 `build/check_all/` |
+| 真机 | slcan + CyberBeast USB2CAN + 一台关节（node 1，hw 262711 / fw 1545，1 Mbps **Classic**）：`scan`/`info`/`desc-*`/`read`/`batch-read`/`health`/`dump-config`/`mon` **与写路径**（原值回写 / 写探针后恢复，实测 `100 → 150 → 恢复 100`）逐条验证；**`calibrate` 全流程 + `save` 落 Flash**（软复位后 `pre_calibrated` 仍为 true）、`tools/hw_verify.sh --runs 3 --write-probe` **45/45**、`tools/py_hw_smoke.py` **10/10**；**36 个独立进程 0 失败**（含一次预热丢帧被真实吸收）、12/12 条 `scan` 行 `超时=0` |
 
-**会话预热（`jsdk_context_warmup()`）**：slcan 适配器打开端口时会丢掉主站**头一两帧**，
+**链路自愈与观测（v0.31~v0.33）**：slcan 适配器打开端口时会丢掉主站**头一两帧**，
 而 Lawicel 对帧行**不回报结果**（`acks/nacks` 恒 0）⇒ 主机侧没有任何可观测信号，
-第一条命令就会莫名超时（`0/0 bytes` + 心跳正常），再敲一次又好了。
-解法是幂等请求 + 重发（只读的 `QUERY_DEVICE_INFO`），SDK 已**自动挂在发帧之前**，
-计数在 `ctx.bus_state().tx_retries` / `-v` 的 `重发=N（预热）`。
+第一条命令就会莫名超时（`0/0 bytes` + 心跳正常），再敲一次又好了。三层修法：
+
+| 层 | 做法 | 客户怎么看 |
+|---|---|---|
+| 预热（v0.31） | 幂等的 `QUERY_DEVICE_INFO(0x46)` + 重发，SDK **自动挂在发帧之前**（急停等不能等的帧走 `jsdk_ctx_send_raw()` 绕开） | `tx_retries_warm` / `-v` 的 `重发=N（预热 X + 幂等请求 Y）；超时=Z` |
+| 幂等重发（v0.32） | **运行中途**丢帧时重发同一帧（只做能证明安全的那一档：读、等 ACK 的同值写；控制帧/急停/`SET_NODE_ID` 绝不重发） | `tx_retries_req`、`req_timeouts` |
+| 描述符请求（v0.23） | `0x24` 请求重发，判据是“**本次传输还没开始**”而不是“一帧都没收到”（残留帧会骗过前者） | `desc-info` 的 `0x24 请求重发 N 次` |
 
 **未完成与已知限制的完整清单见 [`docs/BACKLOG.zh-CN.md`](docs/BACKLOG.zh-CN.md)**
-（§1 未完成项 A12、B6；§3 已知限制 L1~L7 与记录缺失）。
+（§1 未完成项**已清空**；§3 还敷着 L1/L2/L5 等**需要第二台设备或人工上电**才能验的限制）。
 真机层面**必须人工**的部分（终端电阻、error-frame/bus-off、真驱动器运动、写路径）见
 [`docs/PORTING.zh-CN.md`](docs/PORTING.zh-CN.md) §7.5.3 B 段；只读自检步骤见
 [`docs/CLI.zh-CN.md`](docs/CLI.zh-CN.md) §8。
