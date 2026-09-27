@@ -42,6 +42,7 @@ JointROS 的需求里明确要 SDK 提供“限速上限/每 tick 预算/多关�
 | 失效 | 在途超时（默认 50 ms）→ 计数 + 让该关节状态**失效**，**不拿旧值冒充当前值**（与 JointROS `polled_usable()` 同一条原则） |
 | 关节级 | 需要时再考虑“路径解析一次并缓存”；⚠ 先确认真的比现有 `jsdk_joint_get_feedback()`（已含 pos/vel/current/torque/age/status_flags）多给什么，**不要**凭空造第二套缓存 |
 | 可观 | 计数进 `jsdk_bus_state_t`（`state_sent/state_ok/state_timeout`）+ `-v`/`health` + Python（ABI 三处同步：头、`jsdk_text.c` 表、`_abi.py`） |
+| ⚠ 新鲜度阈值 | 现在 `jsdk_joint_stale_ms()` = max(50 ms, `heartbeat_rate_ms×3`, 控制周期×6)（`src/core/jsdk_fault.c:233`）—— **只盯着心跳**。一旦反馈源改成“按需轮询”，客户端会看到“帧是新的但 `FEEDBACK_STALE` 仍置位”（真机上已出现：心跳 10 Hz 而阈值退到 50 ms ⇒ 恒 stale）。阶段 2 必须把**轮询周期也计入阈值**，并且把阈值变成**可读**（建议公开 `jsdk_joint_get_stale_ms()`，让 `age_ms` 与阈值一眼可比） |
 
 **优先级**：中（阶段 1 已可让 JointROS 自己排；但需求明确要 SDK 给限速与顺序）。
 
