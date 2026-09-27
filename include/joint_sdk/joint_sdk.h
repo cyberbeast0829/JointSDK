@@ -841,6 +841,58 @@ typedef struct {
  */
 JSDK_API jsdk_status_t jsdk_joint_get_feedback(const jsdk_joint_t *j, jsdk_joint_feedback_t *fb);
 
+/* ---- 非阻塞状态请求：驱动中的新鲜反馈（不与 tick 互斥） ---- */
+
+/** `jsdk_joint_request_state()`：请求位置/速度（`QUERY_POS_VEL` 0x41）。 */
+#define JSDK_STATE_POS_VEL  0x01u
+/** `jsdk_joint_request_state()`：请求电流（`QUERY_CURRENT` 0x44）→ 电流与**估计**力矩。 */
+#define JSDK_STATE_CURRENT  0x02u
+
+/**
+ * 请求一次状态读取（`QUERY_POS_VEL` 0x41 / `QUERY_CURRENT` 0x44）—— **发出即返回，不等应答**。
+ *
+ * @par 为什么需要它
+ *   某些固件上设备主动上报的帧**不会更新**（`fb.pos/vel` 恒 0 且
+ *   `JSDK_JF_FEEDBACK_STALE` 置位），而其它所有读路径
+ *   （`jsdk_joint_param_get*()` / SDO / 批量读）都要**在调用者线程里等应答**：
+ *   真机单次 1.4〜5.5 ms，而 1 kHz 的 tick 只有 1 ms ⇒ 在 RT 循环里用不了。
+ *   本函数只把**请求帧**交给 HAL；应答由 `jsdk_context_cycle_begin()` 的收帧
+ *   路径解码并回填到 `jsdk_joint_feedback_t`（`pos`/`vel` 来自 0x41；
+ *   `current_A`/`torque_Nm` 来自 0x44）—— 于是“读”不再与 tick 互斥。
+ *
+ * @param fields `JSDK_STATE_POS_VEL` / `JSDK_STATE_CURRENT` 的按位或
+ *               （`0` 或含未知位 → `JSDK_ERR_INVALID_ARG`）。两个都给 = **两帧**。
+ *
+ * @return `JSDK_OK` = 请求帧**已交给 HAL**（⚠ 不代表设备收到，更不代表会有应答）；
+ *         `JSDK_ERR_INVALID_ARG`（`j` 非法 / `fields` 为 0 或含未知位）；
+ *         `JSDK_ERR_TRANSPORT`（HAL 发送失败）。
+ *
+ * @par 时序（推荐用法）
+ *   @code
+ *   jsdk_context_cycle_end(ctx);                      // 本 tick 的控制帧已发完
+ *   jsdk_joint_request_state(j, JSDK_STATE_POS_VEL);  // 在 tick 间隙发请求
+ *   ... 下一次循环开始时，应答已经躺在缓存里 ...
+ *   jsdk_context_cycle_begin(ctx, now_ns);            // 收帧 → 回填 fb
+ *   jsdk_joint_get_feedback(j, &fb);                  // 先看 fb.age_ms
+ *   @endcode
+ *   典型延迟 1〜2 个 tick（请求 → 应答 → 下一次 `cycle_begin()` 收帧）。
+ *
+ * @par 判据永远是 `age_ms`（**不要在这里等**）
+ *   本函数不重发、不排队、不保证有应答：丢了就是丢了。用
+ *   `jsdk_joint_get_feedback().age_ms` 与 `JSDK_JF_FEEDBACK_STALE` 判定可信度；
+ *   需要更稳的节奏就自己按 `age_ms` 重发。
+ *
+ * @warning **0x41/0x44 不喂设备看门狗**（见 `jsdk_msgtype_feeds_watchdog()` 的说明）
+ *          ⇒ 这类请求帧只能**额外**发，**不能顶替控制帧**，否则设备会按
+ *          `break_timeout` 停下来。
+ * @warning 本函数走 **raw 发送**（不触发会话预热）：RT 路径不能被预热（最长数百 ms）
+ *          拖住。会话开头的丢帧请在初始化里用 @ref jsdk_context_warmup() 解决。
+ * @note 限速：真机建议 **≤10 Hz/关节**（一次轮询 ≈ 2 帧的总线时间；本函数自己不拦）。
+ * @note 不产生任何阻塞读、不改变 `cycle_*()` 的行为；`configure()` 前后都可调用
+ *       （0x41 是协议原始查询，不依赖描述符）。
+ */
+JSDK_API jsdk_status_t jsdk_joint_request_state(jsdk_joint_t *j, uint32_t fields);
+
 /** 是否已使能（使能序列走完才算 `1`；只发控制帧但没走完序列时为 `0`）。不产生总线交互。 */
 JSDK_API int jsdk_joint_is_enabled(const jsdk_joint_t *j);
 /** 是否有故障（MIT 4-bit 错误码 / 心跳位 / 0x45 明细的**并集**）。不产生总线交互。 */

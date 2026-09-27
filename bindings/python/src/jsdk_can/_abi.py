@@ -583,6 +583,8 @@ _FUNCS: dict[str, tuple[list, object]] = {
     "jsdk_context_estop": ([c_void_p], None),
     # --- 关节反馈/控制 ---
     "jsdk_joint_get_feedback": ([c_void_p, POINTER(JointFeedback)], c_int),
+    # 非阻塞状态请求（0x41/0x44）：发出即返回，结果由 cycle_begin() 的收帧回填。
+    "jsdk_joint_request_state": ([c_void_p, c_uint32], c_int),
     "jsdk_joint_is_enabled": ([c_void_p], c_int),
     "jsdk_joint_is_fault": ([c_void_p], c_int),
     "jsdk_joint_get_mode_state": ([c_void_p], c_int),
@@ -696,6 +698,8 @@ _REQUIRED_FUNCS = (
     "jsdk_context_cycle_end",
     "jsdk_context_add_joint",
     "jsdk_context_configure",
+    # --- 非阻塞状态请求（0.36 新增）：无条件编译进共享库，所以也要求“库不旧于绑定”。
+    "jsdk_joint_request_state",
     # --- A13：以下符号也是 0.1.0 公开 ABI 的一部分（无条件编译进共享库），
     #     所以“库比绑定旧”必须当场报出来，而不是等用户调到才 AttributeError。
     #     ⚠ **不包含**需要特殊构建开关的少数：`jsdk_context_create/free`

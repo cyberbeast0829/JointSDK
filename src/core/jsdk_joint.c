@@ -302,6 +302,52 @@ jsdk_status_t jsdk_joint_get_feedback(const jsdk_joint_t *j, jsdk_joint_feedback
     return JSDK_OK;
 }
 
+/**
+ * 非阻塞状态请求（0x41 / 0x44）：只发帧，不等应答。
+ *
+ * ⚠ 三个刻意为之的点：
+ *   ① 用 `jsdk_ctx_send_raw()` 而不是 `jsdk_ctx_send()`：后者会在会话开头
+ *      触发**预热**（预算最长 500 ms）—— RT 调用者会被拖住，而正是为了
+ *      “不阻塞 tick” 才有这个 API。
+ *   ② 不记账、不重发：丢了就丢（0x41 是空闲查询，不值得为它加重发预算；
+ *      可信度用 `fb.age_ms` 判）。所以本函数不会碰 `req_timeouts`。
+ *   ③ 请求帧**不顶替**控制帧：`jsdk_msgtype_feeds_watchdog()` 只认 ≤0x03 与
+ *      0x80〜0x83，0x41/0x44 不喂狗 ⇒ 调用者必须继续照常发控制帧。
+ */
+jsdk_status_t jsdk_joint_request_state(jsdk_joint_t *j, uint32_t fields)
+{
+    jsdk_context_t *ctx;
+
+    if (!jsdk_joint_check(j) || !j->ctx) return JSDK_ERR_INVALID_ARG;
+    if (fields == 0u
+        || (fields & ~(uint32_t)(JSDK_STATE_POS_VEL | JSDK_STATE_CURRENT)) != 0u) {
+        jsdk_joint_seterr(j, "request_state: bad field mask 0x%08x", (unsigned)fields);
+        return JSDK_ERR_INVALID_ARG;
+    }
+
+    ctx = j->ctx;
+
+    if ((fields & JSDK_STATE_POS_VEL) != 0u) {
+        if (jsdk_ctx_send_raw(ctx, CB_PRI_QUERY, CB_MSG_QUERY_POS_VEL,
+                              j->cfg.node_id, NULL, 0u) != 0) {
+            jsdk_joint_seterr(j, "request_state: QUERY_POS_VEL send failed");
+            return JSDK_ERR_TRANSPORT;
+        }
+        ctx->tx_seq = cb_seq_next(ctx->tx_seq);
+    }
+
+    if ((fields & JSDK_STATE_CURRENT) != 0u) {
+        if (jsdk_ctx_send_raw(ctx, CB_PRI_QUERY, CB_MSG_QUERY_CURRENT,
+                              j->cfg.node_id, NULL, 0u) != 0) {
+            jsdk_joint_seterr(j, "request_state: QUERY_CURRENT send failed");
+            return JSDK_ERR_TRANSPORT;
+        }
+        ctx->tx_seq = cb_seq_next(ctx->tx_seq);
+    }
+
+    return JSDK_OK;
+}
+
 int jsdk_joint_is_enabled(const jsdk_joint_t *j)
 {
     if (!jsdk_joint_check(j)) return 0;

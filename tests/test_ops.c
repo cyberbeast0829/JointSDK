@@ -2245,6 +2245,154 @@ static void test_link_quality_observability(void)
            "probes/polling); last retry reported; desc retries visible\n");
 }
 
+/**
+ * [18] **非阻塞状态请求**（`jsdk_joint_request_state()`）—— 驱动中的新鲜反馈。
+ *
+ * 真机背景（JointROS 的 F11）：某些固件上**主动上报的帧不更新**
+ * （`fb.pos/vel` 恒 0 + `FEEDBACK_STALE`），而其它读路径都要在调用者线程里等应答
+ * （真机 1.4〜5.5 ms vs 1 ms 的 tick）⇒ RT 循环里用不了。这里钉住三件事：
+ *   - 健康链路：1 帧请求 → **下一次 `cycle_begin()`** 里 `fb.valid=1`、pos/vel 对得上；
+ *   - 应答丢了：调用仍**立即**返回（不重发、不记超时），`fb` 保持陈旧而**不假装新鲜**；
+ *   - 时钟冻住 + 无应答：必须立刻返回（阻塞实现在这里会卡住或记一次超时）。
+ *
+ * ⚠ 全部子用例都关掉设备心跳（`hb=0`）：否则一个周期里可能“碰巧”收到心跳而让
+ *   `fb.valid` 变真，于是“应答丢了就不假装新鲜”这条断言变成**概率性**的。
+ *   （同一手法见 `tests/test_joint.py` 的 `test_feedback_age_grows_when_bus_goes_quiet`。）
+ */
+static void test_state_request(void)
+{
+    fix_t fx;
+    jsdk_joint_feedback_t fb;
+    sim_node_t *n;
+
+    printf("[18] non-blocking state request: 0x41/0x44 do not block the tick\n");
+
+    /* ---- ① 健康链路（Classic：8 字节应答正好一帧）---- */
+    if (fx_open_flags(&fx, "0:id=1,hb=0,timeout=30000,classic", 1u, 0) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+    if (fx_configure(&fx) != 0) {
+        printf("      FATAL: configure failed\n"); g_fail++; g_checks++; fx_close(&fx); return;
+    }
+    n = sim_find_node(fx.sim, 1u);
+    CHECK(n != NULL);
+    if (n) {
+        uint32_t tx0 = fx.ctx->bus.tx_frames;
+
+        /* ⚠ 只注入**位置**：它是积分量（稳态下不被重算）；而速度/电流是每个 tick 由
+           物理模型重算的派生量（未 armed 时被清零）⇒ 它们的**数值**放到 ③b 的
+           “已使能 + 力矩”场景里验。这里用位置把**解码链路**钉死。 */
+        n->pos_estimate = 0.25f;      /* 电机端 turns（与真机到底端同义） */
+        CHECK_EQ(jsdk_joint_request_state(fx.j, JSDK_STATE_POS_VEL), JSDK_OK);
+        CHECK_EQ(fx.ctx->bus.tx_frames, tx0 + 1u);        /* 只发一帧，且不等 */
+        CHECK_EQ(fx.ctx->bus.req_timeouts, 0u);
+
+        fx_cycle(&fx);                                    /* 收帧 → 回填 fb */
+        CHECK_EQ(jsdk_joint_get_feedback(fx.j, &fb), JSDK_OK);
+        CHECK_EQ(fb.valid, 1);
+        /* ⚠ 夹具的 `now_ms()` 每被调用一次推进 1 ms（见文件头）⇒ age 可能是 0 或 1 */
+        CHECK(fb.age_ms <= 1u);
+        /* 单位：电机端 turns → 输出端 rad（除 gear_ratio） */
+        CHECK_NEAR(fb.pos, (2.0 * M_PI * 0.25) / (double)fx.j->gear_ratio, 1e-9);
+    }
+
+    /* ---- ② 应答丢了：立即返回、不记超时、fb 保持陈旧 ---- */
+    {
+        uint32_t tx0 = fx.ctx->bus.tx_frames;
+        uint32_t to0 = fx.ctx->bus.req_timeouts;
+
+        fx.drop_msgtype   = (uint8_t)CB_MSG_QUERY_POS_VEL;
+        fx.drop_msgtype_n = 1u;
+        CHECK_EQ(jsdk_joint_request_state(fx.j, JSDK_STATE_POS_VEL), JSDK_OK);
+        CHECK_EQ(fx.ctx->bus.tx_frames, tx0 + 1u);
+        CHECK_EQ(fx.ctx->bus.req_timeouts, to0);          /* 它根本没等 */
+        fx.drop_msgtype = 0u;
+
+        fx_cycle(&fx);                                    /* 本周期没有新有效帧 */
+        CHECK_EQ(jsdk_joint_get_feedback(fx.j, &fb), JSDK_OK);
+        CHECK_EQ(fb.valid, 0);                            /* 不假装新鲜 */
+        CHECK(fb.age_ms > 0u);
+    }
+
+    /* ---- ③ 0x44 的“到达”证明：关心跳 + **未使能** ⇒ 本周期唯一的有效帧只可能是 0x44 的应答 ---- */
+    {
+        CHECK_EQ(jsdk_joint_request_state(fx.j, JSDK_STATE_CURRENT), JSDK_OK);
+        fx_cycle(&fx);
+        CHECK_EQ(jsdk_joint_get_feedback(fx.j, &fb), JSDK_OK);
+        CHECK_EQ(fb.valid, 1);               /* 没有其它可能的来源 ⇒ 就是它 */
+        CHECK_NEAR(fb.current_A, 0.0, 1e-9); /* 未 armed：仿真器报 0 */
+    }
+
+    /* ---- ④ 组合掩码 = 两帧；参数校验 ---- */
+    {
+        uint32_t tx0 = fx.ctx->bus.tx_frames;
+
+        CHECK_EQ(jsdk_joint_request_state(fx.j, JSDK_STATE_POS_VEL | JSDK_STATE_CURRENT),
+                 JSDK_OK);
+        CHECK_EQ(fx.ctx->bus.tx_frames, tx0 + 2u);
+        CHECK_EQ(jsdk_joint_request_state(fx.j, 0u), JSDK_ERR_INVALID_ARG);
+        CHECK_EQ(jsdk_joint_request_state(fx.j, 0x80u), JSDK_ERR_INVALID_ARG);
+        CHECK_EQ(jsdk_joint_request_state(NULL, JSDK_STATE_POS_VEL), JSDK_ERR_INVALID_ARG);
+        CHECK_EQ(fx.ctx->bus.tx_frames, tx0 + 2u);        /* 参数错不发帧 */
+    }
+    fx_close(&fx);
+
+    /* ---- ③b 使能 + 纯力矩：电流/力矩的**数值**与同一条反馈内部的**自洽关系** ---- */
+    if (fx_open(&fx, "0:id=1,gear=16.5,tconst=0.0385,pmax=12.5,vmax=65,"
+                     "tmax=50,kpmax=500,kdmax=5,hb=10,timeout=30000,fd", 1u) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+    if (fx_configure(&fx) == 0 && jsdk_context_activate(fx.ctx) == JSDK_OK) {
+        unsigned i;
+
+        for (i = 0u; i < 20u; ++i) {
+            jsdk_context_cycle_begin(fx.ctx, 0u);
+            jsdk_joint_set_mit(fx.j, 0.0, 0.0, 0.0, 0.0, 0.4);   /* 纯力矩（输出端 N·m） */
+            jsdk_context_cycle_end(fx.ctx);
+        }
+        CHECK_EQ(jsdk_joint_request_state(fx.j, JSDK_STATE_CURRENT), JSDK_OK);
+        fx_cycle(&fx);
+        CHECK_EQ(jsdk_joint_get_feedback(fx.j, &fb), JSDK_OK);
+        CHECK(fb.current_A > 0.0);
+        /* 力矩是**估计**，但同一条反馈必须自洽：Iq × Kt × gear */
+        CHECK_NEAR(fb.torque_Nm, fb.current_A * (double)fx.j->torque_constant
+                                  * (double)fx.j->gear_ratio, 1e-9);
+    } else {
+        printf("      FATAL: configure/activate failed (armed case)\n");
+        g_fail++; g_checks++;
+    }
+    fx_close(&fx);
+
+    /* ---- ⑤ 时钟冻住 + 设备不回：必须**立刻**返回（阻塞实现会卡到自旋上限）---- */
+    if (fx_open_flags(&fx, "0:id=1,hb=0,timeout=30000,classic", 1u, 0) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+    fx.drop_tx_head  = 1000u;         /* 连请求都出不去 */
+    fx.freeze_clock  = 1;
+    CHECK_EQ(jsdk_joint_request_state(fx.j, JSDK_STATE_POS_VEL), JSDK_OK);
+    CHECK_EQ(fx.ctx->bus.req_timeouts, 0u);
+    fx_cycle(&fx);                    /* 不收帧也不推进时间：不能死循环 */
+    fx_close(&fx);
+
+    /* ---- ⑥ FD：0x41/0x44 在 FD 链路上同样能落在 fb 上 ---- */
+    if (fx_open_flags(&fx, "0:id=1,hb=0,timeout=30000,fd", 1u, 1) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+    if (fx_configure(&fx) == 0) {
+        n = sim_find_node(fx.sim, 1u);
+        if (n) n->pos_estimate = 1.0f;
+        CHECK_EQ(jsdk_joint_request_state(fx.j, JSDK_STATE_POS_VEL | JSDK_STATE_CURRENT),
+                 JSDK_OK);
+        fx_cycle(&fx);
+        CHECK_EQ(jsdk_joint_get_feedback(fx.j, &fb), JSDK_OK);
+        CHECK_EQ(fb.valid, 1);
+        CHECK_NEAR(fb.pos, (2.0 * M_PI * 1.0) / (double)fx.j->gear_ratio, 1e-9);
+    } else {
+        printf("      FATAL: configure failed (fd)\n"); g_fail++; g_checks++;
+    }
+    fx_close(&fx);
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -2272,6 +2420,7 @@ int main(void)
     test_warmup();       printf("\n");
     test_idempotent_request_retry(); printf("\n");
     test_link_quality_observability(); printf("\n");
+    test_state_request(); printf("\n");
     test_robustness();   printf("\n");
 
     free(g_json);

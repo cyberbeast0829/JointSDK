@@ -297,6 +297,27 @@ j.param_get_batch(p1, p2, p3, p4)                      # FD 下打包成一帧�
 
 ---
 
+## 8.1 非阻塞状态请求（驱动中的新鲜反馈）
+
+```python
+from jsdk_can.joint import STATE_POS_VEL, STATE_CURRENT, STATE_ALL
+
+ctx.cycle_end()                      # 本 tick 的控制帧已发完
+j.request_state(STATE_POS_VEL)       # 在 tick 间隙发请求：立即返回，不等应答
+ctx.cycle_begin()                    # 下一次循环：应答已被收帧路径解出并回填
+fb = j.feedback()                    # 先看 fb.age_ms，再看 fb.pos / fb.vel
+```
+
+| | 说明 |
+|---|---|
+| 为什么不用 `param_get()` | 那条路**在调用者线程里等应答**（真机单次 1.4〜5.5 ms，而 1 kHz 的 tick 只有 1 ms）⇒ RT 循环里用不了 |
+| 字段 | `STATE_POS_VEL`（`0x41` → `pos`/`vel`）、`STATE_CURRENT`（`0x44` → `current_A`/`torque_Nm`）；`STATE_ALL` = 两帧 |
+| 判据 | **只有 `age_ms`**（本方法不重发：丢了就是丢了）；建议 ≤10 Hz/关节 |
+| ⚠ 约束 | 请求帧**不喂设备看门狗** ⇒ 只能额外发，**不能顶替控制帧**；它走 raw 发送（绕过会话预热），所以会话开头的丢帧靠 `ctx.warmup()` 在初始化里解决 |
+| 力矩 | 是 **Iq × torque_constant × gear** 的**估计值**（与 `feedback().torque_Nm` 同源），不是实测力矩 |
+
+---
+
 ## 9. 错误处理
 
 ```python
@@ -319,7 +340,7 @@ except JsdkStateError as e:          # 调用顺序不对、设备状态不允�
 
 ---
 
-## 9.1 与 C 公共 API 的对齐（**A13：已全覆盖，114/114**）
+## 9.1 与 C 公共 API 的对齐（**A13：已全覆盖，118/118**）
 
 Python 绑定覆盖了公共 C API 的 **114/114 个函数，0 个未绑定**（`tools/_abi_gap.py` 可复核）：
 

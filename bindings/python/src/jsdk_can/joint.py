@@ -24,7 +24,14 @@ from .enums import AxisState, EpType, Mode, ModeState, Status, StatusFlag
 from .errors import raise_for_status
 
 __all__ = ["Joint", "Feedback", "ConfigSnapshot", "DeviceInfo", "FaultInfo",
-           "Sdo"]
+           "Sdo", "STATE_POS_VEL", "STATE_CURRENT"]
+
+#: ``Joint.request_state()`` 的字段掩码（对应 C 侧 ``JSDK_STATE_*``）。
+STATE_POS_VEL = 0x01
+STATE_CURRENT = 0x02
+
+#: 常用组合：一次请求把位置/速度与电流/力矩都取回来（= 两条请求帧）。
+STATE_ALL = STATE_POS_VEL | STATE_CURRENT
 
 
 def _c_str(value: object) -> str:
@@ -410,6 +417,26 @@ class Joint:
 
     def is_enabled(self) -> bool:
         return bool(self._lib.jsdk_joint_is_enabled(self._ptr))
+
+    def request_state(self, fields: int = STATE_POS_VEL) -> None:
+        """请求一次状态读取 —— **发出即返回，不等应答**（驱动中的新鲜反馈）。
+
+        结果由 ``Context.cycle_begin()`` 的收帧路径回填到 :meth:`feedback`：
+
+        * ``STATE_POS_VEL`` → ``pos`` / ``vel``（``QUERY_POS_VEL`` 0x41）
+        * ``STATE_CURRENT`` → ``current_A`` / ``torque_Nm``（``QUERY_CURRENT`` 0x44，
+          力矩是 **Iq × torque_constant × gear** 的估计值）
+
+        为什么不用 :meth:`param_get`：那条路要**在调用者线程里等应答**
+        （真机 1.4〜5.5 ms，而 1 kHz 的 tick 只有 1 ms）⇒ 在 RT 循环里用不了。
+        本方法只发请求帧；典型延迟 1〜2 个 tick。
+
+        判据：``feedback().age_ms``（丢了就是丢了，本方法**不重发**）。
+        建议 ≤10 Hz/关节；请求帧**不喂设备看门狗**，不能顶替控制帧。
+        """
+        self._chk(self._lib.jsdk_joint_request_state(self._ptr,
+                                                     ctypes.c_uint32(fields)),
+                  "request_state")
 
     def is_fault(self) -> bool:
         return bool(self._lib.jsdk_joint_is_fault(self._ptr))
