@@ -39,6 +39,7 @@ Python 侧还能顺带验证：新绑定 `Joint.request_state()` 在真机上确
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import statistics
 import sys
@@ -110,16 +111,37 @@ def build_hal(args):
 
 
 def read_truth(j, path_pos: str, path_vel: str) -> tuple[float, float, float]:
-    """阻塞读端点真值（**只在失能时做**：这条路要独占总线窗口）。"""
+    """阻塞读端点真值（**只在失能时做**：这条路要独占总线窗口）。
+
+    ⚠ **单位**：`axis0.encoder.pos_estimate` / `vel_estimate` 是**电机端 turns / turns·s⁻¹**
+      （端点值是设备内存原样，SDK **不做**单位换算）—— 而 `feedback().pos` 是**输出端 rad**。
+      比较时要么两边都换到 turns，要么都换到 rad（此处按 turns 比）。
+    """
     t0 = time.perf_counter()
     pos = float(j.param_get_f32(path_pos))   # type: ignore[arg-type]
     vel = float(j.param_get_f32(path_vel))   # type: ignore[arg-type]
     return pos, vel, (time.perf_counter() - t0) * 1e3
 
 
+def poll_once(ctx, j) -> None:
+    """发一次非阻塞状态请求，并把应答**泵进缓存**。
+
+    ⚠ 反位要跨**两个** cycle：请求帧发出去之后，应答要过 1〜5 ms（总线 + 适配器）才到，
+      紧跟的第一次 `cycle_begin()` 往往还没收到它。而 `feedback().valid` 是
+      “**本周期**有没有新帧”的旗标（每次 `cycle_begin()` 先清零）⇒ 读得太早会
+      看到 `valid=0` 而误以为“应答没被计入”。
+    """
+    j.request_state(STATE_POS_VEL)
+    ctx.cycle_begin(); ctx.cycle_end()          # 第一次：请求刚出门
+    time.sleep(0.02)                            # 给总线/适配器一点时间
+    ctx.cycle_begin(); ctx.cycle_end()          # 第二次：应答在这里被解出并回填
+
+
 def phase_a(ctx, j, args) -> tuple[float, float]:
     """失能：端点真值 vs `0x41`（这是整条链路的值正确性交叉对拍）。"""
     print("\n=== 阶段 A：失能态 —— 端点真值 vs 0x41 ===")
+    gear = float(j.config_snapshot().gear_ratio)
+    note(f"gear_ratio = {gear}（端点 pos/vel 是**电机端 turns**，feedback 是输出端 rad）")
     fails = 0
     deltas: list[float] = []
     pos0 = vel0 = 0.0
@@ -136,12 +158,17 @@ def phase_a(ctx, j, args) -> tuple[float, float]:
                 note(f"⚠ 单次端点读很慢（{ms:.2f} ms）—— 这正是“不能放进 1 kHz tick”的原因")
 
         j.request_state(STATE_POS_VEL)
+        ctx.cycle_begin(); ctx.cycle_end()
+        time.sleep(0.02)
         ctx.cycle_begin()
         fb = j.feedback()
         ctx.cycle_end()
-        dpos = abs(fb.pos - pos)
+        # 两边都换到 **电机端 turns** 比较（端点就是 turns；feedback 是输出端 rad）
+        fb_turns = fb.pos * (gear / (2.0 * math.pi))
+        dpos = abs(fb_turns - pos)
         note(f"  第 {i + 1} 次：valid={int(fb.valid)} age={fb.age_ms} ms "
-             f"0x41.pos={fb.pos:.9f} 端点={pos:.9f} Δ={dpos:.3e} rad")
+             f"0x41={fb.pos:.6f} rad = {fb_turns:.4f} turns  端点={pos:.4f} turns "
+             f"Δ={dpos:.4f} turns")
         if not fb.valid:
             fails += 1
         deltas.append(dpos)
@@ -150,8 +177,9 @@ def phase_a(ctx, j, args) -> tuple[float, float]:
     check("0x41 有应答（5/5）", fails == 0, f"未应答 {fails}/5")
     if deltas:
         worst = max(deltas)
-        check("0x41 的值 == 端点真值（Δpos < 1e-3 rad）", worst < 1e-3,
-              f"最大 Δ={worst:.3e} rad")
+        # 端点 pos 是 ×100 定点（心跳）/ f32（端点）两种精度都有，1 LSB = 0.01 turn
+        check("0x41 的值 == 端点真值（Δpos < 0.02 turn）", worst < 0.02,
+              f"最大 Δ={worst:.4f} turns")
     return pos0, vel0
 
 
@@ -159,6 +187,7 @@ def phase_b(ctx, j, args, pos0: float) -> None:
     """使能 + 零力矩保持：闭环运行中轮询（**本脚本唯一会动设备的阶段**）。"""
     period_s = args.period_ms / 1000.0
     poll_s   = args.poll_ms / 1000.0
+    gear = float(j.config_snapshot().gear_ratio)   # 端点真值是电机端 turns，需换算后比较
     print(f"\n=== 阶段 B：使能（MIT，kp={args.kp} kd={args.kd} tau=0）"
           f"周期 {args.period_ms} ms，每 {args.poll_ms} ms 轮询一次 ===")
     note(f"保持目标 = 当前位置 {pos0:.9f} rad；漂移保护 {args.max_drift} rad")
@@ -249,9 +278,10 @@ def phase_b(ctx, j, args, pos0: float) -> None:
     pos_t, vel_t, _ = read_truth(j, EP_POS, EP_VEL)
     note(f"失能后端点真值：pos={pos_t:.9f} vel={vel_t:.9f}")
     if pos_seen:
-        delta = abs(pos_seen[-1] - pos_t)
+        delta = abs(pos_seen[-1] - pos_t * (2.0 * math.pi / gear))
         # ⚠ 这个 Δ **必然**包含“最后一次轮询 → 失能完成”之间关节的移动（零增益下会溜车，
         #   仿真的玩具模型也会），所以它只能当**量级**判据，不能当等值判据。
+        #   ⚠ 两边必须同单位：端点 pos_t 是**电机端 turns**，feedback 是输出端 rad。
         note(f"最后一次轮询值 vs 随后的真值：Δ={delta:.3e} rad"
              f"（含失能过渡期间的移动）")
         check("闭环期间 0x41 的值在**漂移量级**内（不是垃圾值）",
@@ -267,6 +297,8 @@ def main() -> int:
     ap.add_argument("--bitrate", type=int, default=1000000)
     ap.add_argument("--data-bitrate", type=int, default=0)
     ap.add_argument("--node", type=int, default=1)
+    ap.add_argument("--fd", action="store_true",
+                    help="链路是 CAN FD（默认 Classic：真机这台是 Classic 1 Mbps）")
     ap.add_argument("--spec", default=None,
                     help="仅 --if virtual 用：设备规格字符串（默认单节点 FD）")
     ap.add_argument("--armed", action="store_true",
@@ -283,7 +315,13 @@ def main() -> int:
                      "kpmax=500,kdmax=5,hb=10,timeout=30000,fd")
 
     hal = build_hal(args)
-    ctx = Context(hal)
+    # ⚠ **必须显式指定帧格式**：Python 的 `Context(is_fd=None)` 默认按 **FD** 起步
+    #   （留给 SDK 自动对齐），而“自动对齐”要等收到帧之后才发生 ⇒ 在 **Classic 链路**
+    #   上第一条发送就被 socketcan/slcan 后端拒掉（`FD 帧 + link_is_fd == 0`），
+    #   现场表现是 `configure: transport ... could not be sent`（很误导）。
+    #   ⚠ 虚拟后端那块 spec 默认是 FD（见上面的默认 spec），所以那儿给 True。
+    is_fd = True if args.iface == "virtual" else bool(args.fd)
+    ctx = Context(hal, is_fd=is_fd)
     try:
         j = ctx.add_joint(args.node)
         print(f"=== 非阻塞状态请求真机实验（{'armed' if args.armed else '只读'}）===")
@@ -305,7 +343,16 @@ def main() -> int:
             return 1
 
         ctx.warmup()                                 # 会话预热（slcan 首帧丢失）
-        pos0, _ = phase_a(ctx, j, args)
+        ep_pos, _ = phase_a(ctx, j, args)
+
+        # ⚠ 保持目标必须是**输出端 rad**（`feedback().pos`），不能直接用上面那个
+        #   端点值：端点是**电机端 turns**（本例 1.8475 turns = 1.4979 rad）。
+        #   弄混就会把关节“保持”到另一个位置（差 0.35 rad），而且保护会把这次
+        #   实验正确地判为“漂移”。
+        poll_once(ctx, j)
+        pos0 = j.feedback().pos
+        note(f"保持目标 = feedback().pos = {pos0:.6f} rad"
+             f"（端点真值 {ep_pos:.4f} turns）")
 
         if args.armed:
             phase_b(ctx, j, args, pos0)

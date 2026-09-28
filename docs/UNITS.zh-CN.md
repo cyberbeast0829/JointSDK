@@ -67,6 +67,14 @@
 > `torque_Nm` 是**估算**：它依赖设备里标定的 `torque_constant`。
 > 要精确定力矩，请读设备端参数或用外部力矩传感器。
 
+> ⚠⚠ **端点值的单位（真机实测核实，最容易踩）**：`axis0.encoder.pos_estimate` /
+> `vel_estimate` 这些**端点值就是设备内存里的原样值**（**电机端 turns / turns·s⁻¹**），
+> SDK **不做**任何换算。而 `feedback().pos/vel` 是**输出端 rad / rad·s⁻¹**。
+> 两者直接相比会得到“同一个位置两个值、差一个 `2π/gear`”的假象（实测：
+> 端点 1.8475 turns ↔ `feedback().pos` 1.4979 rad ↔ ×2π/7.75 ✓）。
+> 同理：**心跳 `0x48` 的 pos 是电机端 turns（Classic ×100 定点，1 LSB = 0.01 turn）** ——
+> 它在刷新且正确，但精度只有 0.0081 rad（本关节）⇒ 不能当控制反馈。
+
 ---
 
 ## 4. Raw 入口（协议原始量，SDK 不换算）
