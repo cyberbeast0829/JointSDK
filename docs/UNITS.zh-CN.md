@@ -52,7 +52,7 @@
 | `jsdk_joint_set_target_velocity_rad_s(j, r)` | 输出端 rad/s | CSV/VEL：内部换算成 RPM |
 | `jsdk_joint_set_target_torque_Nm(j, Nm)` | **输出端** N·m | CST：内部 `÷ gear_ratio` 后发 `0x03` |
 | `jsdk_joint_set_mit(j, pos, vel, kp, kd, tau)` | 输出端 rad / rad·s⁻¹ / — / — / 输出端 N·m | `kp/kd` 是**线上值**（见 §6） |
-| `jsdk_joint_set_mit_stiffness(j, pos, vel, K, D, tau)` | 输出端 rad、**N·m/rad**、**N·m·s/rad** | 内部 `kp = K × 2π / gear` |
+| `jsdk_joint_set_mit_stiffness(j, pos, vel, K, D, tau)` | 输出端 rad、**N·m/rad**、**N·m·s/rad** | 内部 `kp = K × gear`（2026-09-30 更正，原写 `× 2π / gear`） |
 
 反馈结构体 `jsdk_joint_feedback_t`：
 
@@ -187,27 +187,32 @@ axis.controller_.input_mit_kp_ = kp;                  // 原样使用
 
 $$
 \text{stiffness}_{\text{out}}\ [\mathrm{N\cdot m/rad}]
-= kp \times \frac{\text{gear\_ratio}}{2\pi}
+= kp \div \text{gear\_ratio}
 $$
 
-### 数字例子（`gear_ratio = 16.5`）
+### 数字例子（本机 `gear_ratio = 7.75`）
 
 | 你给的 `kp` | 实际输出端刚度 | 说明 |
 |---|---|---|
-| 10 | 26.3 N·m/rad | `16.5 / (2π) = 2.626` |
-| 100 | 262.6 N·m/rad | 手册上限 `mit_max_kp = 500` → 等效 1313 N·m/rad |
-| 500 | 1313 N·m/rad | 上限值 |
+| 10 | 1.29 N·m/rad | `10 / 7.75` |
+| 100 | 12.9 N·m/rad | `100 / 7.75` |
+| 500 | 64.5 N·m/rad | 手册上限 `mit_max_kp = 500` → 等效仅 64.5 N·m/rad |
+
+> ⚠ **2026-09-30 回源更正**：此前写的 $kp\times\text{gear}/(2\pi)$（含"2.63 倍"的所有数字）**是错的**。
+> 按 `controller.cpp:401/415/418/450` 逐行推导（`pos_err` 本身是**电机端 turns**，`:415` 的 `/g*2π`
+> 把它换回输出端 rad），正确系数是 $1/\text{gear}$。数值验证：`kp=100, g=7.75 → K=12.903`。
+> 详见 `FIRMWARE_REPLY_DRAFT.zh-CN.md` §1。
 
 > 协议文档（`docs/cyberbeast-protocol.md:353`）把 `KP` 的单位写成 **N·m/rad**，
-> 与实现相差 **2.63 倍** —— 这一条已经作为 **F1** 提给固件侧
-> （见 `FIRMWARE_ISSUES.zh-CN.md`）。SDK 的处理是**两端都暴露**：
-> `set_mit()` 给"线上 kp"，`set_mit_stiffness()` 给"真实刚度"。
+> 而实际输出端刚度是 `kp / gear`（本机约 **0.13 倍**）—— 这一条已作为 **F1** 提给固件侧
+> （见 `FIRMWARE_ISSUES.zh-CN.md`），并已澄清固件侧"kp 即输出端刚度"的理解同样不成立。
+> SDK 的处理是**两端都暴露**：`set_mit()` 给"线上 kp"，`set_mit_stiffness()` 给"真实刚度"。
 
 ### 怎么选
 
 - 想**和厂商工具/别人给的调参值一致** → `jsdk_joint_set_mit()`（线上值，逐字节一致）
 - 想**按物理意义整定**（"我要 30 N·m/rad 的刚度"）→ `jsdk_joint_set_mit_stiffness()`
-- `kd` 同理：`实际阻尼 = kd × gear_ratio / (2π)`
+- `kd` 同理：`实际阻尼 = kd / gear_ratio`
 
 ---
 

@@ -1060,17 +1060,21 @@ JSDK_API void jsdk_joint_set_target_torque_Nm     (jsdk_joint_t *j, double Nm);
 /**
  * 发送 MIT 指令。**kp/kd 为线上值，原样透传**（与 cyberbeast_tool.py 一致）。
  *
- * @warning 固件把 kp/kd 作用在**电机端 turns 误差**上，而 pos/vel 由输出端换算而来，
+ * @warning 固件把 kp/kd 作用在**输出端 rad 误差**上（`controller.cpp:415` 把电机端
+ *          turns 误差 `/gear*2π` 换回输出端），但最终扭矩又会 `÷gear_ratio`（`:450`）。
  *          因此实际输出端刚度 ≠ kp：
- *              实际刚度 [N·m/rad] = kp × gear_ratio / (2π)
- *          以 gear_ratio = 16.5 计约为 kp 的 2.63 倍。
+ *              实际刚度 [N·m/rad] = kp ÷ gear_ratio
+ *          以本机 gear_ratio = 7.75 计约为 kp 的 0.129 倍。
  *          需要按"真实刚度"给值时请用 jsdk_joint_set_mit_stiffness()。
+ *
+ * @note 2026-09-30 更正：本注释早期版本写的 `kp × gear_ratio / (2π)`（及"2.63 倍"）
+ *       是错的，偏高 2π 倍。详见 docs/FIRMWARE_REPLY_DRAFT.zh-CN.md §1（已数值验证）。
  */
 JSDK_API void jsdk_joint_set_mit(jsdk_joint_t *j,
                         double pos_rad, double vel_rad_s,
                         double kp, double kd, double tau_Nm);
 
-/** 以**输出端真实刚度/阻尼**为输入；SDK 内部换算 kp = stiffness × 2π / gear_ratio。 */
+/** 以**输出端真实刚度/阻尼**为输入；SDK 内部换算 kp = stiffness × gear_ratio。 */
 JSDK_API void jsdk_joint_set_mit_stiffness(jsdk_joint_t *j,
                                   double pos_rad, double vel_rad_s,
                                   double stiffness_Nm_per_rad,

@@ -217,17 +217,29 @@ static void test_units(void)
     CHECK_NEAR(jsdk_units_rpm_to_rad_s(60.0), 2.0 * M_PI, 1e-9);
     CHECK_NEAR(jsdk_units_rpm_to_rad_s(jsdk_units_rad_s_to_rpm(1.234)), 1.234, 1e-12);
 
-    /* kp 量纲修正（§6.2）：刚度 = kp × gear / 2π */
+    /* kp 量纲修正（§6.2）：刚度_输出端 = kp / gear
+     *
+     * 见 docs/FIRMWARE_REPLY_DRAFT.zh-CN.md §1：MIT 入口的 pos 已是电机端 turns，
+     * controller.cpp:415 的 `/gear*2π` 把它换回输出端 rad，故 kp 被 1/gear 缩放。
+     * 历史：这里曾断言 `kp × gear / 2π`（偏高 2π 倍），是错误的。 */
     {
         double gear = 16.5;
         double kp = 500.0;
-        CHECK_NEAR(jsdk_units_kp_to_stiffness(kp, gear), 500.0 * 16.5 / (2.0 * M_PI), 1e-6);
+        CHECK_NEAR(jsdk_units_kp_to_stiffness(kp, gear), 500.0 / 16.5, 1e-6);
         CHECK_NEAR(jsdk_units_stiffness_to_kp(jsdk_units_kp_to_stiffness(kp, gear), gear),
                    kp, 1e-9);
-        /* 文档里的"约 2.63 倍" */
-        CHECK_NEAR(jsdk_units_kp_to_stiffness(kp, gear) / kp, 2.626, 5e-3);
+        /* 往返幂等（任意齿比） */
+        CHECK_NEAR(jsdk_units_kp_to_stiffness(jsdk_units_stiffness_to_kp(37.5, 7.75), 7.75),
+                   37.5, 1e-9);
+        /* 文档里的 "1/16.5 ≈ 0.0606 倍" */
+        CHECK_NEAR(jsdk_units_kp_to_stiffness(kp, gear) / kp, 1.0 / 16.5, 1e-6);
+        /* 实测本机 gear=7.75：kp=100 -> 12.903 N·m/rad（数值由固件链路仿真复核） */
+        CHECK_NEAR(jsdk_units_kp_to_stiffness(100.0, 7.75), 100.0 / 7.75, 1e-9);
+        CHECK_NEAR(jsdk_units_kp_to_stiffness(100.0, 7.75), 12.903225806451612, 1e-9);
+        /* 反向：想要 K=500 的输出端刚度，必须给 kp = 500*g（远超 mit_max_kp=500） */
+        CHECK_NEAR(jsdk_units_stiffness_to_kp(500.0, 7.75), 3875.0, 1e-9);
     }
-    printf("      gear=16.5: kp=500 -> %.3f N.m/rad (%.3fx the naive reading)\n",
+    printf("      gear=16.5: kp=500 -> %.3f N.m/rad (%.4fx the naive reading)\n",
            jsdk_units_kp_to_stiffness(500.0, 16.5),
            jsdk_units_kp_to_stiffness(500.0, 16.5) / 500.0);
 

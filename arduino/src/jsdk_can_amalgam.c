@@ -12798,26 +12798,42 @@ double jsdk_units_rpm_to_rad_s(double rpm)
 /* ==========================================================================
  * kp / kd 量纲修正（DESIGN §6.2）
  *
- * 固件：`torque_motor = tau + kp×(pos_sp − pos_est) + kd×(vel_des − vel_est)`，
- * 其中 pos 为**电机 turns**，而 kp/kd 由主站原样透传。线上下发 pos 时 SDK 已做
- * `turns = rad × gear / 2π`，于是误差被放大了 `gear/2π` 倍：
+ * 固件 `Controller::update()` 的 MIT 分支（controller.cpp:410-418, tag v4.2.55）：
  *
- *      力矩 ≈ kp × (gear/2π) × Δrad      ⇒   刚度_输出端 = kp × gear / 2π
+ *      mit_p_err = (pos_setpoint_ − pos_est) / gear_ratio * 2π
+ *      torque    = tau*torque_setpoint_*gear_ratio + kp*mit_p_err + kd*mit_v_err
+ *      torque_output_ = torque / gear_ratio                  (:450)
  *
- * 反解即 `kp = 刚度 × 2π / gear`。以 gear = 16.5 计，客户直接填 kp 会得到
- * 约 2.63 倍于直觉的刚度 —— 这是最容易让调参现场翻车的一条。
+ * ⚠ 关键：MIT 入口 `set_input_pos_and_steps()` 收到的 pos **已经是电机端 turns**
+ *    （CAN 侧 :371 做了 `pos*g/(2π)`），`pos_setpoint_`/`pos_estimate_linear`
+ *    两边同为电机端 turns，故 `pos_err` 是电机端 turns。`:415` 的
+ *    `/gear*2π` 作用是把**电机端 turns 换回输出端 rad**。
+ *
+ *    于是：mit_p_err = (Δrad_out / gear * 2π) 代入（其中 Δturns = Δrad*g/2π）
+ *        => mit_p_err = Δrad_out
+ *        => torque_motor = kp * Δrad_out
+ *        => torque_out   = kp * Δrad_out / gear      (:450)
+ *
+ *          ⇒ 输出端等效刚度 = kp / gear
+ *
+ *    反解：kp = 刚度_输出端 × gear。
+ *
+ * 历史备注：本函数早期版本按 “kp 作用在电机 turns 误差上” 推导，
+ * 写成 `刚度 × 2π / gear`，与固件实际链路差 2π 倍（偏高约 6.28×）。
+ * 以 gear = 16.5、刚度 100 为例：旧式给 kp ≈ 38.1，正确应给 kp = 1650。
+ * 详见 docs/FIRMWARE_REPLY_DRAFT.zh-CN.md §1。
  * ======================================================================== */
 
 double jsdk_units_stiffness_to_kp(double stiffness_nm_per_rad, double gear_ratio)
 {
     if (!(gear_ratio > 0.0)) return 0.0;
-    return stiffness_nm_per_rad * JSDK_TWO_PI / gear_ratio;
+    return stiffness_nm_per_rad * gear_ratio;
 }
 
 double jsdk_units_kp_to_stiffness(double kp, double gear_ratio)
 {
     if (!(gear_ratio > 0.0)) return 0.0;
-    return kp * gear_ratio / JSDK_TWO_PI;
+    return kp / gear_ratio;
 }
 
 /* ==========================================================================
