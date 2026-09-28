@@ -1108,7 +1108,7 @@ JSDK_API jsdk_status_t jsdk_joint_query_error_detail(jsdk_joint_t *j, jsdk_fault
  * 这三个的**语义层级**完全不同（4-bit 是摘要，32-bit 是明细），不要互相比对。
  * ------------------------------------------------------------------------ */
 
-/** @return MIT 4-bit ErrorCode 的名称（如 "CAN_TIMEOUT"）；未知返回 "?"。 */
+/** @return MIT 4-bit ErrorCode 的名称（如 "CAN_TIMEOUT"）；未定义的取值返回 "unknown"。 */
 JSDK_API const char *jsdk_joint_error_string(uint8_t mit_err_code);
 
 /** 心跳 5-bit 子系统位名（bit 0..4）；越界返回 NULL。 */

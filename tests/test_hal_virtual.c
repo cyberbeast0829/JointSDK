@@ -413,6 +413,45 @@ static void test_mit(void)
         CHECK((out.flags & JSDK_FRAME_FD) != 0u);
     }
 
+    /* --- MIT 响应 4-bit ErrorCode：取值与固件逐值一致（⚠ 0x8=OVERLOAD、0x9=CAN_TIMEOUT）--- */
+    {
+        cb_mit_response_t resp;
+        float max_cur = cb_mit_response_max_current(n->mit_max_torque,
+                                                    n->torque_constant);
+        uint64_t merr[5];
+        uint32_t aerr[5];
+        uint8_t  want[5];
+        unsigned k;
+
+        merr[0] = SIM_MERR_STALL;     aerr[0] = 0u; want[0] = CB_ERR_STALL;
+        merr[1] = SIM_MERR_OVERLOAD;  aerr[1] = 0u; want[1] = CB_ERR_OVERLOAD;
+        merr[2] = SIM_MERR_STALL | SIM_MERR_OVERLOAD;   /* 两个都置 → 先检查的胜出 */
+        aerr[2] = 0u;                 want[2] = CB_ERR_STALL;
+        merr[3] = 0x1ull;             aerr[3] = 0u; want[3] = CB_ERR_MOTOR;
+        merr[4] = 0u;                 aerr[4] = SIM_ERR_CAN_BUS_FAILED;
+        want[4] = CB_ERR_CAN_TIMEOUT;
+
+        for (k = 0u; k < 5u; ++k) {
+            n->error_motor = merr[k];
+            n->error_axis  = aerr[k];
+            drain(&f);
+            CHECK_EQ(send_frame(&f, 1u, CB_MSG_MIT_CONTROL, CB_PRI_HIGH_CTRL,
+                                payload, 8u, 1), 0);
+            CHECK_EQ(recv_mit_response(&f, 1u, &out), 1);
+            cb_mit_unpack_response(out.data, &r, max_cur, &resp);
+            CHECK_EQ(resp.err_code, want[k]);
+        }
+
+        /* 取值本身再钉一遍：enum 若被静默重编号（如 0x8/0x9 对调）必须立刻红 */
+        CHECK_EQ((unsigned)CB_ERR_VOLTAGE,     0x4u);
+        CHECK_EQ((unsigned)CB_ERR_STALL,       0x7u);
+        CHECK_EQ((unsigned)CB_ERR_OVERLOAD,    0x8u);
+        CHECK_EQ((unsigned)CB_ERR_CAN_TIMEOUT, 0x9u);
+
+        n->error_motor = 0ull;
+        n->error_axis  = 0u;
+    }
+
     /* --- ⚠ 响应 Seq **不回显**请求 Seq，而是设备本地滚动计数器 --- */
     {
         jsdk_can_frame_t fr;

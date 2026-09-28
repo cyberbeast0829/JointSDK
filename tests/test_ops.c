@@ -343,20 +343,24 @@ static void test_fault_text(void)
 {
     unsigned i;
     /* 取自固件 `can_cyberbeast.hpp` 的 `ErrorCode` —— **不是** ODrive 的
-       `ErrorCode` 枚举（两者顺序完全不同，凭记忆写必错）。 */
-    static const char *const k_mit[9] = {
-        "NONE", "MOTOR", "ENCODER", "CONTROLLER", "UNDER_VOLTAGE",
-        "OVER_TEMP", "OVER_CURRENT", "STALL", "CAN_TIMEOUT"
+       `ErrorCode` 枚举（两者顺序完全不同，凭记忆写必错）。
+       ⚠ 固件 61cf2c5e 改过 0x4/0x8/0x9（UNDER_VOLTAGE→VOLTAGE、新增 OVERLOAD、
+       CAN_TIMEOUT 0x8→0x9）。本表**按值排列**，因此同时钉住了「值 → 名字」，
+       将来再静默重编号（如 0x8/0x9 对调）就会红。 */
+    static const char *const k_mit[10] = {
+        "NONE", "MOTOR", "ENCODER", "CONTROLLER", "VOLTAGE",
+        "OVER_TEMP", "OVER_CURRENT", "STALL", "OVERLOAD", "CAN_TIMEOUT"
     };
 
     printf("[1] fault code text\n");
 
-    for (i = 0u; i < 9u; ++i) {
+    for (i = 0u; i < 10u; ++i) {
         CHECK_STR(jsdk_joint_error_string((uint8_t)i), k_mit[i]);
     }
     CHECK_STR(jsdk_joint_error_string(0xFu), "MULTIPLE");   /* 线宽 4 bit 的最高值 */
-    CHECK(jsdk_joint_error_string(9u) != NULL);             /* 未定义值有兜底 */
-    CHECK(strcmp(jsdk_joint_error_string(9u), "NONE") != 0);
+    CHECK(jsdk_joint_error_string(0xAu) != NULL);           /* 未定义值有兜底 */
+    CHECK_STR(jsdk_joint_error_string(0xAu), "unknown");    /* 兜底串与头文件文档一致 */
+    CHECK(strcmp(jsdk_joint_error_string(0xAu), "NONE") != 0);
 
     /* 心跳 5-bit 位名 */
     CHECK_STR(jsdk_hb_error_bit_name(0u), "axis");
@@ -409,7 +413,7 @@ static void test_fault_text(void)
         if (fx_configure(&fx) != 0) { g_fail++; g_checks++; fx_close(&fx); return; }
 
         /* 注入一个 32-bit 轴错误 + 心跳子系统位，再看描述串 */
-        fx.j->fb.err_code   = 8u;                       /* CAN_TIMEOUT */
+        fx.j->fb.err_code   = 9u;                       /* CAN_TIMEOUT（固件 61cf2c5e 起为 0x9） */
         fx.j->fb.hb_error   = (uint8_t)(CB_HB_ERR_AXIS | CB_HB_ERR_MOTOR);
         fx.j->fb.axis_error = 1u << 20;                 /* CAN_BUS_FAILED */
         fx.j->current_state_raw = 8u;                   /* CLOSED_LOOP_CONTROL */

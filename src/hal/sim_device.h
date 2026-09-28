@@ -76,6 +76,10 @@ extern "C" {
 #define SIM_ERR_CAN_BUS_FAILED       0x00100000u
 /** `Axis::ERROR_ESTOP_REQUESTED` */
 #define SIM_ERR_ESTOP_REQUESTED      0x00004000u
+/** `Motor::ERROR_STALL`（固件值）——用于让 `detect_error_code()` 产出 `CB_ERR_STALL` */
+#define SIM_MERR_STALL               0x2000000000ull
+/** `Motor::ERROR_OVERLOAD`（固件值）——用于产出 `CB_ERR_OVERLOAD` */
+#define SIM_MERR_OVERLOAD            0x4000000000ull
 /** `InputMode::INPUT_MODE_MIT`（MIT 帧会把 input_mode 设为它） */
 #define SIM_INPUT_MODE_MIT           9u
 /** `Controller::ControlMode` */

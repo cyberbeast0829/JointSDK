@@ -262,10 +262,11 @@ const char *cb_mit_error_name(uint8_t err_code)
     case CB_ERR_MOTOR:         return "MOTOR";
     case CB_ERR_ENCODER:       return "ENCODER";
     case CB_ERR_CONTROLLER:    return "CONTROLLER";
-    case CB_ERR_UNDER_VOLTAGE: return "UNDER_VOLTAGE";
+    case CB_ERR_VOLTAGE:       return "VOLTAGE";
     case CB_ERR_OVER_TEMP:     return "OVER_TEMP";
     case CB_ERR_OVER_CURRENT:  return "OVER_CURRENT";
     case CB_ERR_STALL:         return "STALL";
+    case CB_ERR_OVERLOAD:      return "OVERLOAD";
     case CB_ERR_CAN_TIMEOUT:   return "CAN_TIMEOUT";
     case CB_ERR_MULTIPLE:      return "MULTIPLE";
     default:                   return "unknown";

@@ -268,8 +268,15 @@ static uint8_t detect_error_code(const sim_node_t *n)
         && n->error_controller == 0u && n->error_board == 0u) {
         return CB_ERR_NONE;
     }
-    /* 与固件同样：先看轴级/CAN 超时，再按子系统 */
+    /* 与固件同样：先看轴级（ESTOP / CAN 超时），再按子系统细分，最后通用兜底。
+       ⚠ 固件 `detect_error_code()` 目前把通用的 `motor_.error_ != 0 → ERR_MOTOR`
+       排在 `ERR_OVER_TEMP` / `OVER_CURRENT` / `STALL` / `OVERLOAD` **之前**，而这
+       4 类故障位都在 `motor_.error_` 里 ⇒ 固件上这 4 个细分码实际不可达
+       （本仓库 `docs/FIRMWARE_ISSUES.zh-CN.md` F31）。本模拟器按固件**意图**顺序
+       实现（细分优先、通用兜底），否则测试根本无法覆盖 0x5..0x8 的解码与文案。 */
     if (n->error_axis & SIM_ERR_CAN_BUS_FAILED) return CB_ERR_CAN_TIMEOUT;
+    if (n->error_motor & SIM_MERR_STALL)    return CB_ERR_STALL;
+    if (n->error_motor & SIM_MERR_OVERLOAD) return CB_ERR_OVERLOAD;
     if (n->error_motor != 0u)    return CB_ERR_MOTOR;
     if (n->error_encoder != 0u)  return CB_ERR_ENCODER;
     if (n->error_controller != 0u) return CB_ERR_CONTROLLER;

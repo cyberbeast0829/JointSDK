@@ -857,6 +857,37 @@ Classic/slcan）、一次独占窗口 ≈ **9 个 1 kHz tick**，建议 **≤10 
 
 ---
 
+### 2.13 v0.36：ErrorCode 与固件 `61cf2c5e` 对齐（2026-09-28）
+
+**起因**：固件提交 `61cf2c5e`（`fix(CYBERBEAST)：修正电压故障…&增加堵转和过载保护故障码及判断逻辑`）改了 `CANCyberBeast::ErrorCode`。用户要求把 SDK 侧相关定义与代码对齐。
+
+**固件改了什么**（仅 2 文件 / +11 −4）：
+- `ERR_UNDER_VOLTAGE(0x4)` → **`ERR_VOLTAGE(0x4)`**（取值不变，欠压/过压合并）
+- 新增 **`ERR_OVERLOAD = 0x8`**
+- **`ERR_CAN_TIMEOUT` 0x8 → 0x9**
+- `detect_error_code()`：电压两个位都返回 `ERR_VOLTAGE`；新增堵转（`Motor::ERROR_STALL = 0x2000000000`）与过载（`ERROR_OVERLOAD = 0x4000000000`）分支
+
+**SDK 侧改了什么**（改动面刻意压到最小：编号只有一份定义）
+| 文件 | 改动 |
+|---|---|
+| `src/proto_cyberbeast/cb_mit.h` | enum：`CB_ERR_VOLTAGE=0x4`、新增 `CB_ERR_OVERLOAD=0x8`、`CB_ERR_CAN_TIMEOUT=0x9`；每行注明“自哪个固件版本起成立”，并写明 **0x8 在旧固件含义相反** |
+| `src/proto_cyberbeast/cb_mit.c` | `cb_mit_error_name()`：`VOLTAGE` / `OVERLOAD`，`CAN_TIMEOUT` 随 0x9 |
+| `src/hal/sim_device.h/.c` | 新增可注入位 `SIM_MERR_STALL`/`SIM_MERR_OVERLOAD`（取自固件 `autogen/interfaces.hpp`）；`detect_error_code()` 按固件**意图**顺序（细分优先、`MOTOR` 兜底）产出 0x5~0x8 |
+| `tests/test_ops.c` | 名字表 `k_mit[10]`（按值排列 ⇒ 同时钉住“值 → 名字”）；兜底值改 0xA 并断言 `"unknown"`（与头文件文档一致） |
+| `tests/test_hal_virtual.c` | 5 组注入对照（stall / overload / 两者并存取 stall / 通用 motor / `CAN_BUS_FAILED`）+ 直接钉住 `VOLTAGE==0x4`、`STALL==0x7`、**`OVERLOAD==0x8`、`CAN_TIMEOUT==0x9`** |
+| `docs/DESIGN` / `PROTOCOL_NOTES` / `FIRMWARE_ISSUES` / `include/joint_sdk/joint_sdk.h` | 4-bit 表与已知缺陷同步；F29 表述修正；新增 F31；兜底串文档 `?` → `"unknown"` |
+| `arduino/src/jsdk_can_amalgam.*`、`dist/` | `python tools/amalgamate.py` 重生成（客户单文件版 + Arduino 包装） |
+
+**兼容性**：`0x8` 语义反转，是**会改变客户判断**的一处；SDK 现在按 `61cf2c5e` 对齐，接更旧的固件时两者含义相反。头文件与两份文档都写了这条版本耦合。
+
+**本轮新查实的两件事**（都不是 SDK 的 bug）：
+1. **固件 F31（新增）**：`detect_error_code()` 的通用 `motor_.error_ != 0 → ERR_MOTOR` 排在温度/过流/堵转/过载之前，而那 4 类位都在 `motor_.error_` 里 ⇒ `0x5/0x6/0x7/0x8` **永不返回**；`61cf2c5e` 新加的堵转/过载“保护故障码”因此报不出来（保护动作照常）。修法写在 F31 的“应改为”列。
+2. **F29 里我们写错了**：原写“`ERROR_WATCHDOG_TIMER_EXPIRED` 也映射成 `CAN_TIMEOUT`”——按 `61cf2c5e` 复核，CyberBeast 路径只引用 `ESTOP_REQUESTED`（0x4000）与 `CAN_BUS_FAILED`（0x100000，即总线 `break_timeout` 触发），WATCHDOG 只在 `canopen.cpp` 出现。已改。
+
+**验证**：一键回归 **14/14**（含 amalgam/Arduino 冒烟，因此能发现“改了头却没重生成合并件”）；C 断言 **30765**/0 失败（实测求和：`28858` + `test_jsondesc` 的 `1907 项检查`；较 v0.35 的 30744 +21，正好是本轮新增的检查数）；**两处变异都被检出**：① enum 里 0x8/0x9 对调 → `test_ops` 3 项 + `test_hal_virtual` 2 项报错；② 删掉仿真器新增的两个分支 → `test_hal_virtual` 3 项报错。
+
+**未做（属于固件仓）**：`d:/projects/cheetah/ODrive` 的 `docs/cyberbeast-protocol.md:452` 仍写 `| 0x8 | CAN 通信超时 |`，需同步为 0x8=过载、0x9=CAN 超时；F31 的代码修法也未提交（跨仓，等用户决定）。
+
 ## 3. 已知限制与记录缺失
 
 ### 3.1 已知限制（不是缺陷；**无法在本环境消除**，交付时要一并说明）

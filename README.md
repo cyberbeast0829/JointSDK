@@ -102,7 +102,7 @@ python -m pytest bindings/python/tests -q
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
-| `JSDK_BUILD_TESTS` | ON | 单元测试（**11 套 / 30744 项断言**）。⚠ 它**需要** `JSDK_BUILD_HAL_VIRTUAL=ON`：测试套件全部跑在虚拟后端的设备模型上（靠它注入丢帧/不回包），两者同时关闭会在配置期报错 |
+| `JSDK_BUILD_TESTS` | ON | 单元测试（**11 套 / 30765 项断言**）。⚠ 它**需要** `JSDK_BUILD_HAL_VIRTUAL=ON`：测试套件全部跑在虚拟后端的设备模型上（靠它注入丢帧/不回包），两者同时关闭会在配置期报错 |
 | `JSDK_WERROR` | OFF | 把告警当错误（MSVC 下是 `/WX`） |
 | `JSDK_BUILD_HAL_VIRTUAL` | ON | 虚拟总线 + 驱动器模型（自带描述符，CI/离线用；也是测试套件唯一的无硬件底座） |
 | `JSDK_BUILD_HAL_SOCKETCAN` | Linux ON | Linux SocketCAN（CAN FD + BRS） |
@@ -381,7 +381,7 @@ tools/                夹具/黄金向量生成、构建与验证脚本（`wsl_b
 | 维度 | 现状（可复现） |
 |---|---|
 | 构建 | **两套工具链都干净**：gcc（`-Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes` + `-Werror`）与 MSVC（`/W4 /WX /std:c11 /utf-8`） |
-| C 测试 | **11 套 / 30744 项断言**，0 失败（Windows MinGW gcc 13；Windows MSVC 19.44；Linux WSL gcc 9；ASan+UBSan 同样全过） |
+| C 测试 | **11 套 / 30765 项断言**，0 失败（Windows MinGW gcc 13；Windows MSVC 19.44；Linux WSL gcc 9；ASan+UBSan 同样全过） |
 | ctest | **22 项**（11 套 C + 8 个示例 + `cli_text_lint` + `api_docs_lint` + `hw_verify_virtual`；共享库构建为 23 项，多一个 `python_bindings`） |
 | Python | **246 passed / 2 skipped**（Windows 3.12 与 Linux 3.8 结果一致）；公共 C API **118/118 已绑定，0 缺口**；`python -m jsdk_can` 与 `jsdk-cli` **25 个子命令对齐**（同款安全闸、同款退出码、同款 JSON 字段与 CSV 列） |
 | 一键回归 | **`./tools/check_all.sh`** → **14 步全过**（Windows 三套构建 + Python、WSL 四步、3 冒烟、3 静态守卫），日志在 `build/check_all/`；已接 CI（**只读验证型**，不含真机）：`.github/workflows/verify.yml` + 云效接法见 [`docs/CI.zh-CN.md`](docs/CI.zh-CN.md) |

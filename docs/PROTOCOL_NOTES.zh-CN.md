@@ -400,12 +400,13 @@ current_A = cb_u2f(c, -max_current, max_current, 12);
 | 1 | MOTOR | |
 | 2 | ENCODER | |
 | 3 | CONTROLLER | |
-| 4 | UNDER_VOLTAGE | ⚠ 过压（`DC_BUS_OVER_VOLTAGE`）也映射到此处 |
-| 5 | OVER_TEMP | |
-| 6 | OVER_CURRENT | |
-| 7 | STALL | |
-| 8 | CAN_TIMEOUT | ⚠ `ERROR_ESTOP_REQUESTED` 与 `ERROR_CAN_BUS_FAILED` 都映射到此处 |
-| 0xF | MULTIPLE | 多个子系统同时报错 |
+| 4 | VOLTAGE | 欠压（`DC_BUS_UNDER_VOLTAGE`）**与**过压（`DC_BUS_OVER_VOLTAGE`）共用；固件 61cf2c5e 由 `UNDER_VOLTAGE` 更名 |
+| 5 | OVER_TEMP | ⚠ 固件当前**不可达**（F31） |
+| 6 | OVER_CURRENT | ⚠ 固件当前**不可达**（F31） |
+| 7 | STALL | ⚠ 固件当前**不可达**（F31） |
+| 8 | OVERLOAD | 固件 61cf2c5e 新增；⚠ **该版本之前 0x8 = CAN_TIMEOUT** |
+| 9 | CAN_TIMEOUT | ⚠ 固件 61cf2c5e 由 0x8 改为 0x9；`ERROR_ESTOP_REQUESTED`（E-STOP）与 `ERROR_CAN_BUS_FAILED`（总线 `break_timeout`）都映射到此处 |
+| 0xF | MULTIPLE | 多个子系统同时报错（也是“有错但没命中任何细分分支”的兜底） |
 
 → 精确原因必须靠 `QUERY_ERROR(0x45)`（§4.11）。
 

@@ -139,16 +139,25 @@ size_t cb_mit_bcast_frame_len(uint8_t max_slot_used);
  * 响应帧解码
  * ======================================================================== */
 
+/* ⚠ 取值必须与固件 `CANCyberBeast::ErrorCode` 逐值一致
+ *   （`Firmware/communication/can/can_cyberbeast.hpp`）。
+ *   固件 commit 61cf2c5e（2026-09-28）改过一次取值，见各行的 ⚠ 备注：
+ *   **在 0x8/0x9 上做分支前务必核对固件版本**，否则会把过载当成 CAN 超时。 */
 typedef enum {
     CB_ERR_NONE          = 0x0,
     CB_ERR_MOTOR         = 0x1,
     CB_ERR_ENCODER       = 0x2,
     CB_ERR_CONTROLLER    = 0x3,
-    CB_ERR_UNDER_VOLTAGE = 0x4,   /**< ⚠ 过压（DC_BUS_OVER_VOLTAGE）也映射到此处 */
+    CB_ERR_VOLTAGE       = 0x4,   /**< 欠压（DC_BUS_UNDER_VOLTAGE）**与**过压（DC_BUS_OVER_VOLTAGE）都映射到此处；
+                                       ⚠ 固件 61cf2c5e 由 `UNDER_VOLTAGE` 更名为 `VOLTAGE`（取值未变） */
     CB_ERR_OVER_TEMP     = 0x5,
     CB_ERR_OVER_CURRENT  = 0x6,
     CB_ERR_STALL         = 0x7,
-    CB_ERR_CAN_TIMEOUT   = 0x8,   /**< ⚠ ESTOP_REQUESTED 与 CAN_BUS_FAILED 都映射到此处 */
+    CB_ERR_OVERLOAD      = 0x8,   /**< ⚠ 固件 61cf2c5e 新增；**该版本之前 0x8 = CAN_TIMEOUT** */
+    CB_ERR_CAN_TIMEOUT   = 0x9,   /**< ⚠ 固件 61cf2c5e 由 0x8 挪到 0x9；
+                                       `Axis::ERROR_ESTOP_REQUESTED`（E-STOP）与 `ERROR_CAN_BUS_FAILED`
+                                       （总线 `break_timeout` 触发）都映射到此处 —— 名字叫 CAN_TIMEOUT，
+                                       但 E-STOP 也全算在这里（见 FIRMWARE_ISSUES F29） */
     CB_ERR_MULTIPLE      = 0xF
 } cb_mit_error_t;
 
