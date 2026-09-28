@@ -438,6 +438,15 @@ class Joint:
                                                      ctypes.c_uint32(fields)),
                   "request_state")
 
+    def stale_ms(self) -> int:
+        """反馈新鲜度阈值（ms）—— 与 ``feedback().age_ms`` 直接可比。
+
+        ``age_ms > stale_ms()`` 就会置 ``JSDK_JF_FEEDBACK_STALE``。
+        阈值由心跳周期、控制周期、**状态轮询周期**与 50 ms 硬下限取最大值得出
+        （见 C 头 ``jsdk_joint_get_stale_ms()``）。
+        """
+        return int(self._lib.jsdk_joint_get_stale_ms(self._ptr))
+
     def is_fault(self) -> bool:
         return bool(self._lib.jsdk_joint_is_fault(self._ptr))
 

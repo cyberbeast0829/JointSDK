@@ -55,7 +55,9 @@ class BusState:
                  "keepalive_sent", "tx_retries", "tx_retries_warm",
                  "tx_retries_req", "req_timeouts", "last_retry_what",
                  "last_retry_age_ms", "last_rx_age_ms", "hal_bus_flags",
-                 "link_errors", "nodes_online", "link_up")
+                 "link_errors", "nodes_online", "link_up",
+                 # v0.37：状态轮询观测
+                 "state_sent", "state_ok", "state_timeout")
 
     def __init__(self, c: _abi.BusState) -> None:
         self.tx_frames = c.tx_frames
@@ -74,6 +76,9 @@ class BusState:
         self.link_errors = c.link_errors
         self.nodes_online = c.nodes_online
         self.link_up = bool(c.link_up)
+        self.state_sent = c.state_sent
+        self.state_ok = c.state_ok
+        self.state_timeout = c.state_timeout
 
     def as_dict(self) -> dict:
         return {k: getattr(self, k) for k in self.__slots__}
@@ -484,6 +489,26 @@ class Context:
                                                               ctypes.byref(c)),
                          "get_bus_state")
         return BusState(c)
+
+    def set_state_poll(self, period_ms: int, *, per_cycle: int = 1,
+                       fields: int = 0, timeout_ms: int = 0) -> None:
+        """配置 **SDK 侧限速状态轮询**（阶段 2；默认关闭）。
+
+        :param period_ms: **每关节**轮询周期（ms）；``0`` = 关闭。真机建议 ``100``（10 Hz）。
+        :param per_cycle: 每拍最多发几个（``0`` = 1）。
+        :param fields: ``STATE_POS_VEL`` / ``STATE_CURRENT`` 的按位或；``0`` = 两个都要。
+        :param timeout_ms: 在途超时；``0`` = 50 ms。
+
+        与 :meth:`Joint.request_state` 的关系：后者是“自己决定何时发”的原语，
+        本方法是“SDK 按周期替我发”—— 每总线**最多一个在途**、按 ``node_id``
+        **升序轮转**，应答仍走 ``cycle_begin()`` 的收帧路径回填 ``feedback()``。
+
+        ⚠ 轮询帧**不喂设备看门狗** ⇒ 只能额外发，不能顶替控制帧。
+        """
+        raise_for_status(self._lib.jsdk_context_set_state_poll(
+            self._ctx_ptr, ctypes.c_uint32(int(period_ms)), ctypes.c_uint8(int(per_cycle)),
+            ctypes.c_uint8(int(fields)), ctypes.c_uint16(int(timeout_ms))),
+            "set_state_poll", self.last_error())
 
     def last_error(self) -> str:
         """最近一次错误的可读文本（含关节/给定量/量程）。"""

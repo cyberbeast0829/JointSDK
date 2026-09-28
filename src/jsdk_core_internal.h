@@ -224,6 +224,15 @@ struct jsdk_joint {
     uint8_t  fault_prev;      /**< 上一次 is_fault（故障回调边沿检测） */
     jsdk_fault_info_t fault;
 
+    /* ---- 状态轮询（v0.37；见 jsdk_state_poll.c）---- */
+    uint32_t poll_next_ms;    /**< 下一次允许发送的**绝对时刻**（仅当 `poll_scheduled` 时有意义） */
+    uint8_t  poll_scheduled;  /**< 1 = 已排期（`poll_next_ms` 有效）。**不要**用 `poll_next_ms`
+                                   的 0 当“未排期”哨兵 —— 时刻 0 是合法值，两者混用会让
+                                   “首次该不该发”变成一个说不清的边界（本项目踩过） */
+    uint8_t  poll_pending;    /**< 1 = 本关节有在途请求未结 */
+    uint8_t  poll_inflight_field; /**< 在途的是哪个字段（JSDK_STATE_*，单个位） */
+    uint8_t  poll_reserved;
+
     jsdk_sdo_slot_t sdo[JSDK_SDO_SLOTS];
 };
 
@@ -285,6 +294,12 @@ struct jsdk_context {
     /* ---- 记账 ---- */
     jsdk_bus_state_t bus;
     uint32_t         last_rx_ms;      /**< 最近一次收到与本主站相关帧的时刻 */
+
+    /* ---- 状态轮询调度器（v0.37；配置在 cfg，运行态在这里）---- */
+    uint32_t poll_inflight_ms;   /**< 在途请求的发出时刻；0 = 无在途 */
+    uint16_t poll_timeout_ms;    /**< 在途超时（解析后的值，非 0） */
+    uint8_t  poll_inflight_ji;   /**< 在途请求对应的关节下标（无在途时无意义） */
+    uint8_t  poll_rotation;      /**< 轮转起点：上一次发到哪个关节（下一个从它之后找） */
     /**
      * 最近一次**自动重发**的时刻与类别（只为观测；`jsdk_context_get_bus_state()`
      * 把它们换算成 `last_retry_what` / `last_retry_age_ms` 报出去）。
@@ -536,6 +551,36 @@ int jsdk_joint__send_now(jsdk_joint_t *j);
 
 /** cycle_end()：看门狗/keepalive（jsdk_watchdog.c）。 */
 void jsdk_watchdog__cycle_end(jsdk_context_t *ctx);
+
+/* ==========================================================================
+ * 状态轮询调度器（jsdk_state_poll.c）
+ * ======================================================================== */
+
+/**
+ * cycle_end()：按配置的周期/轮转/每 tick 上限发出状态请求帧。
+ *
+ * 配置关闭（`cfg.state_poll_period_ms == 0`）时**立即返回**，不改变任何行为。
+ */
+void jsdk_state_poll__cycle_end(jsdk_context_t *ctx);
+
+/**
+ * cycle_begin()（**`pump_rx()` 之后**）：结掉已到期的在途状态轮询请求。
+ *
+ * 超时会在这里计数 `state_timeout` 并释放槽位（所以即使设备完全不答，
+ * 调度器也不会永久卡在“有一个在途请求”上）。
+ */
+void jsdk_state_poll__cycle_begin(jsdk_context_t *ctx);
+
+/**
+ * 收帧路径钩子：某个关节收到了 0x41 / 0x44 的应答。
+ *
+ * 结掉在途请求并计数 `state_ok`（**只**处理在途字段匹配的那一帧，
+ * 客户自己发的 `jsdk_joint_request_state()` 不会污染调度器的计数）。
+ */
+void jsdk_state_poll__on_reply(jsdk_context_t *ctx, jsdk_joint_t *j, uint8_t msgtype);
+
+/** 解析后的轮询周期（ms）；0 = 关闭。供 `jsdk_joint_stale_ms()` 计入阈值。 */
+uint32_t jsdk_state_poll_period_ms(const jsdk_context_t *ctx);
 
 /**
  * 设备侧协议级超时（`can.config.break_timeout`，单位 ms）。

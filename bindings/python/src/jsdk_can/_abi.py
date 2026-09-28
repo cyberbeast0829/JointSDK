@@ -143,6 +143,11 @@ class ContextConfig(ctypes.Structure):
         ("enable_watchdog_hint", c_uint8),
         ("max_joints", c_uint8),
         ("rx_burst_limit", c_uint8),
+        # v0.37：SDK 侧限速状态轮询（默认全 0 = 关闭，见 C 头）
+        ("state_poll_period_ms", c_uint32),
+        ("state_poll_timeout_ms", c_uint16),
+        ("state_poll_fields", c_uint8),
+        ("state_poll_per_cycle", c_uint8),
         ("desc", DescConfig),
     ]
 
@@ -232,6 +237,10 @@ class BusState(ctypes.Structure):
         ("last_retry_what", c_uint8),
         ("_reserved", c_uint8 * 3),
         ("last_retry_age_ms", c_uint32),
+        # v0.37：状态轮询观测（调度器关闭时恒为 0）
+        ("state_sent", c_uint32),
+        ("state_ok", c_uint32),
+        ("state_timeout", c_uint32),
     ]
 
 
@@ -585,6 +594,8 @@ _FUNCS: dict[str, tuple[list, object]] = {
     "jsdk_joint_get_feedback": ([c_void_p, POINTER(JointFeedback)], c_int),
     # 非阻塞状态请求（0x41/0x44）：发出即返回，结果由 cycle_begin() 的收帧回填。
     "jsdk_joint_request_state": ([c_void_p, c_uint32], c_int),
+    "jsdk_context_set_state_poll": ([c_void_p, c_uint32, c_uint8, c_uint8, c_uint16], c_int),
+    "jsdk_joint_get_stale_ms": ([c_void_p], c_uint32),
     "jsdk_joint_is_enabled": ([c_void_p], c_int),
     "jsdk_joint_is_fault": ([c_void_p], c_int),
     "jsdk_joint_get_mode_state": ([c_void_p], c_int),
@@ -700,6 +711,9 @@ _REQUIRED_FUNCS = (
     "jsdk_context_configure",
     # --- 非阻塞状态请求（0.36 新增）：无条件编译进共享库，所以也要求“库不旧于绑定”。
     "jsdk_joint_request_state",
+    # --- 状态轮询调度器 + 新鲜度阈值（0.37 新增）：同样无条件编译进共享库。
+    "jsdk_context_set_state_poll",
+    "jsdk_joint_get_stale_ms",
     # --- A13：以下符号也是 0.1.0 公开 ABI 的一部分（无条件编译进共享库），
     #     所以“库比绑定旧”必须当场报出来，而不是等用户调到才 AttributeError。
     #     ⚠ **不包含**需要特殊构建开关的少数：`jsdk_context_create/free`

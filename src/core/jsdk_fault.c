@@ -244,6 +244,14 @@ uint32_t jsdk_joint_stale_ms(const jsdk_joint_t *j)
         uint32_t v = (uint32_t)(j->ctx->cfg.period_ns / 1000000u) * 6u;
         if (v > ms) ms = v;
     }
+    {
+        uint32_t poll_ms = jsdk_state_poll_period_ms(j->ctx);
+
+        if (poll_ms != 0u) {
+            uint32_t v = poll_ms * 4u;
+            if (v > ms) ms = v;
+        }
+    }
     return ms;
 }
 

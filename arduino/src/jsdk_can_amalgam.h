@@ -521,6 +521,15 @@ typedef struct {
     uint8_t  rx_burst_limit;        /**< 单周期最多处理的接收帧数；0 = 默认 32。
                                          防止总线风暴阻塞控制循环。
                                          注：描述符下载走独立排空循环，不受此限。 */
+    uint32_t state_poll_period_ms;  /**< 状态轮询的**每关节**周期（ms）；**0（默认）= 关闭**。
+                                         与 `state_poll_per_cycle` 一起构成限速上限。
+                                         见 jsdk_context_set_state_poll()。 */
+    uint16_t state_poll_timeout_ms; /**< 状态轮询的在途超时（ms）；0 = 50。
+                                         超时后本关节状态置为失效（不拿旧值充数）。 */
+    uint8_t  state_poll_fields;     /**< 轮询哪些字段（`JSDK_STATE_*` 掩码）；0 = `STATE_ALL`。 */
+    uint8_t  state_poll_per_cycle;  /**< 每个 `cycle_end()` 最多发出几个请求；0 = 1。`> 1` 时
+                                         同一周期内的多个请求会让限速变松（不等应答就发下一个）——
+                                         仅在多关节、且实测总线余量充足时才调大。 */
 
     /** 描述符获取与解析策略（必需，见 §5.5）。arena 必须由调用者提供。 */
     jsdk_desc_config_t desc;
@@ -806,6 +815,15 @@ typedef struct {
     uint8_t  last_retry_what;  /**< 最近一次自动重发的类别：0 从未 / 1 会话预热 / 2 幂等请求 */
     uint8_t  _reserved[3];     /**< 对齐占位（保持字段偏移稳定，不要写） */
     uint32_t last_retry_age_ms;/**< 距最近一次自动重发的毫秒数（`last_retry_what == 0` 时无意义） */
+
+    /* ---- 状态轮询观测（v0.37 新增；`jsdk_context_set_state_poll()` 关闭时恒为 0） ---- */
+    uint32_t state_sent;       /**< 已发出的状态请求帧数。
+                                    ⚠ `fields = POS_VEL|CURRENT` 时一次轮询 = **2 帧**，
+                                    所以这个数是帧数而不是“轮询次数” */
+    uint32_t state_ok;         /**< 其中**拿到应答**的次数（在途请求在超时前收到了对应的 0x41/0x44） */
+    uint32_t state_timeout;    /**< 在途请求**超时**的次数（设备没答）。
+                                    判“轮询到底有没有用”看这四个的比值：
+                                    `state_ok / state_sent` 低 ⇒ 总线被控制帧挤满或链路丢帧 */
 } jsdk_bus_state_t;
 
 /**
@@ -864,6 +882,63 @@ typedef struct {
  *       陈旧数据上的 `pos/vel` 不能当“当前状态”用（`JSDK_JF_STALE` 会置位）。
  */
 JSDK_API jsdk_status_t jsdk_joint_get_feedback(const jsdk_joint_t *j, jsdk_joint_feedback_t *fb);
+
+/**
+ * 反馈新鲜度阈值（ms）—— 与 `feedback().age_ms` 直接可比：`age_ms > 阈值` 就会置
+ * `JSDK_JF_FEEDBACK_STALE`。
+ *
+ * @par 为什么公开它
+ *   阈值原先只能由 SDK 内部推算，客户看到 `JSDK_JF_FEEDBACK_STALE` 时无法判断
+ *   “差了多少”。公开之后一行就能判：`fb.age_ms > jsdk_joint_get_stale_ms(j)`。
+ *
+ * @par 取值
+ *   下列各项取**最大值**（越大越保守，避免误报 stale）：
+ *     1. `heartbeat_rate_ms × 3`（心跳是唯一无需请求的周期反馈）；
+ *     2. 控制周期 × 6；
+ *     3. **状态轮询周期 × 4**（v0.37：反馈源改成“按需轮询”后必须计入，
+ *        否则轮询比心跳慢时会看到“数据明明刚回来、却一直 stale”）；
+ *     4. 硬下限 50 ms。
+ * @note 无副作用（`const`），可在 RT 路径调用；`j` 非法时返回硬下限 50。
+ */
+JSDK_API uint32_t jsdk_joint_get_stale_ms(const jsdk_joint_t *j);
+
+/**
+ * 配置 **SDK 侧限速状态轮询**（`QUERY_POS_VEL 0x41` / `QUERY_CURRENT 0x44`）。
+ *
+ * @par 与 jsdk_joint_request_state() 的关系
+ *   后者是“我自己决定什么时候发”的**原语**；本函数是“SDK 按周期替我发”的**调度器**，
+ *   内部就是用那个原语发帧，因此：
+ *     - **每总线最多一个在途请求**（等应答或超时后才发下一个）⇒ 不会自己把总线压满；
+ *     - 按 `node_id` **升序轮转**（确定性，便于复现;多关节不会“饿死”某个关节）；
+ *     - 每个 `cycle_end()` 最多发 `per_cycle` 个（默认 1）⇒ 每 tick 预算可控；
+ *     - 应答走 `cycle_begin()` 里**已有的**收帧路径回填 `feedback()`，不新增缓存。
+ *
+ * @param ctx       上下文
+ * @param period_ms **每关节**的轮询周期（ms）；`0` = **关闭**（默认，行为与本函数不存在时一致）。
+ *                  真机参考值 **100 ms（10 Hz）**：一次轮询在 Classic 上 ≈ 2 帧、
+ *                  实测（`tools/state_poll_probe.py`）每周期墙钟中位 58 µs。
+ * @param per_cycle 每个 `cycle_end()` 最多发几个请求；`0` = 1。
+ * @param fields    轮询字段（`JSDK_STATE_POS_VEL` / `JSDK_STATE_CURRENT` 的按位或）；
+ *                  `0` = 两个都轮询。含未知位 → `JSDK_ERR_INVALID_ARG`。
+ * @param timeout_ms 在途超时；`0` = 50 ms。超时后该关节状态**失效**
+ *                  （计数 `state_timeout`，**不拿旧值冒充当前值**）。
+ *
+ * @return `JSDK_OK`；`JSDK_ERR_INVALID_ARG`（`ctx` 非法 / `fields` 含未知位）。
+ *
+ * @par 总线负载算式（设计时用）
+ *   `帧率 ≈ 关节数 × fields的帧数 / (period_ms/1000)`；例如 7 关节、
+ *   只轮询 `POS_VEL`、`period_ms = 100` ⇒ 70 帧/s（1 Mbps 下 ≈ 7% 负载，
+ *   加上控制帧仍有充足余量）。**`STATE_ALL` 会让帧数翻倍**。
+ *
+ * @warning 轮询帧**不喂设备看门狗** ⇒ 它只能**额外**发，不能顶替控制帧。
+ * @warning `period_ms` **不**是“每 tick 发一次”的开关：它必须明显大于一个往返
+ *          （真机 ≈ 2 ms），否则在途请求会一直占着槽位。
+ * @note 可在 `configure()` 前调用（0x41 不依赖描述符）；运行中改参数立即生效，
+ *       传 `period_ms = 0` 即关闭（在途请求会被放弃并计入 `state_timeout`）。
+ */
+JSDK_API jsdk_status_t jsdk_context_set_state_poll(jsdk_context_t *ctx, uint32_t period_ms,
+                                                   uint8_t per_cycle, uint8_t fields,
+                                                   uint16_t timeout_ms);
 
 /* ---- 非阻塞状态请求：驱动中的新鲜反馈（不与 tick 互斥） ---- */
 

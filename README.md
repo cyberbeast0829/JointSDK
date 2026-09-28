@@ -102,7 +102,7 @@ python -m pytest bindings/python/tests -q
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
-| `JSDK_BUILD_TESTS` | ON | 单元测试（**11 套 / 30765 项断言**）。⚠ 它**需要** `JSDK_BUILD_HAL_VIRTUAL=ON`：测试套件全部跑在虚拟后端的设备模型上（靠它注入丢帧/不回包），两者同时关闭会在配置期报错 |
+| `JSDK_BUILD_TESTS` | ON | 单元测试（**11 套 / 30836 项断言**）。⚠ 它**需要** `JSDK_BUILD_HAL_VIRTUAL=ON`：测试套件全部跑在虚拟后端的设备模型上（靠它注入丢帧/不回包），两者同时关闭会在配置期报错 |
 | `JSDK_WERROR` | OFF | 把告警当错误（MSVC 下是 `/WX`） |
 | `JSDK_BUILD_HAL_VIRTUAL` | ON | 虚拟总线 + 驱动器模型（自带描述符，CI/离线用；也是测试套件唯一的无硬件底座） |
 | `JSDK_BUILD_HAL_SOCKETCAN` | Linux ON | Linux SocketCAN（CAN FD + BRS） |
@@ -381,7 +381,7 @@ tools/                夹具/黄金向量生成、构建与验证脚本（`wsl_b
 | 维度 | 现状（可复现） |
 |---|---|
 | 构建 | **两套工具链都干净**：gcc（`-Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes` + `-Werror`）与 MSVC（`/W4 /WX /std:c11 /utf-8`） |
-| C 测试 | **11 套 / 30765 项断言**，0 失败（Windows MinGW gcc 13；Windows MSVC 19.44；Linux WSL gcc 9；ASan+UBSan 同样全过） |
+| C 测试 | **11 套 / 30836 项断言**，0 失败（Windows MinGW gcc 13；Windows MSVC 19.44；Linux WSL gcc 9；ASan+UBSan 同样全过） |
 | ctest | **22 项**（11 套 C + 8 个示例 + `cli_text_lint` + `api_docs_lint` + `hw_verify_virtual`；共享库构建为 23 项，多一个 `python_bindings`） |
 | Python | **246 passed / 2 skipped**（Windows 3.12 与 Linux 3.8 结果一致）；公共 C API **118/118 已绑定，0 缺口**；`python -m jsdk_can` 与 `jsdk-cli` **25 个子命令对齐**（同款安全闸、同款退出码、同款 JSON 字段与 CSV 列） |
 | 一键回归 | **`./tools/check_all.sh`** → **14 步全过**（Windows 三套构建 + Python、WSL 四步、3 冒烟、3 静态守卫），日志在 `build/check_all/`；已接 CI（**只读验证型**，不含真机）：`.github/workflows/verify.yml` + 云效接法见 [`docs/CI.zh-CN.md`](docs/CI.zh-CN.md) |
@@ -397,6 +397,7 @@ tools/                夹具/黄金向量生成、构建与验证脚本（`wsl_b
 | 幂等重发（v0.32） | **运行中途**丢帧时重发同一帧（只做能证明安全的那一档：读、等 ACK 的同值写；控制帧/急停/`SET_NODE_ID` 绝不重发） | `tx_retries_req`、`req_timeouts` |
 | 描述符请求（v0.23） | `0x24` 请求重发，判据是“**本次传输还没开始**”而不是“一帧都没收到”（残留帧会骗过前者） | `desc-info` 的 `0x24 请求重发 N 次` |
 | 状态查询（v0.35） | `jsdk_joint_request_state(j, JSDK_STATE_POS_VEL)` —— **发出即返回**，应答由下一次 `cycle_begin()` 解出并回填 `feedback()`；用于“驱动中的新鲜反馈”（某些固件上主动上报帧冻结成 `0/0`） | `feedback().age_ms` / `pos` / `vel`（`STATE_CURRENT` 再给 `current_A`/`torque_Nm`） |
+| 限速轮询（v0.37） | `jsdk_context_set_state_poll(ctx, 100)` —— SDK **按周期自己发**查询帧（每总线最多一个在途、按 `node_id` 升序轮转）；默认关闭 | 计数 `bus_state().state_sent/state_ok/state_timeout`；阈值 `jsdk_joint_get_stale_ms()` |
 
 **未完成与已知限制的完整清单见 [`docs/BACKLOG.zh-CN.md`](docs/BACKLOG.zh-CN.md)**
 （§1 未完成项**已清空**；§3 还敷着 L1/L2/L5 等**需要第二台设备或人工上电**才能验的限制）。

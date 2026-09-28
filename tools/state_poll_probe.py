@@ -187,15 +187,27 @@ def phase_b(ctx, j, args, pos0: float) -> None:
     """使能 + 零力矩保持：闭环运行中轮询（**本脚本唯一会动设备的阶段**）。"""
     period_s = args.period_ms / 1000.0
     poll_s   = args.poll_ms / 1000.0
+    scheduler = bool(args.scheduler)          # 阶段 2：让 SDK 自己按周期发
     gear = float(j.config_snapshot().gear_ratio)   # 端点真值是电机端 turns，需换算后比较
     print(f"\n=== 阶段 B：使能（MIT，kp={args.kp} kd={args.kd} tau=0）"
-          f"周期 {args.period_ms} ms，每 {args.poll_ms} ms 轮询一次 ===")
+          f"周期 {args.period_ms} ms，"
+          f"{'**SDK 调度器** ' if scheduler else '每 '}{args.poll_ms} ms 轮询一次"
+          f"{'（stage 2）' if scheduler else ''} ===")
     note(f"保持目标 = 当前位置 {pos0:.9f} rad；漂移保护 {args.max_drift} rad")
 
     j.enable(Mode.MIT)
     ctx.activate()
     if not check("使能成功", j.is_enabled()):
         return
+
+    if scheduler:
+        # ⚠ **必须在 `activate()` 之后**才开调度器：`activate()` 是阻塞的“请求/等应答”
+        #   序列，调度器插进去的 0x41/0x44 帧会与它抢应答 ⇒ 真机上表现为
+        #   `activate: timeout (... mode_state=2, 没报故障)`（本项目实测复现过两次，
+        #   而且**只在打开调度器时**出现，所以它就是调度器引起的）。
+        #   规则与头文件的警告一致：**配置期的阻塞序列期间不要并发轮询**。
+        ctx.set_state_poll(int(args.poll_ms), fields=STATE_ALL)
+        note("已配置 SDK 调度器：每总线最多一个在途、按 node_id 升序轮转")
 
     t_end   = time.perf_counter() + args.seconds
     next_p  = time.perf_counter()
@@ -225,7 +237,6 @@ def phase_b(ctx, j, args, pos0: float) -> None:
                     pos_seen.append(fb.pos)
                     cur_seen.append(fb.current_A)
                 pending = 0
-
             if fb.valid and abs(fb.pos - pos0) > args.max_drift:
                 print(f"  !! 漂移 {abs(fb.pos - pos0):.4f} rad > {args.max_drift}"
                       f" ⇒ 立即退出并失能")
@@ -233,7 +244,16 @@ def phase_b(ctx, j, args, pos0: float) -> None:
                 break
 
             now = time.perf_counter()
-            if now >= next_q:
+            if scheduler:
+                # 阶段 2：**不需要**自己发 —— SDK 在 cycle_end() 里按周期发。
+                # 这里只统计“本拍有没有拿到新的有效帧”（就是调度器的成果）。
+                if fb.valid:
+                    replied += 1
+                    ages.append(fb.age_ms)
+                    pos_seen.append(fb.pos)
+                    cur_seen.append(fb.current_A)
+                sent = cycles          # 名义“轮询次数”按拍数计，真实帧数看 bus_state
+            elif now >= next_q:
                 next_q = now + poll_s
                 sent += 1
                 j.request_state(STATE_ALL)      # 在 tick 间隙发；下个 cycle 收应答
@@ -252,8 +272,40 @@ def phase_b(ctx, j, args, pos0: float) -> None:
     check("退出后关节已失能", not j.is_enabled())
     check("未被安全保护中断（漂移）", not drift_abort)
 
-    print(f"\n  轮询 {sent} 次，其中拿到有效应答 {replied} 次"
-          f"（{100.0 * replied / sent if sent else 0:.1f}%）")
+    if scheduler:
+        # 调度器模式下 `sent` 记的是**拍数**（我们没自己发帧），所以不要把它说成“轮询次数”，
+        # 真实帧数看下面 `bus_state().state_*`。这里报的是“多少次 tick 拿到了新帧”。
+        print(f"\n  {sent} 拍中，有 {replied} 拍拿到了新的有效帧"
+              f"（{100.0 * replied / sent if sent else 0:.1f}%）")
+    else:
+        print(f"\n  轮询 {sent} 次，其中拿到有效应答 {replied} 次"
+              f"（{100.0 * replied / sent if sent else 0:.1f}%）")
+    if scheduler:
+        # 阶段 2 的核心可观量：SDK 自己记账的“发了多少帧 / 答了多少 / 超时多少”
+        bs = ctx.bus_state()
+        print(f"  调度器计数：state_sent={bs.state_sent} state_ok={bs.state_ok} "
+              f"state_timeout={bs.state_timeout}")
+        check("调度器没有超时（每个请求都拿到应答）", bs.state_timeout == 0,
+              f"state_timeout={bs.state_timeout}")
+        check("调度器记账闭合（已发 = 已答 + 已超时 + ≤1 条在途）",
+              bs.state_sent >= bs.state_ok + bs.state_timeout
+              and bs.state_sent - (bs.state_ok + bs.state_timeout) <= 2,
+              f"sent={bs.state_sent} ok={bs.state_ok} to={bs.state_timeout}")
+        # 轮询周期 100 ms、跑 N 秒 ⇒ 期望帧数 ≈ N/(poll_ms/1000) × 2（POS_VEL + CURRENT）
+        # ⚠ 上界必须一起查：**只有下界**的断言曾在第一版放过一个“每拍都发”的实现
+        #   （真机上表现为状态帧数量 ≈ 控制帧数量，把总线占掉一大半还浑然不觉）。
+        expect = max(1.0, args.seconds / poll_s * 2.0)
+        check("调度器按周期发（帧数接近期望，没超发）",
+              0.5 * expect <= bs.state_sent <= 2.0 * expect + 4,
+              f"state_sent={bs.state_sent}，期望≈{expect:.0f}")
+        check("状态帧远少于控制帧（没把总线占满）",
+              bs.state_sent <= 4 * cycles,
+              f"state_sent={bs.state_sent} vs 控制拍数 {cycles}")
+        check("新鲜度阈值把轮询周期算进去了（不再恒 stale）",
+              not (j.feedback().status_flags & 0x0008)
+              or j.stale_ms() >= int(args.poll_ms),
+              f"stale_ms={j.stale_ms()} poll={args.poll_ms} ms")
+        ctx.set_state_poll(0)               # 退出前关掉
     check("0x41 在闭环中也应答", sent > 0 and replied >= max(1, int(0.95 * sent)),
           f"{replied}/{sent}")
     check("闭环中反馈不再陈旧（age_ms 合理）",
@@ -303,6 +355,8 @@ def main() -> int:
                     help="仅 --if virtual 用：设备规格字符串（默认单节点 FD）")
     ap.add_argument("--armed", action="store_true",
                     help="真的使能电机（先确认关节可以小幅移动/有支撑）")
+    ap.add_argument("--scheduler", action="store_true",
+                    help="阶段 2：用 SDK 侧限速调度器（set_state_poll）而不是手动发请求")
     ap.add_argument("--seconds", type=float, default=30.0)
     ap.add_argument("--period-ms", type=float, default=2.0)
     ap.add_argument("--poll-ms", type=float, default=100.0)

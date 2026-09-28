@@ -253,6 +253,18 @@ typedef struct {
     uint32_t drop_msgtype_n;
     uint32_t dropped_msgtype;
 
+    /** 应答丢帧注入（`sim_set_drop_reply()`）：丢掉**设备发出**的某个 MsgType 的应答。
+        用于验证“主站等不到应答”（例如状态轮询的在途超时）。
+        ⚠ **支持两个 MsgType 同时生效**（0x41 与 0x42 是两类独立查询，验证“配对严格”
+           时往往要同时屏蔽两者）—— 用一个槽位的写法会让第二次调用**覆盖**第一次。 */
+    struct {
+        uint8_t  msgtype;
+        uint8_t  any_node;
+        uint16_t node;
+        uint32_t n;
+        uint32_t dropped;
+    } drop_reply[2];
+
     /* JSON 描述符（0x24 / 0x25） */
     struct {
         uint8_t *json;
@@ -363,6 +375,20 @@ void sim_clear_stats(sim_bus_t *b);
 
 /** 设置描述符流速率（帧/ms）；0 = 恢复默认。用于“慢但持续”的流。 */
 void sim_set_desc_rate(sim_bus_t *b, uint32_t frames_per_ms);
+
+/**
+ * 让某节点**丢掉的应答**：丢掉它发出的某个 MsgType 的前 `n` 帧。
+ *
+ * 与 `sim_node_t.drop_msgtype`（那是丢**主站发出的请求**）不同，本函数丢的是
+ * **设备自己发出的应答** —— 用于验证“客户端等不到应答”的路径（例如状态轮询的
+ * 在途超时）。
+ *
+ * @param b       总线
+ * @param node_id 设备 node_id
+ * @param msgtype 要丢的 MsgType（0 = 取消丢帧）
+ * @param n       丢几帧；`UINT32_MAX` 表示“一直丢”
+ */
+void sim_set_drop_reply(sim_bus_t *b, uint32_t node_id, uint8_t msgtype, uint32_t n);
 
 #ifdef __cplusplus
 }

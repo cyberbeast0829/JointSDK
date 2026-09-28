@@ -135,6 +135,10 @@ typedef struct {
     /* 注入故障 5：时钟冻住（`now_ms` 不前进）—— 客户自写假时钟的常见写法。
        时间预算永远不到期，所以预热**必须有轮次上限**，否则就是死循环。 */
     int                      freeze_clock;
+    /** 时钟偏移（ms）：与 `freeze_clock` 配合，让测试能**精确**驱动
+        “在途超时 / 轮询到期”这类与时序强相关的分支。夹具默认是“每问一次
+        `now_ms` 就 +1 ms”，粒度太粗且不可控（它一度把“每拍都发”的缺陷掩盖成绿的）。 */
+    uint32_t                 clock_offset;
 } fix_t;
 
 static int w_send(void *u, const jsdk_can_frame_t *f)
@@ -209,7 +213,7 @@ static uint32_t w_now(void *u)
     fix_t *fx = (fix_t *)u;
 
     if (!fx->freeze_clock) jsdk_hal_virtual_advance_ms(fx->h, 1u);
-    return fx->inner.now_ms(fx->inner.user);
+    return fx->inner.now_ms(fx->inner.user) + fx->clock_offset;
 }
 
 /** 建总线 + 上下文 + n 个关节（不下载描述符）。`is_fd` = 0 时走 Classic。 */
@@ -2397,6 +2401,389 @@ static void test_state_request(void)
     fx_close(&fx);
 }
 
+/**
+ * [19] **状态轮询调度器**（`jsdk_context_set_state_poll()`）—— 阶段 2。
+ *
+ * 阶段 1（[18]）只给了“发一帧、不等”的原语，相位与限速留给调用者。本用例钉住
+ * 调度器的四条硬约束（都是 JointROS 需求里点名要的）：
+ *   ① **默认关闭**：不调用 `set_state_poll()` 时一帧都不发（现有行为不变）；
+ *   ② **每总线最多一个在途**：不等应答/超时就不发下一个 ⇒ 这才是真正的限速；
+ *   ③ **`node_id` 升序轮转**：多关节时按 id 顺序轮流，不会饿死后面的；
+ *   ④ **到期判据的方向**：真实时钟下按周期发，**绝不能每拍都发**。
+ *
+ * ⚠ 两条来自**真机**的教训（都是单测全绿、真机才暴露的）：
+ *   - 到期判据写反（`elapsed == 0` 当成“到点”）⇒ 真机 8 s 发了 8000 条状态帧；
+ *     夹具那个“每问一次 +1 ms”的时钟恰好把它撞成“偶尔放行”，所以必须用
+ *     `clock_offset` **显式**推进时间才测得出来（见子用例 ②c）。
+ *   - 调度器**不能在 `activate()` 之前打开**：配置期的阻塞请求/等应答序列会被
+ *     插进来的 0x41/0x44 抢走应答 ⇒ 真机报 `activate: timeout`（无故障）。
+ */
+static void test_state_poll(void)
+{
+    fix_t fx;
+    jsdk_joint_feedback_t fb;
+    jsdk_bus_state_t bs;
+    sim_node_t *n;
+
+    printf("[19] state poll scheduler: rate limit / rotation / timeout\n");
+
+    /* ---- ① 默认关闭：什么都没配时，跑 50 个周期一帧查询都不发 ---- */
+    if (fx_open(&fx, "0:id=1,hb=0,timeout=30000,fd", 1u) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+    if (fx_configure(&fx) != 0) {
+        printf("      FATAL: configure failed\n"); g_fail++; g_checks++; fx_close(&fx); return;
+    }
+    {
+        unsigned i;
+
+        for (i = 0u; i < 50u; ++i) fx_cycle(&fx);
+        CHECK_EQ(count_tx(&fx, CB_MSG_QUERY_POS_VEL, 0), 0u);
+        CHECK_EQ(count_tx(&fx, CB_MSG_QUERY_CURRENT, 0), 0u);
+        CHECK_EQ(jsdk_context_get_bus_state(fx.ctx, &bs), JSDK_OK);
+        CHECK_EQ(bs.state_sent, 0u);
+        CHECK_EQ(bs.state_ok, 0u);
+        CHECK_EQ(bs.state_timeout, 0u);
+    }
+    fx_close(&fx);
+
+    /* ---- ② 限速：**在途期间一条都不发**（真限速是“不等应答不罢休”，不是周期） ----
+       ⚠ 必须**把时钟推过在途超时之前**才有意义：夹具时钟来自 HAL，所以这里用
+         `clock_offset` 显式控制（不用默认那个“每问一次 +1 ms”的行为）。 */
+    if (fx_open(&fx, "0:id=1,hb=0,timeout=30000,fd", 1u) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+    if (fx_configure(&fx) != 0) {
+        printf("      FATAL: configure failed\n"); g_fail++; g_checks++; fx_close(&fx); return;
+    }
+    if ((n = sim_find_node(fx.sim, 1u)) != NULL) {
+        uint32_t t0;
+        unsigned sent_first;
+
+        sim_set_drop_reply(fx.sim, 1u, CB_MSG_QUERY_POS_VEL, 0xFFFFFFFFu);
+        CHECK_EQ(jsdk_context_set_state_poll(fx.ctx, 1u, 1u, JSDK_STATE_POS_VEL, 100u),
+                 JSDK_OK);
+
+        fx_cycle(&fx);                                  /* 第一拍：发出恰好一条 */
+        CHECK_EQ(jsdk_context_get_bus_state(fx.ctx, &bs), JSDK_OK);
+        CHECK_EQ(bs.state_sent, 1u);
+        sent_first = 1u;
+
+        fx.freeze_clock = 1;
+        t0 = fx.ctx->now_ms;
+
+        /* 周期 1 ms、超时 100 ms：连续 50 拍，时钟只到“超时之前”。
+           若没有“最多一个在途”，这 50 拍会发出 ~50 条。 */
+        {
+            unsigned k;
+
+            for (k = 0u; k < 50u; ++k) {
+                fx.clock_offset = 50u;           /* 50 ms < 100 ms 超时 */
+                jsdk_context_cycle_begin(fx.ctx, 0u);
+                jsdk_context_cycle_end(fx.ctx);
+            }
+        }
+        CHECK_EQ(jsdk_context_get_bus_state(fx.ctx, &bs), JSDK_OK);
+        CHECK_EQ(bs.state_sent, sent_first);            /* **一条都没多** —— 限速生效 */
+        CHECK_EQ(bs.state_timeout, 0u);
+        CHECK_EQ(bs.state_ok, 0u);
+
+        /* 推过超时 ⇒ 恰好记一次超时（超时后 deadline 被推到 now+1，
+           所以还要让时间继续走才能再发 —— 不锁死在第几拍） */
+        fx.clock_offset = 101u;
+        jsdk_context_cycle_begin(fx.ctx, 0u);
+        jsdk_context_cycle_end(fx.ctx);
+        CHECK_EQ(jsdk_context_get_bus_state(fx.ctx, &bs), JSDK_OK);
+        CHECK_EQ(bs.state_timeout, 1u);
+        {
+            unsigned k;
+
+            for (k = 0u; k < 5u; ++k) {
+                fx.clock_offset += 1u;
+                jsdk_context_cycle_begin(fx.ctx, 0u);
+                jsdk_context_cycle_end(fx.ctx);
+            }
+        }
+        CHECK_EQ(jsdk_context_get_bus_state(fx.ctx, &bs), JSDK_OK);
+        CHECK(bs.state_sent > sent_first);             /* 释放槽位后确实又发了 */
+        CHECK(bs.state_sent <= sent_first + 3u);
+
+        /* ⚠ `online` 在 `configure()` 期间就已置位（它表示“节点出现过”，
+           不是“轮询拿到状态”）⇒ 只能断言**本周期**没有新的有效帧。 */
+        CHECK_EQ(jsdk_joint_get_feedback(fx.j, &fb), JSDK_OK);
+        CHECK_EQ(fb.valid, 0);
+        CHECK(bs.state_sent >= bs.state_timeout + bs.state_ok);
+        CHECK(bs.state_sent - (bs.state_timeout + bs.state_ok) <= 1u);   /* ≤1 在途 */
+        (void)t0;
+
+        fx.freeze_clock = 0;
+        fx.clock_offset = 0u;
+    }
+    fx_close(&fx);
+
+    /* ---- ②c **到期判据的方向**（真机抓出来的那个 bug）----
+       100 拍、每拍 +2 ms（= 200 ms），周期 100 ms、**在途不会超时释放**
+       （超时配 5000 ms）⇒ 全程只允许**恰好 1 条**在途。
+       ⚠ 必须让设备**不回** 0x41：否则 `poll_pending` 会替我们挡住“每拍都发”，
+         即便到期判据写成“永远到期”也只看得到 1 条 —— 变异就存活了。
+         这是本轮变异测试的教训：**两个守卫要各自被独立钉住**。 */
+    if (fx_open(&fx, "0:id=1,hb=0,timeout=30000,fd", 1u) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+    if (fx_configure(&fx) != 0) {
+        printf("      FATAL: configure failed\n"); g_fail++; g_checks++; fx_close(&fx); return;
+    }
+    if ((n = sim_find_node(fx.sim, 1u)) != NULL) {
+        unsigned k;
+
+        sim_set_drop_reply(fx.sim, 1u, CB_MSG_QUERY_POS_VEL, 0xFFFFFFFFu);
+        fx.freeze_clock = 1;
+        fx.clock_offset = 0u;
+        CHECK_EQ(jsdk_context_set_state_poll(fx.ctx, 100u, 1u, JSDK_STATE_POS_VEL, 5000u),
+                 JSDK_OK);
+
+        for (k = 0u; k < 100u; ++k) {
+            fx.clock_offset += 2u;
+            jsdk_context_cycle_begin(fx.ctx, 0u);
+            jsdk_context_cycle_end(fx.ctx);
+        }
+        CHECK_EQ(jsdk_context_get_bus_state(fx.ctx, &bs), JSDK_OK);
+        CHECK_EQ(bs.state_ok, 0u);
+        /* “每拍都发”会得到 ~100；正确实现是 1。 */
+        CHECK_EQ(bs.state_sent, 1u);
+        CHECK_EQ(bs.state_timeout, 0u);
+
+        fx.freeze_clock = 0;
+        fx.clock_offset = 0u;
+    }
+    fx_close(&fx);
+
+    /* ---- ②d **周期必须真的节流**（对应“永远到期”那个变异）----
+       ⚠ 2c 屏蔽了应答 ⇒ `poll_pending` 会替我们挡住重复发送，于是**到期判据再错也看不出来**。
+         这里让应答**正常回来**（`poll_pending` 每拍都会被清），于是唯一的节流器就是
+         `poll_next_ms`：100 拍 × 2 ms = 200 ms、周期 100 ms ⇒ 只能发 2 条。
+         若到期判据写成“永远到期”，这里会得到 ~100 条。 */
+    if (fx_open(&fx, "0:id=1,hb=0,timeout=30000,fd", 1u) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+    if (fx_configure(&fx) != 0) {
+        printf("      FATAL: configure failed\n"); g_fail++; g_checks++; fx_close(&fx); return;
+    }
+    if ((n = sim_find_node(fx.sim, 1u)) != NULL) {
+        unsigned k;
+
+        n->pos_estimate = 0.25f;
+        fx.freeze_clock = 1;
+        fx.clock_offset = 0u;
+        CHECK_EQ(jsdk_context_set_state_poll(fx.ctx, 100u, 1u, JSDK_STATE_POS_VEL, 5000u),
+                 JSDK_OK);
+
+        for (k = 0u; k < 100u; ++k) {
+            fx.clock_offset += 2u;          /* 每拍 2 ms ⇒ 200 ms 总时长 */
+            jsdk_context_cycle_begin(fx.ctx, 0u);
+            jsdk_context_cycle_end(fx.ctx);
+        }
+        CHECK_EQ(jsdk_context_get_bus_state(fx.ctx, &bs), JSDK_OK);
+        /* 期望 2 条；给到 4 容忍边界，但**必须远小于 100** */
+        CHECK(bs.state_sent >= 2u);
+        CHECK(bs.state_sent <= 4u);
+        CHECK_EQ(bs.state_timeout, 0u);
+
+        fx.freeze_clock = 0;
+        fx.clock_offset = 0u;
+    }
+    fx_close(&fx);
+
+    /* ---- ③ 正常应答 ⇒ `state_ok` 增长、反馈变新鲜、关闭后不再发 ---- */
+    if (fx_open(&fx, "0:id=1,hb=0,timeout=30000,fd", 1u) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+    if (fx_configure(&fx) != 0) {
+        printf("      FATAL: configure failed\n"); g_fail++; g_checks++; fx_close(&fx); return;
+    }
+    n = sim_find_node(fx.sim, 1u);
+    if (n) {
+        unsigned i;
+
+        n->pos_estimate = 0.5f;
+        CHECK_EQ(jsdk_context_set_state_poll(fx.ctx, 5u, 1u, JSDK_STATE_POS_VEL, 50u),
+                 JSDK_OK);
+        for (i = 0u; i < 40u; ++i) fx_cycle(&fx);
+
+        CHECK_EQ(jsdk_context_get_bus_state(fx.ctx, &bs), JSDK_OK);
+        CHECK(bs.state_sent >= 2u);
+        CHECK(bs.state_ok + 2u >= bs.state_sent);     /* 尾部 1〜2 条还没结算 */
+        CHECK_EQ(bs.state_timeout, 0u);
+
+        /* ⚠ 先多泵一拍把最后一条的应答收完，再断言（`valid` 是**每周期**标志） */
+        fx_cycle(&fx);
+        CHECK_EQ(jsdk_joint_get_feedback(fx.j, &fb), JSDK_OK);
+        CHECK_EQ(fb.valid, 1);
+        CHECK_NEAR(fb.pos, (2.0 * M_PI * 0.5) / (double)fx.j->gear_ratio, 1e-9);
+
+        /* 关闭后不再发（且不影响已缓存的值） */
+        (void)count_tx(&fx, CB_MSG_QUERY_POS_VEL, 0);   /* 清空捕获队列 */
+        CHECK_EQ(jsdk_context_set_state_poll(fx.ctx, 0u, 1u, 0u, 0u), JSDK_OK);
+        fx_cycle(&fx);
+        for (i = 0u; i < 20u; ++i) fx_cycle(&fx);
+        CHECK_EQ(count_tx(&fx, CB_MSG_QUERY_POS_VEL, 0), 0u);
+    }
+    fx_close(&fx);
+
+    /* ---- ④ 多关节：`node_id` 升序轮转（不会“总是先伺候 node 1”）----
+       ⚠ 不靠“跑 N 拍再数帧”：夹具时钟粒度与周期相比很粗，先到期的那个会一直赢。
+         直接**摆好到期时刻**，再检查另一个关节有没有被轮到。 */
+    if (fx_open(&fx, "0:id=1,hb=0,timeout=30000,fd;1:id=2,hb=0,timeout=30000,fd", 2u) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+    if (fx_configure(&fx) != 0) {
+        printf("      FATAL: configure failed\n"); g_fail++; g_checks++; fx_close(&fx); return;
+    }
+    {
+        unsigned i;
+        unsigned seen1 = 0u, seen2 = 0u;
+
+        CHECK_EQ(jsdk_context_set_state_poll(fx.ctx, 5u, 1u, JSDK_STATE_POS_VEL, 50u),
+                 JSDK_OK);
+        for (i = 0u; i < 8u; ++i) {
+            jsdk_can_frame_t f;
+            unsigned first = i % 2u;
+
+            fx.ctx->joints[0].poll_next_ms = 0u;
+            fx.ctx->joints[1].poll_next_ms = 0u;
+            fx.ctx->joints[0].poll_scheduled = 1u;
+            fx.ctx->joints[1].poll_scheduled = 1u;
+            fx.ctx->joints[first].poll_next_ms = fx.ctx->now_ms + 1u;
+            fx.ctx->poll_rotation = (uint8_t)(1u - first);
+
+            jsdk_context_cycle_begin(fx.ctx, 0u);
+            jsdk_context_cycle_end(fx.ctx);
+            while (jsdk_hal_virtual_capture(fx.h, &f)) {
+                if (cb_id_msgtype(f.id) == CB_MSG_QUERY_POS_VEL) {
+                    if (cb_id_dest(f.id) == 1u) seen1++;
+                    if (cb_id_dest(f.id) == 2u) seen2++;
+                }
+            }
+            fx.ctx->poll_inflight_ms = 0u;
+            fx.ctx->joints[0].poll_pending = 0u;
+            fx.ctx->joints[1].poll_pending = 0u;
+        }
+        CHECK(seen1 > 0u);
+        CHECK(seen2 > 0u);                              /* 关键：两个关节都被轮到了 */
+    }
+    fx_close(&fx);
+
+    /* ---- ⑤ `0x42` 的应答**不能**结掉 `POS_VEL` 在途请求（严格按 MsgType 配对）---- */
+    if (fx_open(&fx, "0:id=1,hb=0,timeout=30000,fd", 1u) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+    if (fx_configure(&fx) != 0) {
+        printf("      FATAL: configure failed\n"); g_fail++; g_checks++; fx_close(&fx); return;
+    }
+    if ((n = sim_find_node(fx.sim, 1u)) != NULL) {
+        unsigned i;
+
+        sim_set_drop_reply(fx.sim, 1u, CB_MSG_QUERY_POS_VEL, 0xFFFFFFFFu);
+        sim_set_drop_reply(fx.sim, 1u, CB_MSG_QUERY_CURRENT, 0xFFFFFFFFu);
+        CHECK_EQ(jsdk_context_set_state_poll(fx.ctx, 5u, 1u, JSDK_STATE_POS_VEL, 50u),
+                 JSDK_OK);
+        for (i = 0u; i < 20u; ++i) {
+            jsdk_can_frame_t f;
+            cb_query_current_t cv;
+
+            jsdk_context_cycle_begin(fx.ctx, 0u);
+            jsdk_context_cycle_end(fx.ctx);
+
+            /* 手工塞一条 0x42 应答进收帧路径（模拟“总线上恰好有别的查询应答”）。 */
+            memset(&f, 0, sizeof f);
+            f.id    = cb_make_id(CB_PRI_QUERY, CB_MSG_QUERY_CURRENT, 1u, 1u, 0u);
+            memset(&cv, 0, sizeof cv);
+            f.len   = (uint8_t)cb_query_encode_current(f.data, &cv);
+            f.flags = JSDK_FRAME_EXT | JSDK_FRAME_FD;
+            (void)jsdk_ctx_handle_frame(fx.ctx, &f);
+        }
+        CHECK_EQ(jsdk_context_get_bus_state(fx.ctx, &bs), JSDK_OK);
+        CHECK_EQ(bs.state_ok, 0u);              /* 0x42 不算 POS_VEL 的应答 */
+        CHECK(bs.state_sent >= 1u);             /* 但请求确实发出去了 */
+        CHECK(bs.state_sent <= 12u);            /* 远小于 20 拍 —— 限速生效 */
+    }
+    fx_close(&fx);
+
+    /* ---- ⑤b 关闭调度器**必须**放弃在途请求（否则下次打开会“接着等”上一轮）---- */
+    if (fx_open(&fx, "0:id=1,hb=0,timeout=30000,fd", 1u) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+    if (fx_configure(&fx) != 0) {
+        printf("      FATAL: configure failed\n"); g_fail++; g_checks++; fx_close(&fx); return;
+    }
+    if ((n = sim_find_node(fx.sim, 1u)) != NULL) {
+        sim_set_drop_reply(fx.sim, 1u, CB_MSG_QUERY_POS_VEL, 0xFFFFFFFFu);
+        fx.freeze_clock = 1;
+        fx.clock_offset = 1000u;
+        CHECK_EQ(jsdk_context_set_state_poll(fx.ctx, 500u, 1u, JSDK_STATE_POS_VEL, 5000u),
+                 JSDK_OK);
+        fx_cycle(&fx);
+        CHECK_EQ(jsdk_context_get_bus_state(fx.ctx, &bs), JSDK_OK);
+        CHECK_EQ(bs.state_sent, 1u);
+        CHECK_EQ(bs.state_timeout, 0u);
+
+        CHECK_EQ(jsdk_context_set_state_poll(fx.ctx, 0u, 1u, 0u, 0u), JSDK_OK);
+        CHECK_EQ(jsdk_context_get_bus_state(fx.ctx, &bs), JSDK_OK);
+        CHECK_EQ(bs.state_timeout, 1u);             /* 放弃 = 记一次超时 */
+        CHECK_EQ(bs.state_sent, 1u);                /* 没多发 */
+        CHECK_EQ(fx.ctx->poll_inflight_ms, 0u);     /* 槽位真的释放了 */
+
+        /* 再打开也不该“接着等”：立刻能发新的 */
+        CHECK_EQ(jsdk_context_set_state_poll(fx.ctx, 500u, 1u, JSDK_STATE_POS_VEL, 5000u),
+                 JSDK_OK);
+        fx_cycle(&fx);
+        CHECK_EQ(jsdk_context_get_bus_state(fx.ctx, &bs), JSDK_OK);
+        CHECK_EQ(bs.state_sent, 2u);
+        CHECK_EQ(bs.state_timeout, 1u);
+
+        fx.freeze_clock = 0;
+        fx.clock_offset = 0u;
+    }
+    fx_close(&fx);
+
+    /* ---- ⑥ 新鲜度阈值必须把轮询周期算进去，且公开可读 ---- */
+    if (fx_open(&fx, "0:id=1,hb=0,timeout=30000,fd", 1u) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+    if (fx_configure(&fx) != 0) {
+        printf("      FATAL: configure failed\n"); g_fail++; g_checks++; fx_close(&fx); return;
+    }
+    {
+        uint32_t base = jsdk_joint_get_stale_ms(fx.j);
+
+        CHECK_EQ(base, 50u);                    /* 周期 1 ms + 无心跳 ⇒ 落到硬下限 */
+
+        CHECK_EQ(jsdk_context_set_state_poll(fx.ctx, 100u, 1u, JSDK_STATE_POS_VEL, 0u),
+                 JSDK_OK);
+        /* 100 ms × 4 = 400 > 50 ⇒ 阈值必须跟着涨（否则轮询比心跳慢时永远 stale） */
+        CHECK_EQ(jsdk_joint_get_stale_ms(fx.j), 400u);
+
+        CHECK_EQ(jsdk_context_set_state_poll(fx.ctx, 0u, 1u, 0u, 0u), JSDK_OK);
+        CHECK_EQ(jsdk_joint_get_stale_ms(fx.j), 50u);
+    }
+    fx_close(&fx);
+
+    /* ---- ⑦ 参数校验 ---- */
+    if (fx_open(&fx, "0:id=1,hb=0,timeout=30000,fd", 1u) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+    if (fx_configure(&fx) != 0) {
+        printf("      FATAL: configure failed\n"); g_fail++; g_checks++; fx_close(&fx); return;
+    }
+    CHECK_EQ(jsdk_context_set_state_poll(NULL, 100u, 1u, 0u, 0u), JSDK_ERR_INVALID_ARG);
+    CHECK_EQ(jsdk_context_set_state_poll(fx.ctx, 100u, 1u, 0x80u, 0u),
+             JSDK_ERR_INVALID_ARG);            /* 未知字段位 */
+    CHECK_EQ(jsdk_context_set_state_poll(fx.ctx, 100u, 0u,
+                                         (uint8_t)(JSDK_STATE_POS_VEL | JSDK_STATE_CURRENT),
+                                         0u), JSDK_OK);
+    fx_close(&fx);
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -2425,6 +2812,7 @@ int main(void)
     test_idempotent_request_retry(); printf("\n");
     test_link_quality_observability(); printf("\n");
     test_state_request(); printf("\n");
+    test_state_poll();    printf("\n");
     test_robustness();   printf("\n");
 
     free(g_json);

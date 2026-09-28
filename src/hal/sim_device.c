@@ -189,6 +189,29 @@ static void sim_emit(sim_bus_t *b, uint32_t id, const uint8_t *payload,
     uint32_t next;
     jsdk_can_frame_t *f;
 
+    /* 应答丢帧注入（`sim_set_drop_reply`）：模拟“主站等不到应答”。
+       ⚠ 放在最前面 —— 丢的就是“设备发出去的那一帧”，不应把它计入 tx_frames，
+         否则测试会看到“设备发了”而主站收不到，两边记录对不上。
+       ⚠ 两个槽位都要查：0x41/0x42 是两类独立查询，验证“配对严格”时通常要同时屏蔽。 */
+    {
+        unsigned k;
+
+        for (k = 0u; k < 2u; ++k) {
+            if (b->drop_reply[k].msgtype == 0u) continue;
+            if (cb_id_msgtype(id) != b->drop_reply[k].msgtype) continue;
+            if (!b->drop_reply[k].any_node
+                && cb_id_source(id) != b->drop_reply[k].node) continue;
+
+            if (b->drop_reply[k].n == 0u) {
+                b->drop_reply[k].msgtype = 0u;      /* 额度用完：自动取消 */
+            } else {
+                if (b->drop_reply[k].n != 0xFFFFFFFFu) b->drop_reply[k].n--;
+                b->drop_reply[k].dropped++;
+                return;
+            }
+        }
+    }
+
     if (b->force_txq_full > 0u) {
         b->force_txq_full--;
         b->txq_dropped++;
@@ -1567,6 +1590,34 @@ sim_node_t *sim_find_node(sim_bus_t *b, uint32_t node_id)
 void sim_set_desc_rate(sim_bus_t *b, uint32_t frames_per_ms)
 {
     if (b) b->desc_rate = frames_per_ms;
+}
+
+void sim_set_drop_reply(sim_bus_t *b, uint32_t node_id, uint8_t msgtype, uint32_t n)
+{
+    unsigned k;
+    int      slot = -1;
+
+    if (!b) return;
+
+    /* 先找同 MsgType 的已有槽位（重复调用 = 更新），否则占一个空槽 */
+    for (k = 0u; k < 2u; ++k) {
+        if (b->drop_reply[k].msgtype == msgtype && msgtype != 0u) { slot = (int)k; break; }
+    }
+    if (slot < 0) {
+        for (k = 0u; k < 2u; ++k) {
+            if (b->drop_reply[k].msgtype == 0u) { slot = (int)k; break; }
+        }
+    }
+    if (slot < 0) {
+        /* 两个槽都满了：清掉 msgtype 匹配不上的那个（最老的语义无意义，
+           这里退化成“直接覆盖槽 0”并在日志里可见）。 */
+        slot = 0;
+    }
+
+    b->drop_reply[slot].msgtype  = msgtype;
+    b->drop_reply[slot].node     = (uint16_t)node_id;
+    b->drop_reply[slot].any_node = (node_id == 0u || node_id > 0xFFu) ? 1u : 0u;
+    b->drop_reply[slot].n        = (msgtype == 0u) ? 0u : (n ? n : 1u);
 }
 
 void sim_clear_stats(sim_bus_t *b)

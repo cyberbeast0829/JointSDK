@@ -105,6 +105,11 @@ void jsdk_context_config_default(jsdk_context_config_t *cfg)
     cfg->enable_watchdog_hint   = 0u;   /* 默认：不擅自改客户设备配置 */
     cfg->max_joints             = 0u;
     cfg->rx_burst_limit         = 0u;
+    /* 状态轮询：默认**关闭**（v0.37，阶段 2）—— 不改变任何现有行为 */
+    cfg->state_poll_period_ms   = 0u;
+    cfg->state_poll_timeout_ms  = 0u;   /* 0 = 内置默认 50 ms */
+    cfg->state_poll_fields      = 0u;   /* 0 = POS_VEL | CURRENT */
+    cfg->state_poll_per_cycle   = 0u;   /* 0 = 1 */
 
     cfg->desc.mode                = JSDK_DESC_DYNAMIC;
     cfg->desc.retain              = JSDK_DESC_RETAIN_ALL;
@@ -268,6 +273,11 @@ void jsdk_context_set_fault_callback(jsdk_context_t *ctx,
     if (!jsdk_ctx_check(ctx)) return;
     ctx->fault_cb   = cb;
     ctx->fault_user = user;
+}
+
+uint32_t jsdk_joint_get_stale_ms(const jsdk_joint_t *j)
+{
+    return jsdk_joint_stale_ms(j);
 }
 
 /**
@@ -546,6 +556,7 @@ int jsdk_ctx_handle_frame(jsdk_context_t *ctx, const jsdk_can_frame_t *f)
         if (!j) break;
         if (cb_query_decode_pos_vel(f->data, f->len, &pv) != 0) break;
         jsdk_joint__on_pos_vel_turns(j, pv.pos_turns, pv.vel_turns_per_s);
+        jsdk_state_poll__on_reply(ctx, j, msgtype);   /* 结掉在途请求（调度器关闭时是空操作） */
         return 1;
     }
     case CB_MSG_QUERY_CURRENT: {
@@ -553,6 +564,7 @@ int jsdk_ctx_handle_frame(jsdk_context_t *ctx, const jsdk_can_frame_t *f)
         if (!j) break;
         if (cb_query_decode_current(f->data, f->len, &c) != 0) break;
         jsdk_joint__on_current_a(j, (double)c.iq_a);
+        jsdk_state_poll__on_reply(ctx, j, msgtype);   /* 同上 */
         return 1;
     }
     case CB_MSG_QUERY_TEMPERATURE: {
@@ -683,6 +695,10 @@ jsdk_status_t jsdk_context_cycle_begin(jsdk_context_t *ctx, uint64_t app_time_ns
         jsdk_ctx_seterr(ctx, "HAL recv() reported a link error");
         return JSDK_ERR_TRANSPORT;
     }
+    /* 状态轮询：**收帧之后**才结在途请求（应答通常在本拍刚被收掉），
+       真正的发帧在 `cycle_end()` —— 于是“请求→应答→回填 fb”全落在同一个 tick 内，
+       客户在 `cycle_end()` 之后读 `feedback()` 就是刚回来的帧（详见 jsdk_state_poll.c）。 */
+    jsdk_state_poll__cycle_begin(ctx);
     return JSDK_OK;
 }
 
@@ -694,6 +710,9 @@ jsdk_status_t jsdk_context_cycle_end(jsdk_context_t *ctx)
 
     jsdk_joint__cycle_end_all(ctx);
     jsdk_watchdog__cycle_end(ctx);
+    /* 状态轮询放在最后：控制帧已经发完，本周期还剩下的预算才用来发查询帧 ——
+       这样即使总线被控制帧挤满，控制帧也永远优先（安全优先于观测）。 */
+    jsdk_state_poll__cycle_end(ctx);
 
     ctx->in_cycle = 0u;
     return JSDK_OK;
