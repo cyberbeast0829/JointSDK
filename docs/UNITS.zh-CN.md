@@ -52,7 +52,7 @@
 | `jsdk_joint_set_target_velocity_rad_s(j, r)` | 输出端 rad/s | CSV/VEL：内部换算成 RPM |
 | `jsdk_joint_set_target_torque_Nm(j, Nm)` | **输出端** N·m | CST：内部 `÷ gear_ratio` 后发 `0x03` |
 | `jsdk_joint_set_mit(j, pos, vel, kp, kd, tau)` | 输出端 rad / rad·s⁻¹ / — / — / 输出端 N·m | `kp/kd` 是**线上值**（见 §6） |
-| `jsdk_joint_set_mit_stiffness(j, pos, vel, K, D, tau)` | 输出端 rad、**N·m/rad**、**N·m·s/rad** | 内部 `kp = K × gear`（2026-09-30 更正，原写 `× 2π / gear`） |
+| `jsdk_joint_set_mit_stiffness(j, pos, vel, K, D, tau)` | 输出端 rad、**N·m/rad**、**N·m·s/rad** | 与 `kp/kd` 数值相同（不换算） |
 
 反馈结构体 `jsdk_joint_feedback_t`：
 
@@ -183,30 +183,30 @@ float motor_pos = pos * gear_ratio / (2.0f * M_PI);   // 输出端 rad → 电�
 axis.controller_.input_mit_kp_ = kp;                  // 原样使用
 ```
 
-于是**输出端等效刚度**不是 `kp`：
+于是**输出端等效刚度就等于 `kp`**（不做齿比换算）：
 
 $$
-\text{stiffness}_{\text{out}}\ [\mathrm{N\cdot m/rad}]
-= kp \div \text{gear\_ratio}
+\text{stiffness}_{\text{out}}\ [\mathrm{N\cdot m/rad}] = kp
 $$
 
-### 数字例子（本机 `gear_ratio = 7.75`）
+### 数字例子
 
-| 你给的 `kp` | 实际输出端刚度 | 说明 |
-|---|---|---|
-| 10 | 1.29 N·m/rad | `10 / 7.75` |
-| 100 | 12.9 N·m/rad | `100 / 7.75` |
-| 500 | 64.5 N·m/rad | 手册上限 `mit_max_kp = 500` → 等效仅 64.5 N·m/rad |
+| 你给的 `kp` | 实际输出端刚度 |
+|---|---|
+| 10 | 10 N·m/rad |
+| 100 | 100 N·m/rad |
+| 500 | 500 N·m/rad（即 `mit_max_kp`） |
 
-> ⚠ **2026-09-30 回源更正**：此前写的 $kp\times\text{gear}/(2\pi)$（含"2.63 倍"的所有数字）**是错的**。
-> 按 `controller.cpp:401/415/418/450` 逐行推导（`pos_err` 本身是**电机端 turns**，`:415` 的 `/g*2π`
-> 把它换回输出端 rad），正确系数是 $1/\text{gear}$。数值验证：`kp=100, g=7.75 → K=12.903`。
-> 详见 `FIRMWARE_REPLY_DRAFT.zh-CN.md` §1。
+> ✅ **2026-09-29 真机实测定案**：本节先后写过 $kp\times\text{gear}/(2\pi)$ 与 $kp/\text{gear}$，
+> **两者都被实测推翻**。方法：静态平衡 $e=-\tau_{ff}/K_{out}$，用 MIT 的 `tau_ff` 制造**已知**的
+> 输出端力矩，用 MIT 应答的 `pos`（固件已 `×2π/g` 换成输出端 rad）测偏移。
+> 三组独立测量 $K/kp$ = **1.019 / 1.000 / 1.008** ⇒ $K=kp$。
+> 见 `tools/f1_kp_ratio.py` 与 `src/core/jsdk_units.c`。
 
-> 协议文档（`docs/cyberbeast-protocol.md:353`）把 `KP` 的单位写成 **N·m/rad**，
-> 而实际输出端刚度是 `kp / gear`（本机约 **0.13 倍**）—— 这一条已作为 **F1** 提给固件侧
-> （见 `FIRMWARE_ISSUES.zh-CN.md`），并已澄清固件侧"kp 即输出端刚度"的理解同样不成立。
-> SDK 的处理是**两端都暴露**：`set_mit()` 给"线上 kp"，`set_mit_stiffness()` 给"真实刚度"。
+> 协议文档（`docs/cyberbeast-protocol.md`）把 `KP` 的单位写成 **N·m/rad**，
+> **这与实际行为一致**（我们曾以为不一致，已实测纠正）。
+> SDK 仍**两端都暴露**：`set_mit()` 给"线上 kp"，`set_mit_stiffness()` 给"真实刚度" ——
+> 两者现在数值相同，保留双入口是为了让客户代码的语义清晰。
 
 ### 怎么选
 

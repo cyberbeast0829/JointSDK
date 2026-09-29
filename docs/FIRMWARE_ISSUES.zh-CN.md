@@ -77,7 +77,7 @@
 | # | 严重度 | 位置 | 现状 | 应改为 | 影响 |
 |---|---|---|---|---|---|
 | **F26** | 中 | `docs/cyberbeast-protocol.md:112/124/131/138` | `Dest=0xFF` 被描述为"全局广播（所有设备**响应**/接收）"；`Dest` 语义表未区分"广播类型 / 点对点类型" | 分两句写清：① 对**广播类型**（`MsgType ≥ 0x80`）`0xFF` = 全部 8 位；② 对**点对点类型**（`MsgType < 0x80`）`Dest` 必须等于目标 `node_id`，`0xFF` **无人接收**；③ 广播帧**从不产生响应**（"响应"一词删除） | 客户照文档发 `Dest=0xFF` 的点对点请求会"石沉大海"而查不出原因 |
-| **F1** | **高** | `docs/cyberbeast-protocol.md:353/366` | `KP (刚度) … N·m/rad`；`mit_max_kp = 500 N·m/rad` —— **文档与固件都不成立**。⚠ **2026-09-30 回源更正**：正确关系是 **输出端等效刚度 = `kp / gear_ratio`**（本机 gear 7.75 → **0.129×**）。此前的 `kp × gear_ratio / (2π)`（"≈2.63×"）**偏高 2π 倍**，写错了。推导：`can_cyberbeast.cpp:369-373` 只换算 pos/vel/torque（**kp/kd 原样**）→ `controller.cpp:111-112` `input_pos_=motor_pos`（电机端 turns）→ `:401` `pos_err`=电机端 turns → `:415` `/g*2π` **恰好换回输出端 rad**（2π 被约掉）→ `:418` 得电机端力矩 → `:450` `÷g` 得输出端。数值验证：`kp=100,g=7.75 → K=12.903`。或新增 `mit_kp_unit` 能力标志。**固件工程师曾主张"kp 就是输出端刚度"，同样不成立** | 客户按文档或按"kp 即输出端刚度"标定，都会把刚度设低约 **1/gear**（本机 8 倍）；表现是"关节发软→一路加大 kp→撞 `mit_max_kp=500` 饱和（实际仅 64.5 N·m/rad）"，或反推 kp 超量程被 F16 回绕成**反向满力矩**（**F1+F16 是同一事故的两半**） |
+| **F1** | ~~高~~ **已撤回（我们错了）** | `docs/cyberbeast-protocol.md:353/366` | ✅ **2026-09-29 真机实测定案：`kp` 就是输出端刚度（不被 `gear_ratio` 缩放）—— 固件文档一直是对的，我们两次推导都错。** 我们先后主张 `kp × gear_ratio / (2π)`（偏 2π 倍）与 `kp / gear_ratio`（偏 gear 倍），**两者均被实测推翻**。实测方法：静态平衡 $e=-\tau_{ff}/K_{out}$ ⇒ 斜率 $d(e)/d(\tau_{ff})=1/K_{out}$；用 MIT 的 `tau_ff` 制造已知输出端力矩、用应答 `pos`（固件已 `×2π/g` 换到输出端 rad）测偏移。**三组独立测量 $K/kp$ = 1.019 / 1.000 / 1.008**（tau_ff 扫描 kp=60、kp=120；kd 阻尼 9 点组 kp=60/100）。我们错在**只看 `controller.cpp` 的 `/gear*2π` 与 `/gear`，漏了齿轮箱两端的力矩关系**。见 `tools/f1_kp_ratio.py`、`src/core/jsdk_units.c` | —（无需改动） | ⚠ 该条原先被列为 P1，**现已撤回**；如有客户询问，应回答"kp/kd 即输出端刚度，与文档一致" | SDK 侧已把 `jsdk_units_stiffness_to_kp()`/`jsdk_units_kp_to_stiffness()` 改回**恒等** |
 | **F21** | 中 | `Firmware/docs/cyberbeast-json-descriptor-protocol.md` | 0x24/0x25 是**全量流式**传输（`0x24` 只带 `Offset`，`Firmware/.../can_cyberbeast.cpp:879`–`:893`），文档**没有说明这一点** | 明确写出：设备端**永远全量发送**、无服务端 filter、无"传输完成"信号；客户端若按自己的 filter"凑够就提前停"，必须自行保证不会丢同族路径（前缀/通配 filter 会被**首个**匹配项误判为已满足） | 客户端自行提前终止时会**静默丢字段**，且丢哪些取决于 JSON 字段顺序 → 不同固件版本得到不同的残缺端点表，极难复现 |
 | **F6** | 中 | `docs/cyberbeast-protocol.md`（QUERY_CURRENT 一节） | 第 2 项写作 Id **测量值** | 改为"Id **设定值**"（代码是 `Idq_setpoint_`，见 F6） | 同 F6 |
 | **F23** | 中 | `docs/cyberbeast-protocol.md:156`–`164`、`:982` | 声称接收侧做 Seq 连续性检测、对比表标"丢包检测 ✅" | 与 F23 的实现决定保持一致（实现 or 降级为"保留字段"） | 客户以为有丢包检测，实际没有 || **F27** | 高 | `docs/cyberbeast-protocol.md:45`（P7）、`:326`–`:328`（§4 “约定”） | 文档写“**所有多字节量 Big-Endian**”，而 `PARAM_READ(0x20)`/`PARAM_WRITE(0x21)` 的**值字节实际是小端**（固件把端点内存原样 `memcpy`） | 把字节序约定改成**两张表**：① 帧字段（ID 位域/`ep_id`/`offset`/查询与状态响应/控制帧）**BE**；② **参数值 LE**。或（可选，需改固件）在 `0x20`/`0x21` 里做 `htonl`/`ntohl` 归一 | 任何按文档实现的主站读参数会得到**静默错值**（`node_id: 1 → 16777216`、`gear_ratio: 16.5 → 8.9e-41`），而症状看着像“描述符与固件版本对不上”或“标定值超范围”，极难定位 |
@@ -93,7 +93,7 @@
 
 | # | 严重度 | 需求 | 收益 | SDK 侧应对 |
 |---|---|---|---|---|
-| **F1** | **高** | 统一 `kp/kd` 量纲，或在 JSON 描述符增加 `mit_kp_unit` / `mit_kd_unit` 能力标志 | 消除 §1.2 的歧义，客户调参可预期 | 客户端无法从文档推出 `K = kp/gear`；且需与 **F16** 一起防“反推 kp 超量程→回绕” |
+| **F1** | ~~高~~ **撤回** | （原：统一 kp/kd 量纲 / 增加 `mit_kp_unit`）**无需改动** —— 2026-09-29 真机实测确认 `K_out = kp`，与 `cyberbeast-protocol.md` 一致 | 客户调参已可预期（沿用文档即可） | 无需 SDK 侧换算；`set_mit_stiffness()` 保留为语义入口 |
 | **F2** | 低 | 增加 `protocol_version`（如 `can.config.protocol_version`）或 `capabilities u32` 端点 | 能力发现不再依赖"猜端点 ID + 比版本号"（端点 ID 跨版本漂移率实测 **86%**） | 全动态 JSON 描述符（不依赖任何静态端点表） |
 | **F7** | 中 | 位掩码寻址与 MIT 槽位扩展到 `node_id ≥ 8` | `MAX_BROADCAST_DEVICES = 8`（`can_cyberbeast.hpp:47`）→ 12 自由度机器人**无法一帧广播同步** | `node_id ≥ 8` 时自动降级单播 + `configure()` 提前告警 |
 | **F8** | 中 | 广播帧支持"回复聚合"，或提供一个**广播类型**的状态请求（可分时回复） | 目前广播后完全无反馈；而 `MSG_STATUS_FEEDBACK = 0x49` 是**点对点类型**，无法组播（`is_message_for_me` 对非广播类型要求 `Dest == node_id`） | 广播后不期待反馈；需要反馈时逐个单播 `0x49` |
@@ -423,12 +423,12 @@ $ jsdk-cli --if slcan --channel COM3 --node 1 --json --yes watchdog 250
 | 优先级 | 条目 | 理由 |
 |---|---|---|
 | **P0** | **F19**、**F22（文档部分）** | 安全相关，且改动小：F19 是编码 `is_ctrl` 的一行；F22 先把"0 = 字段最小值""接收端按位图校验"写进文档，成本几乎为零 |
-| **P1** | **F5**、**F16**、**F14**、**F1** | 多轴安全阀、越界飞车、单位差一个齿比、**kp 量纲差一个齿比** —— 都是"正常使用下会出错且难定位"。**F1 与 F16 联动**：按文档标的客户会把刚度设低 1/gear，反推 kp 时又超量程被 F16 回绕成反向满力矩 |
-| **P2** | F11、F12、F13、F15、F6、F23/F18、F26、F21、**F27(文档侧)**、**F28(文档侧)** | 静默错误与文档误导；多数可以只改文档。**F27 优先做**： 只需改协议文档的两张字节序表，就能让所有客户端不再读出静默错值。**F28 紧随其后**：把“`0` = 禁用”与“该端点读不回写入值”写进文档，主站就不会再把“读回 0”误判为「写失败」或「已武装 100 ms」。（**F1 已从 P2 提到 P1**，见上行） |
+| **P1** | **F5**、**F16**、**F14** | 多轴安全阀、越界飞车、单位差一个齿比 —— 都是"正常使用下会出错且难定位"。（**F1 已撤回**，见其条目：真机实测确认 `K_out = kp`） |
+| **P2** | F11、F12、F13、F15、F6、F23/F18、F26、F21、**F27(文档侧)**、**F28(文档侧)** | 静默错误与文档误导；多数可以只改文档。**F27 优先做**： 只需改协议文档的两张字节序表，就能让所有客户端不再读出静默错值。**F28 紧随其后**：把“`0` = 禁用”与“该端点读不回写入值”写进文档，主站就不会再把“读回 0”误判为「写失败」或「已武装 100 ms」。（**F1 已撤回** —— 真机实测确认 `K_out=kp`，无需改动） |
 | **P3** | F17、F20、F24、F25、F2、F7、F8、F9 | 一致性、体验、能力扩展 |
 
 > **改动成本提示**：P0/P1 里真正要改代码的只有 **F19（1 行）、F5（1 个循环）、F16（1 行钳位）**；
-> **F14 / F1** 若选择"只改文档"也可立即消除歧义（把每一帧的端别与 `K = kp/gear` 写成表）。
+> **F14** 若选择"只改文档"也可立即消除歧义（把每一帧的端别写成表）。
 > 其余多数条目"改文档"即可闭环，且能显著减少现场排障时间。
 
 ---
@@ -467,7 +467,7 @@ $ jsdk-cli --if slcan --channel COM3 --node 1 --json --yes watchdog 250
 | F16 | `src/proto_cyberbeast/cb_mit.c`（四舍五入 + 钳位）、`tests/test_group.c`（复刻固件回绕语义的对照用例） |
 | F14 / F15 | `src/core/jsdk_joint.c:651`（发 `0x03` 前 ÷ `gear_ratio`）、`src/core/jsdk_units.c`、`docs/PROTOCOL_NOTES.zh-CN.md` §4.7（逐帧单位表） |
 | F11 | 状态判定改读 `axis0.current_state` 端点，不信任心跳 state |
-| F1 | `jsdk_joint_set_mit_stiffness()`（以**真实输出端刚度**为入参，内部 `kp = stiffness × gear_ratio`）、`include/joint_sdk/joint_sdk.h` 的 `@warning` 给出换算公式（`K = kp/gear`）、`docs/DESIGN.zh-CN.md` §6.2、`docs/UNITS.zh-CN.md` |
+| F1（撤回） | `jsdk_units_stiffness_to_kp()` / `jsdk_units_kp_to_stiffness()` 为**恒等函数**（不做齿比换算）；`tests/test_joint.c` 断言恒等**并断言不等于两个曾被误用的旧公式**；证据 `tools/f1_kp_ratio.py` |
 | F18 | 按 `(SRC, DEST, MsgType)` 匹配响应 |
 | F2 / F3 | 全动态 JSON 描述符解析（`src/proto_cyberbeast/cb_jsondesc_parse.c`） |
 | F9 | 文档写明"0 = 100 ms，不是关闭" |
@@ -493,7 +493,7 @@ $ jsdk-cli --if slcan --channel COM3 --node 1 --json --yes watchdog 250
 
 | 版本 | 日期 | 说明 |
 |---|---|---|
-| v1.4 | 2026-09-30 | **F1 量纲更正 + 升为 P1；F31 拿到铁证；F21 定性为"文档缺警告"**。起因：固件工程师逐条回复了本清单，为核对而**回源** `v4.2.55` (`dbec4aec`)。结果：① **F1 双向误判**——固件方主张"`kp` 就是输出端刚度"，**不成立**（少除 `gear_ratio`）；而我们原写的 `kp × gear_ratio / (2π)` **也不成立**（偏高 `2π` 倍）。逐行追 `can_cyberbeast.cpp:369-373` → `controller.cpp:111-112/266/401/415/418/450` 后，正确关系是 **`K_out = kp / gear_ratio`**，数值验证 `kp=100, g=7.75 → K=12.903`。**F1 严重度 中→高，修复顺序 P2→P1**（本机 `g=7.75` ⇒ 实际刚度仅 kp 的 1/8；客户会"加 kp 到 `mit_max_kp=500` 饱和（实际仅 64.5 N·m/rad）"，或反推 kp 超量程被 F16 回绕成反向满力矩）。② **F31 铁证**——`can_cyberbeast.cpp:161-166` 的堵转/过载判断**整段被注释掉**，故枚举 `0x7`/`0x8` 存在但**永不可返回**，一切落到 `0xF`；定性为**文档待办**（标注不可达），非缺陷。③ **F29 映射部分成立且更严重**——`:142-143` 确认 `ERROR_ESTOP_REQUESTED`（E-STOP 帧）与 `ERROR_CAN_BUS_FAILED`（总线超时）**都**返回 `ERR_CAN_TIMEOUT`；但固件方指出的"0x800 不在映射里"也对，我们已按 `61cf2c5e` 修正过。④ **F21** 定性为"**文档缺一条警告**"（非"文档写错"）：固件仓库确实没有任何"提前终止"实现。⑤ **F19 更正**——`HB_ERR_*` 五位在 `:1327-1331` **全部有写入点**，"漏了 0x04"在当前分支不成立；但 `odrv.error_`（含欠/过压）只压成一位 `HB_ERR_BOARD`，心跳里**无法区分欠压/过压**。⑥ **F14 确认**：`0x00` MIT 的力矩语义是输出端 N·m（`/gear` 与 `×gear` 互逆），`0x03` TORQUE 不换算（电机端），`0x04` CURRENT ×`torque_constant`。产出 `docs/FIRMWARE_REPLY_DRAFT.zh-CN.md`（给固件方的逐条回复，含 5 条待其定性）。**验证**：一键回归 **14/14**；`test_joint` 185 checks / 0 失败。 |
+| v1.5 | 2026-09-29 | **F1 撤回（我们错了）+ 固件 `d10883f5` 修订的真机验证**。① **F1 撤回**：我们此前两次推导都错（先 `kp×g/(2π)`，后 `kp/g`）。真机实测（fw 1546，gear 7.75）用静态平衡 $e=-\tau_{ff}/K$ 测斜率，**三组独立测量 $K/kp$ = 1.019 / 1.000 / 1.008** ⇒ **`K_out = kp`，固件文档一直是对的**。错因：只看 `controller.cpp` 的 `/gear` 而漏了齿轮箱两端力矩关系。SDK 侧函数已改回**恒等**。② **F16 已验证修复**：固件改为 `round+clamp`（`can_mit_codec.hpp`），真机发越界值不再回绕。③ **F11/F12 已验证**：FD 心跳实际 **DLC=11/len=20**（不是声称的 19 —— FD DLC 表无 19 这一档，须填到 20），`buf[18]` = 完整 `current_state_`，vbus/ibus/pos/vel 已钳位。④ **F18 已验证**：响应**原样回显请求 Seq**（乱序 3,2,1,0 与重复 seq 均一致）；SDK 只按 `(msgtype,src,dst)` 配对、从不读 rx seq ⇒ **向后兼容，无需改动**。⑤ **F13 无法在本台验证**：分段写只在 `isClassic && data_len>4` 时进入，而本机 `can.config.baud_rate=5000000` ⇒ `isClassic=false`，走的是普通写路径 ⇒ **该修复只影响 Classic 配置，本台不可达**（代码审查通过）。⑥ **F5 在本台不可观测**：`AXIS_COUNT=1`（`Board/v3/Inc/board.h:24`），只有 axis0。⑦ **F31 仍未修**：堵转/过载判断仍被注释（理由改为 `Motor::ERROR_STALL` 已从枚举移除、无法编译）。**验证**：一键回归 14/14；`test_joint` 185 checks / 0 失败；真机各探针见 `tools/f1_kp_ratio.py`、`tools/f16_fw_probe.py`、`tools/f18_seq_probe.py`、`tools/hb_probe.py`。 |
 | v1.3 | 2026-09-21 | **F9 关闭（已满足）+ F28 重写（严重度中→高）**。用户指出最新固件里 `can.config.break_timeout == 0` 是**禁用**而不是 100 ms；回源复核 `can_cyberbeast.cpp` 确实已改为 `if (timeout_ms == 0) return;`，且 `Config_t::break_timeout` 默认就是 0 ⇒ **设备出厂即无协议超时保护**。据此：① F9 从“能力需求”改为 **✅ 已满足**，SDK 侧同步删掉 `0→100 ms` 归一化；② F28 重写——真机上该端点**写 250 后同进程立刻读仍是 0**（`sdo.data` 证实发出的是 `FA 00`，对照端点 `heartbeat_rate_ms` 正常），即“**武装不了**”，而非之前写的“写入生效但新进程读不到”；③ 新增 `JSDK_JF_WATCHDOG_UNVERIFIED` 位、CLI 的 `device_reports_ms`/`verified` 字段（**独立再读一次设备**，不回显写入值） |
 | v1.2 | 2026-09-20 | 新增 **F28**（`can.config.break_timeout` 读回恒为 0：写入被接受但不保留，导致“写后读回校验”永远失败；`dump-config` 显示 100 而 `read` 显示 0）+ §3.9 详述与真机证据（fw 1545 / COM3）；修复顺序 P2 加入 F28（文档侧优先），§6.2 补 SDK 侧实现与回归用例。同时把 §3.8 的 `fw_version` 参照值从 1544 更新为**当前真机 1545**（字节序结论不变，该字段仍按大端解）。来源：`hw_verify.sh --write-probe` 真机写路径验证 |
 | v1.1 | 2026-09-20 | 新增 **F27**（参数值字节序：文档写“所有多字节量 Big-Endian”，实际 `0x20`/`0x21` 的**值字节是小端**）+ §3.8 详述与真机实测；修复顺序 P2 加入 F27（文档侧优先）。F27 的来源是**真机联调**：`read`/`batch-read` 在 slcan + CANable 上读回错值，回源固件后确认 `endpoint_handler` + `memcpy` 走的是主机序。**固件本身无需修改**（读写自洽），只改文档与客户端适配 |

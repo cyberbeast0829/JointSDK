@@ -255,13 +255,14 @@ jsdk-cli: MIT 将发送 pos=0.1000 vel=0.0000 kp=2.0000 kd=0.2000 tau=0.0000，�
 # 零位置、零增益（最温和的"通电抱持"验证）
 jsdk-cli --if socketcan --channel can0 --node 1 --yes --hold 3 mit --kp 0 --kd 0
 
-# 用"输出端真实刚度"给值（SDK 按 kp = 刚度 × gear 换算）
+# 用"输出端真实刚度"给值（与 --kp 数值等价，只是语义更清楚）
 jsdk-cli --if socketcan --channel can0 --yes --hold 5 mit --pos 0.0 --stiffness 20
 ```
 
-`--kp` 是**线上值、原样透传**；固件把它作用在**输出端 rad 误差**上、且最终扭矩会再
-`÷ gear_ratio`，因此输出端实际刚度 = `kp ÷ gear_ratio`（本机 gear 7.75 时约 0.13 倍）。
-要按真实刚度给值请用 `--stiffness`。（2026-09-30 更正：此前写 `kp × gear / 2π` 偏高 2π 倍。）
+`--kp` 是**线上值、原样透传**；固件把它作用在**输出端 rad 误差**上，
+且**输出端实际刚度就等于 `kp`**（不做齿比换算）。
+要按物理意义（"我要 30 N·m/rad 的刚度"）给值请用 `--stiffness` ——
+两者数值相同。（2026-09-29 真机实测更正：此前先后写过 `kp × gear / 2π` 与 `kp / gear`，均错。）
 
 ---
 

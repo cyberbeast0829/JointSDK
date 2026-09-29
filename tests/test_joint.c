@@ -217,36 +217,38 @@ static void test_units(void)
     CHECK_NEAR(jsdk_units_rpm_to_rad_s(60.0), 2.0 * M_PI, 1e-9);
     CHECK_NEAR(jsdk_units_rpm_to_rad_s(jsdk_units_rad_s_to_rpm(1.234)), 1.234, 1e-12);
 
-    /* kp 量纲修正（§6.2）：刚度_输出端 = kp / gear
+    /* kp 量纲（§6.2）：输出端刚度 = kp —— **不做齿比换算**
      *
-     * 见 docs/FIRMWARE_REPLY_DRAFT.zh-CN.md §1：MIT 入口的 pos 已是电机端 turns，
-     * controller.cpp:415 的 `/gear*2π` 把它换回输出端 rad，故 kp 被 1/gear 缩放。
-     * 历史：这里曾断言 `kp × gear / 2π`（偏高 2π 倍），是错误的。 */
+     * 真机实测（2026-09-29, v4.2.55_fw-v0.6.10）：静态平衡 e = -tau_ff/K，
+     * 斜率 1/K。三组独立测量 K/kp = 1.019 / 1.000 / 1.008 ⇒ K = kp。
+     * 见 tools/f1_kp_ratio.py 与 src/core/jsdk_units.c 的完整说明。
+     * 历史：曾写 `kp*g/(2π)`（偏 2π 倍）、再写 `kp/g`（偏 g 倍），均已推翻。 */
     {
         double gear = 16.5;
         double kp = 500.0;
-        CHECK_NEAR(jsdk_units_kp_to_stiffness(kp, gear), 500.0 / 16.5, 1e-6);
+        /* 恒等：不入齿比 */
+        CHECK_NEAR(jsdk_units_kp_to_stiffness(kp, gear), kp, 1e-9);
+        CHECK_NEAR(jsdk_units_stiffness_to_kp(kp, gear), kp, 1e-9);
+        /* 往返幂等 */
         CHECK_NEAR(jsdk_units_stiffness_to_kp(jsdk_units_kp_to_stiffness(kp, gear), gear),
                    kp, 1e-9);
-        /* 往返幂等（任意齿比） */
         CHECK_NEAR(jsdk_units_kp_to_stiffness(jsdk_units_stiffness_to_kp(37.5, 7.75), 7.75),
                    37.5, 1e-9);
-        /* 文档里的 "1/16.5 ≈ 0.0606 倍" */
-        CHECK_NEAR(jsdk_units_kp_to_stiffness(kp, gear) / kp, 1.0 / 16.5, 1e-6);
-        /* 实测本机 gear=7.75：kp=100 -> 12.903 N·m/rad（数值由固件链路仿真复核） */
-        CHECK_NEAR(jsdk_units_kp_to_stiffness(100.0, 7.75), 100.0 / 7.75, 1e-9);
-        CHECK_NEAR(jsdk_units_kp_to_stiffness(100.0, 7.75), 12.903225806451612, 1e-9);
-        /* 反向：想要 K=500 的输出端刚度，必须给 kp = 500*g（远超 mit_max_kp=500） */
-        CHECK_NEAR(jsdk_units_stiffness_to_kp(500.0, 7.75), 3875.0, 1e-9);
+        /* 比值恒为 1（曾被误认为 1/g = 0.129 或 g/(2π) = 2.626） */
+        CHECK_NEAR(jsdk_units_kp_to_stiffness(kp, gear) / kp, 1.0, 1e-12);
+        CHECK_NEAR(jsdk_units_kp_to_stiffness(100.0, 7.75), 100.0, 1e-12);
+        /* 与"错误的旧式"必须是两个不同的值（防止回归时又写回旧公式） */
+        CHECK(jsdk_units_kp_to_stiffness(kp, gear) != kp * gear / (2.0 * M_PI));
+        CHECK(jsdk_units_kp_to_stiffness(kp, gear) != kp / gear);
     }
-    printf("      gear=16.5: kp=500 -> %.3f N.m/rad (%.4fx the naive reading)\n",
-           jsdk_units_kp_to_stiffness(500.0, 16.5),
-           jsdk_units_kp_to_stiffness(500.0, 16.5) / 500.0);
+    printf("      gear=16.5: kp=500 -> %.3f N.m/rad (即 kp 本身，不做齿比换算)\n",
+           jsdk_units_kp_to_stiffness(500.0, 16.5));
 
     /* 非法齿比：绝不除零，也不"猜 1" */
     CHECK_EQ(jsdk_units_rad_to_turns(1.0, 0.0), 0);
     CHECK_EQ(jsdk_units_turns_to_rad(1.0, -1.0), 0);
-    CHECK_EQ(jsdk_units_stiffness_to_kp(1.0, 0.0), 0);
+    /* kp ↔ 刚度 不做齿比换算，故 gear=0 也返回原值（不再有 0 值契约） */
+    CHECK_NEAR(jsdk_units_stiffness_to_kp(1.0, 0.0), 1.0, 0);
 
     /* jsdk_unit_scale_* */
     {

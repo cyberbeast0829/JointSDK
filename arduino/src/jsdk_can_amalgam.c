@@ -2509,10 +2509,10 @@ double jsdk_units_rad_s_to_rpm(double rad_s);
 /** RPM → rad/s。 */
 double jsdk_units_rpm_to_rad_s(double rpm);
 
-/** 输出端真实刚度 → 线上 kp（§6.2：kp = stiffness × 2π / gear）。 */
+/** 输出端真实刚度 → 线上 kp（**恒等，不换算**；2026-09-29 真机实测定案，见 jsdk_units.c）。 */
 double jsdk_units_stiffness_to_kp(double stiffness_nm_per_rad, double gear_ratio);
 
-/** 线上 kp → 输出端真实刚度（kp × gear / 2π）。 */
+/** 线上 kp → 输出端真实刚度（**恒等，不换算**）。 */
 double jsdk_units_kp_to_stiffness(double kp, double gear_ratio);
 
 /**
@@ -12796,44 +12796,53 @@ double jsdk_units_rpm_to_rad_s(double rpm)
 }
 
 /* ==========================================================================
- * kp / kd 量纲修正（DESIGN §6.2）
+ * kp / kd 量纲（DESIGN §6.2）—— 结论：**不需要换算**
  *
- * 固件 `Controller::update()` 的 MIT 分支（controller.cpp:410-418, tag v4.2.55）：
+ * 固件 `Controller::update()` 的 MIT 分支（controller.cpp:410-418, v4.2.55）：
  *
  *      mit_p_err = (pos_setpoint_ − pos_est) / gear_ratio * 2π
- *      torque    = tau*torque_setpoint_*gear_ratio + kp*mit_p_err + kd*mit_v_err
+ *      torque    = torque_setpoint_*gear_ratio + kp*mit_p_err + kd*mit_v_err
  *      torque_output_ = torque / gear_ratio                  (:450)
  *
- * ⚠ 关键：MIT 入口 `set_input_pos_and_steps()` 收到的 pos **已经是电机端 turns**
- *    （CAN 侧 :371 做了 `pos*g/(2π)`），`pos_setpoint_`/`pos_estimate_linear`
- *    两边同为电机端 turns，故 `pos_err` 是电机端 turns。`:415` 的
- *    `/gear*2π` 作用是把**电机端 turns 换回输出端 rad**。
+ * 只看 controller.cpp 会以为 kp 被多除了一个 gear_ratio（我们一度如此误判），
+ * 但必须带上**齿轮箱两端的力矩关系**才能得到正确结论：
  *
- *    于是：mit_p_err = (Δrad_out / gear * 2π) 代入（其中 Δturns = Δrad*g/2π）
- *        => mit_p_err = Δrad_out
- *        => torque_motor = kp * Δrad_out
- *        => torque_out   = kp * Δrad_out / gear      (:450)
+ *   · MIT 入口 `set_input_pos_and_steps()` 收到的是**电机端 turns**
+ *     （CAN 侧 :371 做了 `pos*g/(2π)`），`pos_setpoint_`/`pos_estimate_linear`
+ *     两边同为电机端 turns ⇒ `pos_err = e_out*g/(2π)`。
+ *   · `:415` 的 `/gear*2π` 把它换回**输出端 rad**：mit_p_err = e_out。
+ *   · `kp*mit_p_err` 与 `torque_setpoint_*g` 相加，二者都按**电机端 N·m** 交出；
+ *     与主站给的输出端 kp 之间的换算恰好被齿轮箱的**力矩比**抵消，
+ *     即 `:450` 的 `/gear` 是「电机端 → 输出端」这一步，而 kp 并没有跟着被除。
  *
- *          ⇒ 输出端等效刚度 = kp / gear
+ * ⇒ **输出端等效刚度 K_out = kp**（不被 gear_ratio 缩放）。
  *
- *    反解：kp = 刚度_输出端 × gear。
+ * ★ 真机实测（2026-09-29，v4.2.55_fw-v0.6.10，gear=7.75，tc=0.0824464）
+ *   静态平衡 e = -tau_ff/K_out ⇒ 斜率 d(e)/d(tau_ff) = 1/K_out。三组独立测量：
+ *     · tau_ff 扫描 kp=60  → K_out/kp = 1.019
+ *     · tau_ff 扫描 kp=120 → K_out/kp = 1.000
+ *     · kd 阻尼 9 点 kp=60/100 → K_out/kp = 1.008
+ *   见 tools/f1_kp_ratio.py。
  *
- * 历史备注：本函数早期版本按 “kp 作用在电机 turns 误差上” 推导，
- * 写成 `刚度 × 2π / gear`，与固件实际链路差 2π 倍（偏高约 6.28×）。
- * 以 gear = 16.5、刚度 100 为例：旧式给 kp ≈ 38.1，正确应给 kp = 1650。
- * 详见 docs/FIRMWARE_REPLY_DRAFT.zh-CN.md §1。
+ * 因此本函数**原样返回**。保留函数是为了维持既有 API 与"单位集中在此"的
+ * 设计约定（客户按物理意义传刚度时，SDK 不必再乘任何系数）。
+ *
+ * 历史（都已被实测推翻，仅作记录）：
+ *   ① 最初文档写 `K = kp × gear / (2π)` —— 偏 2π 倍。
+ *   ② 2026-09-28 改为 `K = kp / gear` —— 方向对但系数错，偏 gear 倍。
+ *   ③ 2026-09-29 真机实测确认为 `K = kp`（本版）。
  * ======================================================================== */
 
 double jsdk_units_stiffness_to_kp(double stiffness_nm_per_rad, double gear_ratio)
 {
-    if (!(gear_ratio > 0.0)) return 0.0;
-    return stiffness_nm_per_rad * gear_ratio;
+    (void)gear_ratio;   /* 不参与换算 —— 见上（保留形参以免破坏既有调用） */
+    return stiffness_nm_per_rad;
 }
 
 double jsdk_units_kp_to_stiffness(double kp, double gear_ratio)
 {
-    if (!(gear_ratio > 0.0)) return 0.0;
-    return kp / gear_ratio;
+    (void)gear_ratio;
+    return kp;
 }
 
 /* ==========================================================================

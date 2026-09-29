@@ -123,7 +123,7 @@ public:
 
     /* --- 控制（周期内调用；不抛异常，错了记在 status_flags 里） --- */
 
-    /** MIT：kp/kd 是**线上值** → 输出端等效刚度 = kp × gear/(2π)，见 set_mit_stiffness()。 */
+    /** MIT：kp/kd 是**线上值** → 输出端等效刚度 = kp（不缩放），见 set_mit_stiffness()。 */
     void set_mit(double pos_rad, double vel_rad_s, double kp, double kd, double tau_Nm) noexcept
     {
         jsdk_joint_set_mit(j_, pos_rad, vel_rad_s, kp, kd, tau_Nm);

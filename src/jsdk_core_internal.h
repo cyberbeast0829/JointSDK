@@ -483,10 +483,10 @@ double jsdk_units_rad_s_to_rpm(double rad_s);
 /** RPM → rad/s。 */
 double jsdk_units_rpm_to_rad_s(double rpm);
 
-/** 输出端真实刚度 → 线上 kp（§6.2：kp = stiffness × 2π / gear）。 */
+/** 输出端真实刚度 → 线上 kp（**恒等，不换算**；2026-09-29 真机实测定案，见 jsdk_units.c）。 */
 double jsdk_units_stiffness_to_kp(double stiffness_nm_per_rad, double gear_ratio);
 
-/** 线上 kp → 输出端真实刚度（kp × gear / 2π）。 */
+/** 线上 kp → 输出端真实刚度（**恒等，不换算**）。 */
 double jsdk_units_kp_to_stiffness(double kp, double gear_ratio);
 
 /**
