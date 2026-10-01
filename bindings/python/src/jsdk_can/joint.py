@@ -524,8 +524,33 @@ class Joint:
         """CST/力矩模式的目标力矩（N·m，输出端）。"""
         self._lib.jsdk_joint_set_target_torque_Nm(self._ptr, float(Nm))
 
+    def set_torque_limit(self, vel_lim_rad_s: float, tau_lim_Nm: float) -> None:
+        """CSP/CSV 的**力矩上限**（推荐）。``tau_lim_Nm`` 是**电机端** N·m。
+
+        ⚠ 别和 ``current_lim``（过流**告警**门限）搞混 —— 它写的是固件的
+        ``motor.config.torque_lim``（正常工作力矩上限）：
+
+        * ``current_lim`` 超了 → ``disarm_with_error(ERROR_CURRENT_LIMIT_VIOLATION)``（**报错失能**）
+        * ``torque_lim`` 超了 → 静默钳位（**不报错**）
+
+        固件在 CSP/CSV 里刻意不动 ``current_lim``（源码注释：“不修改
+        current_lim 避免误触发告警”），所以本调用**不会**改告警门限。
+
+        ⚠ 不调用也行：``configure()`` 会用设备读回的
+        ``current_lim × torque_constant`` 当默认上限。但要**显式**控制力矩时
+        请用本方法（旧 API ``set_limits(vel, A)`` 单位是电机端 A，易误读）。
+        """
+        self._lib.jsdk_joint_set_torque_limit_Nm(
+            self._ptr, float(vel_lim_rad_s), float(tau_lim_Nm))
+
     def set_limits(self, vel_lim_rad_s: float, cur_lim_A: float) -> None:
-        """CSP/CSV/CURRENT 模式的限制量。"""
+        """CSP/CSV/CURRENT 模式的限制量（**旧接口**，参数为电机端 A）。
+
+        .. deprecated::
+            请改用 :meth:`set_torque_limit` —— 本方法的 ``cur_lim_A``
+            其实是「力矩上限 ÷ 力矩常数」，**不是** ``current_lim``
+            （告警门限），名字容易误导。
+        """
         self._lib.jsdk_joint_set_limits(self._ptr, float(vel_lim_rad_s),
                                         float(cur_lim_A))
 

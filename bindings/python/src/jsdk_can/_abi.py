@@ -613,6 +613,7 @@ _FUNCS: dict[str, tuple[list, object]] = {
     "jsdk_joint_set_mit_stiffness": ([c_void_p, c_double, c_double,
                                       c_double, c_double, c_double], None),
     "jsdk_joint_set_limits": ([c_void_p, c_double, c_double], None),
+    "jsdk_joint_set_torque_limit_Nm": ([c_void_p, c_double, c_double], None),
     "jsdk_joint_set_current_A": ([c_void_p, c_double], None),
     "jsdk_joint_set_target_position": ([c_void_p, c_int32], None),
     "jsdk_joint_set_target_velocity": ([c_void_p, c_int32], None),

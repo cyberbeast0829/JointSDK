@@ -114,13 +114,29 @@ typedef struct {
     double kp, kd;         /**< MIT 线上值（原样透传，见 §6.2） */
     double cur_A;          /**< 电机端 A（CURRENT） */
     double vel_lim_rad_s;  /**< POS/VEL 模式的限速（输出端） */
-    double cur_lim_A;      /**< POS/VEL 模式的限流（电机端） */
+
+    /*
+     * POS/VEL 模式写入固件 `motor.config.torque_lim` 的**力矩上限**。
+     *
+     * ⚠ 线上字段（CSP/CSV 的第 5..8 字节）单位是**电机端 A**，但固件
+     *   `cmd_pos_control()` / `cmd_vel_control()` 的用法是
+     *       axis.motor_.config_.torque_lim = cur_limit_a * torque_constant;
+     *   也就是说它设的是 **torque_lim（正常工作力矩上限）**，而**不是**
+     *   `current_lim`（那是过流告警门限，`Itrip = current_lim + margin`，
+     *   超了会 `disarm_with_error(ERROR_CURRENT_LIMIT_VIOLATION)`）。
+     *   固件源码里明确写了“不修改 current_lim 避免误触发告警”。
+     *
+     * 内部统一存 **N·m**（`tau_lim_Nm`）；只有编码线上帧时才除以
+     * `torque_constant` 换成 A。语义与单位不再混用。
+     */
+    double tau_lim_Nm;     /**< POS/VEL 模式的**力矩上限**（电机端 N·m） */
 
     uint8_t have_pos;      /**< set_target_position_rad / set_mit 调用过 */
     uint8_t have_vel;
     uint8_t have_tau;
     uint8_t have_mit;      /**< set_mit / set_mit_stiffness 调用过 */
     uint8_t have_cur;
+    uint8_t have_limits;   /**< set_limits / set_torque_limit_Nm 调用过 */
     uint8_t have_raw_pos;  /**< set_target_position(raw) 调用过：原样透传 */
     uint8_t have_raw_vel;
     uint8_t have_raw_tau;
@@ -166,13 +182,28 @@ struct jsdk_joint {
     uint16_t ep_gear_ratio, ep_torque_constant;
     uint16_t ep_mit_pos, ep_mit_vel, ep_mit_tau, ep_mit_kp, ep_mit_kd;
     uint16_t ep_requested_state, ep_current_state, ep_node_id, ep_break_timeout;
+    uint16_t ep_current_lim;      /**< axis0.motor.config.current_lim（可选） */
 
     /* ---- 设备侧配置读回 ---- */
-    uint32_t break_timeout_ms;    /**< can.config.break_timeout；**0 = 设备侧超时检测已禁用** */
+    uint32_t break_timeout_ms;    /**< can.config.break_timeout；**0 = 设备侧超 时检测已禁用** */
     uint32_t node_id_readback;    /**< axis0.config.can.node_id */
-    uint32_t heartbeat_rate_ms;   /**< axis0.config.can.heartbeat_rate_ms（0 = 设备不发心跳） */
+    uint32_t heartbeat_rate_ms;   /**< axis0.config.can.heartbeat_rate_ms（0 =  设备不发心跳） */
     uint8_t  current_state_raw;   /**< axis0.current_state（固件 AxisState 0..16） */
     uint8_t  state_known;         /**< 1 = 至少读到过一次 current_state */
+
+    /*
+     * POS/VEL 模式「力矩上限」的**默认值**（电机端 N·m）。
+     *
+     * 取自设备 `axis0.motor.config.current_lim × torque_constant`。
+     * 为什么用 current_lim 当默认：它是设备的“额定/告警”电流，乘力矩常数就是
+     * 设备**推荐的正常力矩上限**（真机 40 A × 0.0864797 ≈ 3.459 N·m）。
+     * 这样客户不调 set_limits()/set_torque_limit_Nm() 也能正常工作 ——
+     * 之前 `tau_lim_Nm` 留在 0，CSP/CSV 帧会把固件 `torque_lim` 打成 0，
+     * 电流环不出力而**没有任何报错**，表现为“使能成功但电机不转”的假死。
+     *
+     * 读不到时为 0；此时**不**在帧里写 0（见 send_one_frame 的守卫）。
+     */
+    double   tau_lim_default_Nm;
 
     /* ---- 目标 ---- */
     jsdk_target_t tgt;

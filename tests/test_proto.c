@@ -609,6 +609,68 @@ static void test_heartbeat(void)
         /* 最大 4 bit 状态仍可表达 */
         CHECK_EQ(cb_heartbeat_make_state_mode(15u, 0u), 0xF0);
     }
+
+    /* ===== 回归：F32 —— FD 心跳 pos/vel 量程必须按**原始计数域**钳位 =====
+     *
+     * 固件曾把 FD 的 pos/vel 钳在 ±214748.0f（**物理量域**的 214748 turns，
+     * 因为源码里写成 `214748.0f` 当"原始计数上界"）而不是 ±2^31（原始计数域）。
+     * 后果：电机端位置一旦超过 214748/10000 = 21.4748 turns，心跳 pos 就静默
+     * 饱和到 214748（0x000346DC）—— 21.47 turns 只是 int32 满量程的 **0.01%**，
+     * 对 7.75 齿比的关节也就不到 3 圈输出端，属于必现区间。
+     *
+     * 固件 2f72ea09 用 `scale_clamped()` 根治。SDK 侧是**忠实解码**，本不该
+     * 受影响；但此前的黄金向量只到 214748.0 turns（0x7FFFF1C0），恰好**避开**
+     * 了 (214748.0, 214748.3648] 这段"旧 bug 判别区"，等于没有覆盖 ——
+     * 这正是 F32 能静默溜进固件的原因之一。下面把该区间的边界钉死。
+     */
+    {
+        cb_heartbeat_t o;
+        uint8_t b[18];
+        unsigned k;
+
+        /* 1) 21.4748 turns —— 旧 bug 的触发阈值，必须能正常解出，不得饱和 */
+        for (k = 0u; k < 18u; ++k) b[k] = 0u;
+        {
+            /* raw = 214748 = 0x000346DC（旧 bug 的饱和值） */
+            b[8] = 0x00u; b[9] = 0x03u; b[10] = 0x46u; b[11] = 0xDCu;
+            CHECK_EQ(cb_heartbeat_decode(b, 18, &o), 0);
+            CHECK_FEQ(o.pos_turns, 21.4748f);
+        }
+
+        /* 2) 214748.0 turns（旧黄金向量的值）—— 旧 bug 恰好还能正确表达 */
+        for (k = 0u; k < 18u; ++k) b[k] = 0u;
+        b[8] = 0x7Fu; b[9] = 0xFFu; b[10] = 0xF1u; b[11] = 0xC0u;
+        CHECK_EQ(cb_heartbeat_decode(b, 18, &o), 0);
+        CHECK_FEQ(o.pos_turns, 214748.0f);
+
+        /* 3) INT32_MAX（214748.3647 turns）—— **旧 bug 判别区**的核心：
+              旧实现把上界当 214748.0，本值会被钳到 214748.0；正确满量程是
+              214748.3648 turns，故这里必须解出 > 214748.0，而不是等于它。 */
+        for (k = 0u; k < 18u; ++k) b[k] = 0u;
+        b[8] = 0x7Fu; b[9] = 0xFFu; b[10] = 0xFFu; b[11] = 0xFFu;
+        CHECK_EQ(cb_heartbeat_decode(b, 18, &o), 0);
+        CHECK(o.pos_turns > 214748.0f);
+        CHECK(o.pos_turns < 214748.5f);
+
+        /* 4) 正满量程 2^31 会被固件钳到 INT32_MAX（见 can_heartbeat_codec.hpp
+              的 kInt32RawLimit 说明）—— 这里按 INT32_MIN 解释，只要求可解不崩 */
+        for (k = 0u; k < 18u; ++k) b[k] = 0u;
+        b[8] = 0x80u; b[9] = 0x00u; b[10] = 0x00u; b[11] = 0x00u;
+        CHECK_EQ(cb_heartbeat_decode(b, 18, &o), 0);
+
+        /* 5) vel 走同一量程，同样不得在 21.4748 turns/s 处饱和 */
+        for (k = 0u; k < 18u; ++k) b[k] = 0u;
+        b[12] = 0x7Fu; b[13] = 0xFFu; b[14] = 0xFFu; b[15] = 0xFFu;
+        CHECK_EQ(cb_heartbeat_decode(b, 18, &o), 0);
+        CHECK(o.vel_turns_per_s > 214748.0f);
+
+        /* 6) 负向对照：证明上面的判别式**真能**区分旧/新行为。
+              若实现退化成"钳在 ±214748.0"，第 3 条会变成 == 214748.0 而红。 */
+        for (k = 0u; k < 18u; ++k) b[k] = 0u;
+        b[8] = 0x7Fu; b[9] = 0xFFu; b[10] = 0xFFu; b[11] = 0xFFu;
+        CHECK_EQ(cb_heartbeat_decode(b, 18, &o), 0);
+        CHECK(fabsf(o.pos_turns - 214748.0f) > 0.1f);
+    }
 }
 
 /* ==========================================================================

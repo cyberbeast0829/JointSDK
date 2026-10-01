@@ -589,6 +589,71 @@ static void test_enable_modes_disable(void)
         printf("      CSV: vel=%.3f rpm  cur_lim=%.2f A\n", vel_rpm, cur_a);
     }
 
+    /* ---- 新 API：set_torque_limit_Nm 以【N·m】给，线上仍是 A ---- */
+    {
+        jsdk_can_frame_t f;
+        float vel_rpm = 0, cur_a = 0;
+        double tconst = fx.j->torque_constant;
+
+        CHECK(tconst > 0.0);
+        jsdk_joint_set_mode(fx.j, JSDK_MODE_CSV);
+        jsdk_joint_set_target_velocity_rad_s(fx.j, 0.0);
+        jsdk_joint_set_torque_limit_Nm(fx.j, 0.0, 2.0);         /* 2 N·m */
+        drain_tx(&fx);
+        fx_cycle(&fx);
+
+        CHECK_EQ(saw_msgtype(&fx, CB_MSG_VEL_CONTROL, &f), 1);
+        CHECK_EQ(cb_ctrl_vel_unpack(f.data, f.len, &vel_rpm, &cur_a), 0);
+        /* 2 N·m / torque_constant = 线上 A；再乘回去必须回到 2 N·m */
+        CHECK_NEAR(cur_a * tconst, 2.0, 1e-6);
+        printf("      set_torque_limit_Nm(2.0 N·m) -> wire %.4f A "
+               "(tconst=%.4f)\n", cur_a, tconst);
+    }
+
+    /* ---- ⚠ 核心安全性质：力矩上限**永不**被发成 0 A ----
+           固件每收一帧 CSP/CSV 都会 `torque_lim = cur_limit_a * torque_constant`。
+           若发 0，`torque_lim` 就变 0，电流环不出力**且不报任何错** ——
+           现场表现为“使能成功却转不动”（真机实测过的静默陷阱）。
+           故：客户从未设置时，必须用 configure() 读回的默认值兜底。 */
+    {
+        jsdk_can_frame_t f;
+        float vel_rpm = 0, cur_a = 0;
+
+        /* 造一个“客户从未调过 set_limits/set_torque_limit_Nm”的关节：
+           直接清掉 have_limits 并把上限归 0，模拟客户漏调。 */
+        fx.j->tgt.tau_lim_Nm  = 0.0;
+        fx.j->tgt.have_limits = 0u;
+
+        jsdk_joint_set_mode(fx.j, JSDK_MODE_CSV);
+        jsdk_joint_set_target_velocity_rad_s(fx.j, M_PI / 6.0);
+        drain_tx(&fx);
+        fx_cycle(&fx);
+
+        CHECK_EQ(saw_msgtype(&fx, CB_MSG_VEL_CONTROL, &f), 1);
+        CHECK_EQ(cb_ctrl_vel_unpack(f.data, f.len, &vel_rpm, &cur_a), 0);
+        CHECK(cur_a > 0.0f);                    /* ← 绝不能是 0 */
+        printf("      漏调 set_torque_limit_Nm -> wire %.4f A（**必须 >0**）\n",
+               cur_a);
+
+        /* 同一性质也要在 CSP 上成立 */
+        jsdk_joint_set_mode(fx.j, JSDK_MODE_CSP);
+        jsdk_joint_set_target_position_rad(fx.j, 0.1);
+        drain_tx(&fx);
+        fx_cycle(&fx);
+        CHECK_EQ(saw_msgtype(&fx, CB_MSG_POS_CONTROL, &f), 1);
+        CHECK_EQ(cb_ctrl_pos_unpack(f.data, f.len, 0, NULL, NULL, &cur_a), 0);
+        CHECK(cur_a > 0.0f);                    /* ← 同样不能是 0 */
+
+        /* 有默认值时**不应**置 JSDK_JF_TORQUE_LIM_UNSET（fixture 有 current_lim） */
+        if (fx.j->tau_lim_default_Nm > 0.0) {
+            CHECK(!(fx.j->status_flags & JSDK_JF_TORQUE_LIM_UNSET));
+            printf("      default from current_lim: %.4f N·m（未置 UNSET 标志）\n",
+                   fx.j->tau_lim_default_Nm);
+        } else {
+            CHECK(fx.j->status_flags & JSDK_JF_TORQUE_LIM_UNSET);
+        }
+    }
+
     /* ---- CST：**输出端** N·m → 线上【电机端】N·m（除以 gear） ---- */
     {
         jsdk_can_frame_t f;
@@ -998,6 +1063,85 @@ static void test_cache_roundtrip(void)
     fx_down(&fx);
 }
 
+/* ==========================================================================
+ * can_state 取自心跳（F32 验证期间发现的陈旧 bug）
+ * ======================================================================== */
+
+/**
+ * 回归：`jsdk_joint_get_can_state()` 必须跟随设备**真实**的 AxisState。
+ *
+ * 现场症状（真机 fw 1547 实测）：`activate()` 之后关节已在闭环
+ * （心跳 byte[1] 高 4 bit = 8、byte[18] state_full = 8），
+ * 但 `jsdk_joint_get_can_state()` 仍报 **1（IDLE）** —— 因为
+ * `jsdk_joint__on_heartbeat()` 解出了 `hb.state` 却**没有写回**
+ * `current_state_raw`，而后者只在 `configure()` 时读一次
+ * （那一刻通常是 IDLE=1），此后再也不更新。
+ *
+ * 后果不是"显示不好看"：客户按 can_state 判断是否已使能会得到错误结论，
+ * 与 `is_enabled()` / `mode_state()` 自相矛盾。
+ *
+ * 本测试直接驱动 `jsdk_joint__on_heartbeat()`，不依赖虚拟 HAL 的心跳节奏，
+ * 保证"心跳 → can_state"这条链被钉住。
+ */
+static void test_can_state_follows_heartbeat(void)
+{
+    fix_t fx;
+    uint8_t hb[CB_HB_LEN_FD];
+    unsigned k;
+
+    printf("[8] can_state follows heartbeat (F32 侧发现)\n");
+
+    if (fx_up(&fx, "0:id=1,gear=7.75,tconst=0.0824464,pmax=12.5,vmax=65,tmax=50,"
+                   "kpmax=500,kdmax=5,hb=10,fd") != 0) {
+        printf("      FATAL: fixture setup failed\n");
+        g_fail++; g_checks++;
+        return;
+    }
+
+    /* configure() 期间读到的是 IDLE（固件：AXIS_STATE_IDLE = 1） */
+    printf("      after configure: can_state=%d\n", jsdk_joint_get_can_state(fx.j));
+
+    /* --- 1. 心跳报 IDLE(=1) → can_state 必须是 1（不得是 -1 或别的） --- */
+    for (k = 0u; k < CB_HB_LEN_FD; ++k) hb[k] = 0u;
+    hb[1] = (uint8_t)(((1u & 0x0Fu) << 4) | 3u);      /* state=1(IDLE), ctrl=POSITION */
+    jsdk_joint__on_heartbeat(fx.j, hb, CB_HB_LEN_FD);
+    CHECK_EQ(jsdk_joint_get_can_state(fx.j), 1);
+
+    /* --- 2. 心跳报 CLOSED_LOOP(=8) → can_state 必须**立刻**变成 8 ---
+           这正是真机上没发生的事（旧实现永远停在 1）。 */
+    hb[1] = (uint8_t)(((8u & 0x0Fu) << 4) | 3u);      /* state=8, ctrl=POSITION */
+    jsdk_joint__on_heartbeat(fx.j, hb, CB_HB_LEN_FD);
+    CHECK_EQ(jsdk_joint_get_can_state(fx.j), 8);
+    printf("      heartbeat state=8 -> can_state=%d  （旧实现恒为 1）\n",
+           jsdk_joint_get_can_state(fx.j));
+
+    /* --- 3. 回到 IDLE 也必须跟回去（不是单向锁存） --- */
+    hb[1] = (uint8_t)(((1u & 0x0Fu) << 4) | 3u);
+    jsdk_joint__on_heartbeat(fx.j, hb, CB_HB_LEN_FD);
+    CHECK_EQ(jsdk_joint_get_can_state(fx.j), 1);
+
+    /* --- 4. 每个可表达的状态值都能透传（4 bit，0..15） --- */
+    for (k = 0u; k <= 15u; ++k) {
+        hb[1] = (uint8_t)(((k & 0x0Fu) << 4) | 3u);
+        jsdk_joint__on_heartbeat(fx.j, hb, CB_HB_LEN_FD);
+        CHECK_EQ(jsdk_joint_get_can_state(fx.j), (int)k);
+    }
+
+    /* --- 5. 与 mode_state 不矛盾：state=8 时 axis_state 必须反映"已使能" ---
+           这是客户真正会看的两个量，不能再互相打架。 */
+    hb[1] = (uint8_t)(((8u & 0x0Fu) << 4) | 3u);
+    jsdk_joint__on_heartbeat(fx.j, hb, CB_HB_LEN_FD);
+    CHECK_EQ(jsdk_joint_get_can_state(fx.j), 8);
+    printf("      can_state=%d axis_state=%s\n",
+           jsdk_joint_get_can_state(fx.j),
+           jsdk_axis_state_string(fx.j->fb.axis_state));
+
+    /* --- 6. 9..15 是子状态，不影响 state_known（曾经如果没写回，-1 会一直返回） --- */
+    CHECK(jsdk_joint_get_can_state(fx.j) != -1);
+
+    fx_down(&fx);
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -1017,6 +1161,7 @@ int main(void)
     test_target_rejection();   printf("\n");
     test_watchdog();           printf("\n");
     test_cache_roundtrip();    printf("\n");
+    test_can_state_follows_heartbeat(); printf("\n");
 
     free(g_json);
 

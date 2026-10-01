@@ -196,6 +196,37 @@ def test_mode_state_and_can_state_are_different_enums(ctx_enabled):
     assert isinstance(j.can_state(), int)
 
 
+def test_set_torque_limit_accepts_nm(ctx_enabled):
+    """新 API 以 N·m 给；SDK 内部除以 torque_constant 换成线上 A。
+
+    ⚠ 它写的是固件 `torque_lim`（**力矩上限**），不是 `current_lim`
+    （过流**告警**门限）—— 详见 UNITS §2.1。
+    """
+    ctx, j = ctx_enabled
+    j.set_mode(Mode.CSV)
+    j.set_torque_limit(2.0, 1.5)          # 1.5 N·m
+    j.set_velocity(0.0)
+    for _ in range(10):
+        ctx.cycle_begin()
+        ctx.cycle_end()
+    # 只要没崩、且帧确实发出去了，就说明新入口通了（数值断言在 C 侧）
+    assert j.feedback().tx_frames > 0
+    assert not (j.feedback().status_flags & 0x0080), \
+        "fixture 有 current_lim，默认值应生效，不该置 JSDK_JF_TORQUE_LIM_UNSET"
+
+
+def test_legacy_set_limits_still_works(ctx_enabled):
+    """旧入口（电机端 A）必须继续可用 —— 兼容性契约。"""
+    ctx, j = ctx_enabled
+    j.set_mode(Mode.CSV)
+    j.set_limits(1.0, 5.0)
+    j.set_velocity(0.0)
+    for _ in range(10):
+        ctx.cycle_begin()
+        ctx.cycle_end()
+    assert j.feedback().tx_frames > 0
+
+
 # ==========================================================================
 # 参数
 # ==========================================================================

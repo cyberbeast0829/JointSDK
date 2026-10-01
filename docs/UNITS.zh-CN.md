@@ -31,8 +31,8 @@
 |---|---|---|---|---|
 | `MIT_CONTROL (0x00)` | **输出端** rad | **输出端** rad/s | 力矩 **输出端** N·m | `× gear/2π`、`÷ gear`（`mit_control_cmd()`） |
 | `MIT` 响应（含 0x40 与所有控制帧的应答） | **输出端** rad | **输出端** rad/s | 电流 **电机端** A | `× 2π/gear`（`send_mit_response()`） |
-| `POS_CONTROL (0x01)` | **输出端** 度 | **输出端** RPM | 电流限制 **电机端** A | 见 `cmd_pos_control()` |
-| `VEL_CONTROL (0x02)` | — | **输出端** RPM | 电流限制 **电机端** A | 见 `cmd_vel_control()` |
+| `POS_CONTROL (0x01)` | **输出端** 度 | **输出端** RPM | **力矩上限**（线上以**电机端** A 表达）⚠ | 见下方 §2.1 与 `cmd_pos_control()` |
+| `VEL_CONTROL (0x02)` | — | **输出端** RPM | **力矩上限**（线上以**电机端** A 表达）⚠ | 见下方 §2.1 与 `cmd_vel_control()` |
 | `TORQUE_CONTROL (0x03)` | — | — | 力矩 **电机端** N·m ⚠ | **不换算**（`input_torque_ = 原值`） |
 | `CURRENT_CONTROL (0x04)` | — | — | 电流 **电机端** A（内部 `× torque_constant`） | 见 `cmd_current_control()` |
 | `QUERY_POS_VEL (0x41)` | **电机端** turns | **电机端** turns/s | — | 直接透传估算器值 |
@@ -41,6 +41,41 @@
 > ⚠ `TORQUE_CONTROL(0x03)` 是**唯一**端别与 MIT 相反的力矩帧。同一数值 `10`
 > 在 MIT 下是"输出端 10 N·m"，在 `0x03` 下是"电机端 10 N·m" —— 对 gear=16.5 的设备，
 > 实际输出差 **16.5 倍**。详见 `FIRMWARE_ISSUES.zh-CN.md` 的 F14。
+
+---
+
+### 2.1 ⚠ CSP/CSV 的那个字段是「力矩上限」，不是「过流告警门限」
+
+设备里有两个长得很像、**作用完全不同**的上限（真机核实）：
+
+| 设备参数 | 作用 | 越界后果 |
+|---|---|---|
+| `motor.config.current_lim` | **过流告警门限**：`Itrip = current_lim + current_lim_margin` | **`disarm_with_error(ERROR_CURRENT_LIMIT_VIOLATION)`** —— 报错并失能 |
+| `motor.config.torque_lim` | **正常工作力矩上限**：`max_torque = clamp(电流限值 × torque_constant, 0, torque_lim)` | 静默钳位，**不报错** |
+
+CSP/CSV 帧的第 5..8 字节在线上**以电机端 A 为单位**，但固件的用法是：
+
+```cpp
+// cmd_pos_control() / cmd_vel_control()
+axis.motor_.config_.torque_lim = cur_limit_a * axis.motor_.config_.torque_constant;  // A → N·m
+```
+
+即它设的是 **`torque_lim`（力矩上限）**。固件源码注释明确写着
+「**不修改 current_lim 避免误触发告警**」，所以这两个概念**不能混为一谈**：
+客户的 `current_lim` 本来就应当**大于** `torque_lim / torque_constant`。
+
+**SDK 侧对应关系：**
+
+| SDK API | 参数单位 | 写入的设备参数 |
+|---|---|---|
+| `jsdk_joint_set_torque_limit_Nm(j, vel_lim, tau_Nm)` ← **推荐** | **电机端 N·m** | `torque_lim` |
+| `jsdk_joint_set_limits(j, vel_lim, cur_lim_A)`（deprecated） | 电机端 A（线上原值） | `torque_lim` |
+
+**⚠ 静默陷阱**：固件对每帧 CSP/CSV 都**无条件覆盖** `torque_lim`。若这个值发成
+`0`，`torque_lim` 就变 0 ⇒ 电流环被钳到 0 ⇒ **电机不出力，但 `is_enabled()`
+仍为 1、无 fault、`tx_rejected == 0`**，现场表现为“使能成功却完全不转”。
+为避免这个坑，`configure()` 会用设备读回的
+`current_lim × torque_constant` 作为**默认上限**（不调上面两个 API 也能工作）。
 
 ---
 

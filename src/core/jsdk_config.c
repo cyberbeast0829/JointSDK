@@ -18,6 +18,7 @@
 
 #define P_GEAR        "axis0.motor.config.gear_ratio"
 #define P_TCONST      "axis0.motor.config.torque_constant"
+#define P_CURLIM      "axis0.motor.config.current_lim"
 #define P_MIT_POS     "axis0.controller.config.mit_max_pos"
 #define P_MIT_VEL     "axis0.controller.config.mit_max_vel"
 #define P_MIT_TAU     "axis0.controller.config.mit_max_torque"
@@ -437,6 +438,7 @@ static jsdk_status_t calibrate_joint(jsdk_context_t *ctx, jsdk_joint_t *j)
     (void)resolve_ep(ctx, P_CURRENT_ST, &j->ep_current_state, NULL, NULL);
     (void)resolve_ep(ctx, P_NODE_ID,    &j->ep_node_id, NULL, NULL);
     (void)resolve_ep(ctx, P_BREAK,      &j->ep_break_timeout, NULL, NULL);
+    (void)resolve_ep(ctx, P_CURLIM,     &j->ep_current_lim, NULL, NULL);
 
     /* --- 2. 读回标定值（客户端显式给的非 0 值优先，便于离线/异常固件兜底） --- */
     if (j->cfg.gear_ratio != 0.0f) {
@@ -451,6 +453,31 @@ static jsdk_status_t calibrate_joint(jsdk_context_t *ctx, jsdk_joint_t *j)
                         &j->torque_constant) != 0) {
         jsdk_joint_seterr(j, "read %s failed", P_TCONST);
         return JSDK_ERR_TRANSPORT;
+    }
+
+    /*
+     * POS/VEL 「力矩上限」的**默认值** = 设备的额定电流 × 力矩常数。
+     *
+     * 为什么必须给默认值：CSP/CSV 帧里的那个字段会**无条件覆盖**固件
+     * `motor.config.torque_lim`（`torque_lim = cur_limit × torque_constant`）。
+     * 客户若不调 `set_torque_limit_Nm()`，`tgt.tau_lim_Nm` 就是 0，于是每帧
+     * 都写 `torque_lim = 0` ⇒ 电流环钳到 0 ⇒ **电机不出力且不报任何错**
+     * （`is_enabled()` 仍为 1、无 fault），现场表现为“使能成功却转不动”。
+     *
+     * 取 `current_lim`（而不是 `current_lim / 2` 之类）是因为它本身就是设备的
+     * “额定/告警”电流：真机 40 A × 0.0864797 ≈ 3.459 N·m。它比固件自带的
+     * `torque_lim` 默认（2.58 N·m，见 `motor.hpp`）略大，属于合理的工作区间。
+     *
+     * 端点缺失/读失败**不阻塞 configure** —— 只是没有默认值，届时由
+     * `jsdk_joint__tau_lim_to_wire_a()` 兑底并置 `JSDK_JF_TORQUE_LIM_UNSET`。
+     */
+    j->tau_lim_default_Nm = 0.0;
+    if (j->ep_current_lim != 0u) {
+        float cur_lim_a = 0.0f;
+        if (read_f32(ctx, j->cfg.node_id, j->ep_current_lim, &cur_lim_a) == 0
+            && cur_lim_a > 0.0f && j->torque_constant > 0.0) {
+            j->tau_lim_default_Nm = (double)cur_lim_a * j->torque_constant;
+        }
     }
 
     if (j->cfg.mit_max_pos != 0.0f)        j->range.pos_max = j->cfg.mit_max_pos;

@@ -236,10 +236,24 @@ void jsdk_joint__on_heartbeat(jsdk_joint_t *j, const uint8_t *data, uint8_t len)
         j->fb.vbus_V = (double)hb.vbus_v;
         j->fb.ibus_A = (double)hb.ibus_a;
     }
-    if (hb.control_mode <= (uint8_t)CB_HB_CM_POSITION) {
-        /* 心跳的 control_mode 只有 4 个值，粒度比 ModeState 粗；
-           仅在还没有 ModeState 时用它粗略同步 */
-        if (!j->fb.online) { /* 保留：不做更细映射，避免误判模式 */ }
+
+    /*
+     * 心跳 byte[1] 的高 4 bit **就是** `axis.current_state_`（固件
+     * `send_heartbeat()` 用 `(state << 4) | control_mode` 打包），所以心跳是
+     * **不需要额外请求**就能拿到设备真实 AxisState 的低成本通道。
+     *
+     * ⚠ 以前这里不写回 `current_state_raw`，于是 `jsdk_joint_get_can_state()`
+     *   只在 `configure()` 时读到一次（那一刻通常是 IDLE=1）就**永远停在 1** ——
+     *   实测：`activate()` 后关节已在闭环（心跳 state=8），而 `can_state()` 仍报 1。
+     *   这不只是显示问题：客户按 `can_state()` 判断"是否已使能"会得到错误结论，
+     *   与 `is_enabled()`/`mode_state()` 互相矛盾。
+     *
+     * 只在**状态真的变了**时才更新，避免把 `state_known`/seq 相关的语义搅乱；
+     * 标定/回零期间的 `read_current_state()` 轮询仍是更权威的来源，会被它覆盖。
+     */
+    if (j->current_state_raw != hb.state) {
+        j->current_state_raw = hb.state;
+        j->state_known = 1u;
     }
 
     touch_feedback(j, j->ctx ? j->ctx->now_ms : 0u);
@@ -497,7 +511,33 @@ void jsdk_joint_set_limits(jsdk_joint_t *j, double vel_lim_rad_s, double cur_lim
 {
     if (!jsdk_joint_check(j)) return;
     j->tgt.vel_lim_rad_s = vel_lim_rad_s;
-    j->tgt.cur_lim_A     = cur_lim_A;
+    j->tgt.have_limits    = 1u;
+
+    /*
+     * 兼容入口：旧 API 给的是**电机端 A**，这里换算成力矩上限（N·m）存起来。
+     *
+     * ⚠ 线上字段确实是 A（固件：`torque_lim = cur_limit_a * torque_constant`），
+     *   但它设的是**torque_lim（正常工作力矩上限）**，**不是** `current_lim`
+     *   （过流告警门限）。旧名字 `cur_lim_A` 容易让人以为在改告警门限 ——
+     *   新代码请用 `jsdk_joint_set_torque_limit_Nm()`，量纲与语义都不用猜。
+     */
+    if (j->torque_constant > 0.0) {
+        j->tgt.tau_lim_Nm = cur_lim_A * j->torque_constant;
+    } else {
+        /* 还没标定出 torque_constant：先原样存 A，等标定完再换算是不可以的
+           （会静默错量纲），所以这里只记下“客户显式给过 A”并用 0 占位，
+           由 configure() 之后的默认值兵底。 */
+        j->tgt.tau_lim_Nm = 0.0;
+    }
+}
+
+void jsdk_joint_set_torque_limit_Nm(jsdk_joint_t *j, double vel_lim_rad_s,
+                                    double tau_lim_Nm)
+{
+    if (!jsdk_joint_check(j)) return;
+    j->tgt.vel_lim_rad_s = vel_lim_rad_s;
+    j->tgt.tau_lim_Nm    = tau_lim_Nm;
+    j->tgt.have_limits    = 1u;
 }
 
 void jsdk_joint_set_current_A(jsdk_joint_t *j, double amp)
@@ -565,6 +605,43 @@ void jsdk_joint_hold_position_pd(jsdk_joint_t *j, double kp, double kd)
 static int mode_feeds_watchdog(uint8_t msgtype)
 {
     return jsdk_msgtype_feeds_watchdog(msgtype);
+}
+
+/**
+ * POS/VEL 帧里那个「限流」字段要填的**电机端 A**。
+ *
+ * 线上确实以 A 为单位（固件：`torque_lim = cur_limit_a * torque_constant`），
+ * 但它驱动的是固件 `motor.config.torque_lim`（**正常工作力矩上限**），
+ * **不是** `current_lim`（过流告警门限）。所以这里从 `tau_lim_Nm` 反推 A。
+ *
+ * ⚠ 必须保证**永不为 0**（除非设备真的禁用了力矩）。
+ *   固件每收到一帧 CSP/CSV 都会**无条件覆盖** `torque_lim`：
+ *       axis.motor_.config_.torque_lim = cur_limit_a * torque_constant;
+ *   一旦这里发出 0，`torque_lim` 就变 0 ⇒ 电流环被钳到 0 ⇒ 电机**不出力但
+ *   不报任何错**（`is_enabled()` 仍为 1、无 fault），现场表现为“使能成功却
+ *   转不动”。这正是 F32 探测首次失败的原因（脚本忘了 set_limits()）。
+ *
+ *   因此当 `tau_lim_Nm` 还是 0（客户从未设置、且标定也没给出默认值）时，
+ *   退回设备的 `min(current_lim, mit_max_torque)` 语义等价值；
+ *   两者都拿不到才用固件自带的 `torque_lim` 默认量级兑底并置 sticky flag。
+ */
+static double jsdk_joint__tau_lim_to_wire_a(jsdk_joint_t *j)
+{
+    double tau = j->tgt.tau_lim_Nm;
+
+    if (!(tau > 0.0)) {                       /* 0 或 NaN */
+        double fallback = j->tau_lim_default_Nm;   /* configure() 从 current_lim 读回 */
+        if (!(fallback > 0.0)) {
+            /* 连默认值都没读回来（描述符里没有 current_lim）：用固件
+               `motor.hpp` 的 torque_lim 默认量级（2.58 N·m）当保底，
+               宁可给出一个保守的非 0 值，也不要让电机静默假死。 */
+            fallback = 2.58;
+            jsdk_joint_set_flags(j, (uint16_t)JSDK_JF_TORQUE_LIM_UNSET);
+        }
+        tau = fallback;
+    }
+    if (j->torque_constant > 0.0) return tau / j->torque_constant;
+    return 0.0;
 }
 
 /** 越界处理：返回 1 = 已按安全帧替换目标，0 = 目标可用。 */
@@ -685,13 +762,14 @@ static int send_one_frame(jsdk_joint_t *j)
     case JSDK_MODE_CSP: {
         float pos_deg = (float)(j->tgt.pos_rad * 180.0 / 3.14159265358979323846);
         float vel_rpm = (float)jsdk_units_rad_s_to_rpm(j->tgt.vel_lim_rad_s);
-        float cur_a   = (float)j->tgt.cur_lim_A;
+        float cur_a   = (float)jsdk_joint__tau_lim_to_wire_a(j);
         n = cb_ctrl_pos_pack(payload, classic, pos_deg, vel_rpm, cur_a, &flags);
         break;
     }
     case JSDK_MODE_CSV: {
         float vel_rpm = (float)jsdk_units_rad_s_to_rpm(j->tgt.vel_rad_s);
-        n = cb_ctrl_vel_pack(payload, vel_rpm, (float)j->tgt.cur_lim_A, &flags);
+        n = cb_ctrl_vel_pack(payload, vel_rpm, (float)jsdk_joint__tau_lim_to_wire_a(j),
+                             &flags);
         break;
     }
     case JSDK_MODE_CST: {

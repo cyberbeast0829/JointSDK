@@ -308,6 +308,15 @@ typedef enum {
                                               由每次 `jsdk_joint_set_watchdog_ms()`
                                               重新判定（成功即清除）。 */
 
+#define JSDK_JF_TORQUE_LIM_UNSET 0x0080u
+                                         /**< POS/VEL 模式的**力矩上限从未设置**，且
+                                              设备也没读回 `current_lim` 可供兜底
+                                              —— SDK 用了保守默认值发了帧。
+                                              ⚠ 必须处理：CSP/CSV 帧里的该字段会
+                                              **无条件覆盖**固件 `motor.config.torque_lim`，
+                                              若发 0 则该轴**不出力且不报错**。
+                                              调 `jsdk_joint_set_torque_limit_Nm()` 清除。 */
+
 /* ==========================================================================
  * 5. 不透明句柄与上下文存储
  * ======================================================================== */
@@ -1003,6 +1012,21 @@ JSDK_API jsdk_modestate_t jsdk_joint_get_mode_state(const jsdk_joint_t *j);
 /**
  * 固件 `axis0.current_state`（AxisState 0..16）—— **与上面的 ModeState nibble
  * 不是同一个枚举**。回报值 3 = 标定中、11 = 回零中。
+ *
+ * @par 数据来源（v0.40 起）
+ *   `configure()` 时读一次端点；此后**由心跳持续刷新** —— 心跳 byte\[1\] 的高
+ *   4 bit 就是固件 `axis.current_state_`（固件用 `(state << 4) | control_mode`
+ *   打包），所以不需要额外请求就能跟上设备真实状态。
+ *
+ *   ⚠ 旧实现（≤ v0.39）只在 `configure()` 读一次就再也不更新：真机实测
+ *   `activate()` 后关节已在闭环（心跳 state=8），本函数却仍返回 **1（IDLE）**，
+ *   与 `is_enabled()` / `get_mode_state()` 互相矛盾 —— 按它判断"是否已使能"
+ *   会得到错误结论。现已修复（回归见 `tests/test_joint.c` 的
+ *   `can_state follows heartbeat`）。
+ *
+ * @note 心跳只有 4 bit，**大于 15 的 AxisState 无法表达**（固件对此会静默截断成
+ *       0，见 `cb_heartbeat.h` 问题 1）；需要精确子状态（如 16）时用
+ *       `jsdk_joint_request_state()` 之外的端点读路径。
  * @return 状态值；尚未读到过返回 -1。用 `jsdk_can_axis_state_name()` 取名字。
  */
 JSDK_API int jsdk_joint_get_can_state(const jsdk_joint_t *j);
@@ -1093,8 +1117,66 @@ JSDK_API void jsdk_joint_set_target_velocity(jsdk_joint_t *j, int32_t raw);
 JSDK_API void jsdk_joint_set_target_torque  (jsdk_joint_t *j, int16_t raw);
 
 /* --- 限制量（CSP/POS、CSV/VEL、CURRENT 模式） --- */
+
+/**
+ * POS/VEL 模式的**力矩上限**（推荐，语义与量纲都不含糊）。
+ *
+ * @param vel_lim_rad_s  限速（**输出端** rad/s）。
+ * @param tau_lim_Nm     力矩上限（**电机端** N·m）—— 见下方“两个上限的区别”。
+ *
+ * @par 它写的是哪个参数？
+ *   CSP/CSV 帧的第 5..8 字节在线上是 **电机端 A**，但固件
+ *   `cmd_pos_control()` / `cmd_vel_control()` 的用法是：
+ *   @code
+ *   axis.motor_.config_.torque_lim = cur_limit_a * axis.motor_.config_.torque_constant;
+ *   @endcode
+ *   即它设的是 **`torque_lim`（正常工作力矩上限）**。
+ *   本 API 就按这个真实语义给入口：传 N·m，SDK 内部除以 `torque_constant`
+ *   换成线上 A，客户不必自己算电流。
+ *
+ * @par ⚠ 两个“上限”不是一回事（真机核实）
+ *   | 参数 | 作用 | 越界后果 |
+ *   |---|---|---|
+ *   | `motor.config.current_lim` | **过流告警门限**：`Itrip = current_lim + current_lim_margin` | **`disarm_with_error(ERROR_CURRENT_LIMIT_VIOLATION)`** |
+ *   | `motor.config.torque_lim`  | **正常工作力矩上限**：`max_torque = clamp(电流限值×力矩常数, 0, torque_lim)` | 静默钳位，**不报错** |
+ *
+ *   固件在 CSP/CSV 里**刻意不动** `current_lim`（源码注释：“不修改 current_lim
+ *   避免误触发告警”）。故本 API **不会**改变告警门限；客户的 `current_lim`
+ *   本来就应该大于 `torque_lim / torque_constant`。
+ *
+ * @par ⚠ 不发这个值会怎样（真机实测的静默陷阱）
+ *   不调用 ⇒ `tau_lim_Nm` 保持 0 ⇒ 每帧都往固件写 `torque_lim = 0` ⇒
+ *   电流环被钳到 0 ⇒ **电机不出力，但 `is_enabled()` 仍为 1、无 fault、
+ *   `tx_rejected == 0`**，现场就是“使能成功却完全不转”。
+ *   为避免这个坑，`configure()` 会用设备读回的
+ *   `axis0.motor.config.current_lim × torque_constant` 作为**默认上限**，
+ *   所以不调也能正常工作；只有连 `current_lim` 都读不到时才置
+ *   `JSDK_JF_TORQUE_LIM_UNSET` 并用保守值兜底。
+ *
+ * @note 负值/NaN 视为“未设置”（走默认值）。CSP/CSV 会**每帧**重写设备的
+ *       `torque_lim`，所以中途改本值在下一控制周期即生效。
+ */
+JSDK_API void jsdk_joint_set_torque_limit_Nm(jsdk_joint_t *j, double vel_lim_rad_s,
+                                             double tau_lim_Nm);
+
+/**
+ * @deprecated 请改用 @ref jsdk_joint_set_torque_limit_Nm()。
+ *
+ * 语义与上面**完全相同**，只是参数按**线上单位（电机端 A）**给：
+ * `tau_lim_Nm = cur_lim_A × torque_constant`。
+ *
+ * 旧名字 `cur_lim_A` 容易被误读成“改 `current_lim`（告警门限）”，
+ * 实际改的是 `torque_lim`（力矩上限）—— 保留本函数只为兼容既有代码。
+ */
 JSDK_API void jsdk_joint_set_limits   (jsdk_joint_t *j, double vel_lim_rad_s, double cur_lim_A);
-JSDK_API void jsdk_joint_set_current_A(jsdk_joint_t *j, double amp);  /**< 注意：不喂看门狗 */
+
+/**
+ * CURRENT 模式的目标电流（**电机端** A）。
+ *
+ * @warning **不喂看门狗** —— 与固件一致：`0x04` 不刷新 `last_cmd_time_`。
+ *          只发电流指令时设备的协议级超时保护**永远不会武装**。
+ */
+JSDK_API void jsdk_joint_set_current_A(jsdk_joint_t *j, double amp);
 
 /* --- 安全动作 --- */
 

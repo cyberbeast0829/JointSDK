@@ -2140,13 +2140,29 @@ typedef struct {
     double kp, kd;         /**< MIT 线上值（原样透传，见 §6.2） */
     double cur_A;          /**< 电机端 A（CURRENT） */
     double vel_lim_rad_s;  /**< POS/VEL 模式的限速（输出端） */
-    double cur_lim_A;      /**< POS/VEL 模式的限流（电机端） */
+
+    /*
+     * POS/VEL 模式写入固件 `motor.config.torque_lim` 的**力矩上限**。
+     *
+     * ⚠ 线上字段（CSP/CSV 的第 5..8 字节）单位是**电机端 A**，但固件
+     *   `cmd_pos_control()` / `cmd_vel_control()` 的用法是
+     *       axis.motor_.config_.torque_lim = cur_limit_a * torque_constant;
+     *   也就是说它设的是 **torque_lim（正常工作力矩上限）**，而**不是**
+     *   `current_lim`（那是过流告警门限，`Itrip = current_lim + margin`，
+     *   超了会 `disarm_with_error(ERROR_CURRENT_LIMIT_VIOLATION)`）。
+     *   固件源码里明确写了“不修改 current_lim 避免误触发告警”。
+     *
+     * 内部统一存 **N·m**（`tau_lim_Nm`）；只有编码线上帧时才除以
+     * `torque_constant` 换成 A。语义与单位不再混用。
+     */
+    double tau_lim_Nm;     /**< POS/VEL 模式的**力矩上限**（电机端 N·m） */
 
     uint8_t have_pos;      /**< set_target_position_rad / set_mit 调用过 */
     uint8_t have_vel;
     uint8_t have_tau;
     uint8_t have_mit;      /**< set_mit / set_mit_stiffness 调用过 */
     uint8_t have_cur;
+    uint8_t have_limits;   /**< set_limits / set_torque_limit_Nm 调用过 */
     uint8_t have_raw_pos;  /**< set_target_position(raw) 调用过：原样透传 */
     uint8_t have_raw_vel;
     uint8_t have_raw_tau;
@@ -2192,13 +2208,28 @@ struct jsdk_joint {
     uint16_t ep_gear_ratio, ep_torque_constant;
     uint16_t ep_mit_pos, ep_mit_vel, ep_mit_tau, ep_mit_kp, ep_mit_kd;
     uint16_t ep_requested_state, ep_current_state, ep_node_id, ep_break_timeout;
+    uint16_t ep_current_lim;      /**< axis0.motor.config.current_lim（可选） */
 
     /* ---- 设备侧配置读回 ---- */
-    uint32_t break_timeout_ms;    /**< can.config.break_timeout；**0 = 设备侧超时检测已禁用** */
+    uint32_t break_timeout_ms;    /**< can.config.break_timeout；**0 = 设备侧超 时检测已禁用** */
     uint32_t node_id_readback;    /**< axis0.config.can.node_id */
-    uint32_t heartbeat_rate_ms;   /**< axis0.config.can.heartbeat_rate_ms（0 = 设备不发心跳） */
+    uint32_t heartbeat_rate_ms;   /**< axis0.config.can.heartbeat_rate_ms（0 =  设备不发心跳） */
     uint8_t  current_state_raw;   /**< axis0.current_state（固件 AxisState 0..16） */
     uint8_t  state_known;         /**< 1 = 至少读到过一次 current_state */
+
+    /*
+     * POS/VEL 模式「力矩上限」的**默认值**（电机端 N·m）。
+     *
+     * 取自设备 `axis0.motor.config.current_lim × torque_constant`。
+     * 为什么用 current_lim 当默认：它是设备的“额定/告警”电流，乘力矩常数就是
+     * 设备**推荐的正常力矩上限**（真机 40 A × 0.0864797 ≈ 3.459 N·m）。
+     * 这样客户不调 set_limits()/set_torque_limit_Nm() 也能正常工作 ——
+     * 之前 `tau_lim_Nm` 留在 0，CSP/CSV 帧会把固件 `torque_lim` 打成 0，
+     * 电流环不出力而**没有任何报错**，表现为“使能成功但电机不转”的假死。
+     *
+     * 读不到时为 0；此时**不**在帧里写 0（见 send_one_frame 的守卫）。
+     */
+    double   tau_lim_default_Nm;
 
     /* ---- 目标 ---- */
     jsdk_target_t tgt;
@@ -6926,6 +6957,7 @@ const char *cb_error_type_name(uint8_t err_type)
 
 #define P_GEAR        "axis0.motor.config.gear_ratio"
 #define P_TCONST      "axis0.motor.config.torque_constant"
+#define P_CURLIM      "axis0.motor.config.current_lim"
 #define P_MIT_POS     "axis0.controller.config.mit_max_pos"
 #define P_MIT_VEL     "axis0.controller.config.mit_max_vel"
 #define P_MIT_TAU     "axis0.controller.config.mit_max_torque"
@@ -7345,6 +7377,7 @@ static jsdk_status_t calibrate_joint(jsdk_context_t *ctx, jsdk_joint_t *j)
     (void)resolve_ep(ctx, P_CURRENT_ST, &j->ep_current_state, NULL, NULL);
     (void)resolve_ep(ctx, P_NODE_ID,    &j->ep_node_id, NULL, NULL);
     (void)resolve_ep(ctx, P_BREAK,      &j->ep_break_timeout, NULL, NULL);
+    (void)resolve_ep(ctx, P_CURLIM,     &j->ep_current_lim, NULL, NULL);
 
     /* --- 2. 读回标定值（客户端显式给的非 0 值优先，便于离线/异常固件兜底） --- */
     if (j->cfg.gear_ratio != 0.0f) {
@@ -7359,6 +7392,31 @@ static jsdk_status_t calibrate_joint(jsdk_context_t *ctx, jsdk_joint_t *j)
                         &j->torque_constant) != 0) {
         jsdk_joint_seterr(j, "read %s failed", P_TCONST);
         return JSDK_ERR_TRANSPORT;
+    }
+
+    /*
+     * POS/VEL 「力矩上限」的**默认值** = 设备的额定电流 × 力矩常数。
+     *
+     * 为什么必须给默认值：CSP/CSV 帧里的那个字段会**无条件覆盖**固件
+     * `motor.config.torque_lim`（`torque_lim = cur_limit × torque_constant`）。
+     * 客户若不调 `set_torque_limit_Nm()`，`tgt.tau_lim_Nm` 就是 0，于是每帧
+     * 都写 `torque_lim = 0` ⇒ 电流环钳到 0 ⇒ **电机不出力且不报任何错**
+     * （`is_enabled()` 仍为 1、无 fault），现场表现为“使能成功却转不动”。
+     *
+     * 取 `current_lim`（而不是 `current_lim / 2` 之类）是因为它本身就是设备的
+     * “额定/告警”电流：真机 40 A × 0.0864797 ≈ 3.459 N·m。它比固件自带的
+     * `torque_lim` 默认（2.58 N·m，见 `motor.hpp`）略大，属于合理的工作区间。
+     *
+     * 端点缺失/读失败**不阻塞 configure** —— 只是没有默认值，届时由
+     * `jsdk_joint__tau_lim_to_wire_a()` 兑底并置 `JSDK_JF_TORQUE_LIM_UNSET`。
+     */
+    j->tau_lim_default_Nm = 0.0;
+    if (j->ep_current_lim != 0u) {
+        float cur_lim_a = 0.0f;
+        if (read_f32(ctx, j->cfg.node_id, j->ep_current_lim, &cur_lim_a) == 0
+            && cur_lim_a > 0.0f && j->torque_constant > 0.0) {
+            j->tau_lim_default_Nm = (double)cur_lim_a * j->torque_constant;
+        }
     }
 
     if (j->cfg.mit_max_pos != 0.0f)        j->range.pos_max = j->cfg.mit_max_pos;
@@ -10302,10 +10360,24 @@ void jsdk_joint__on_heartbeat(jsdk_joint_t *j, const uint8_t *data, uint8_t len)
         j->fb.vbus_V = (double)hb.vbus_v;
         j->fb.ibus_A = (double)hb.ibus_a;
     }
-    if (hb.control_mode <= (uint8_t)CB_HB_CM_POSITION) {
-        /* 心跳的 control_mode 只有 4 个值，粒度比 ModeState 粗；
-           仅在还没有 ModeState 时用它粗略同步 */
-        if (!j->fb.online) { /* 保留：不做更细映射，避免误判模式 */ }
+
+    /*
+     * 心跳 byte[1] 的高 4 bit **就是** `axis.current_state_`（固件
+     * `send_heartbeat()` 用 `(state << 4) | control_mode` 打包），所以心跳是
+     * **不需要额外请求**就能拿到设备真实 AxisState 的低成本通道。
+     *
+     * ⚠ 以前这里不写回 `current_state_raw`，于是 `jsdk_joint_get_can_state()`
+     *   只在 `configure()` 时读到一次（那一刻通常是 IDLE=1）就**永远停在 1** ——
+     *   实测：`activate()` 后关节已在闭环（心跳 state=8），而 `can_state()` 仍报 1。
+     *   这不只是显示问题：客户按 `can_state()` 判断"是否已使能"会得到错误结论，
+     *   与 `is_enabled()`/`mode_state()` 互相矛盾。
+     *
+     * 只在**状态真的变了**时才更新，避免把 `state_known`/seq 相关的语义搅乱；
+     * 标定/回零期间的 `read_current_state()` 轮询仍是更权威的来源，会被它覆盖。
+     */
+    if (j->current_state_raw != hb.state) {
+        j->current_state_raw = hb.state;
+        j->state_known = 1u;
     }
 
     touch_feedback(j, j->ctx ? j->ctx->now_ms : 0u);
@@ -10563,7 +10635,33 @@ void jsdk_joint_set_limits(jsdk_joint_t *j, double vel_lim_rad_s, double cur_lim
 {
     if (!jsdk_joint_check(j)) return;
     j->tgt.vel_lim_rad_s = vel_lim_rad_s;
-    j->tgt.cur_lim_A     = cur_lim_A;
+    j->tgt.have_limits    = 1u;
+
+    /*
+     * 兼容入口：旧 API 给的是**电机端 A**，这里换算成力矩上限（N·m）存起来。
+     *
+     * ⚠ 线上字段确实是 A（固件：`torque_lim = cur_limit_a * torque_constant`），
+     *   但它设的是**torque_lim（正常工作力矩上限）**，**不是** `current_lim`
+     *   （过流告警门限）。旧名字 `cur_lim_A` 容易让人以为在改告警门限 ——
+     *   新代码请用 `jsdk_joint_set_torque_limit_Nm()`，量纲与语义都不用猜。
+     */
+    if (j->torque_constant > 0.0) {
+        j->tgt.tau_lim_Nm = cur_lim_A * j->torque_constant;
+    } else {
+        /* 还没标定出 torque_constant：先原样存 A，等标定完再换算是不可以的
+           （会静默错量纲），所以这里只记下“客户显式给过 A”并用 0 占位，
+           由 configure() 之后的默认值兵底。 */
+        j->tgt.tau_lim_Nm = 0.0;
+    }
+}
+
+void jsdk_joint_set_torque_limit_Nm(jsdk_joint_t *j, double vel_lim_rad_s,
+                                    double tau_lim_Nm)
+{
+    if (!jsdk_joint_check(j)) return;
+    j->tgt.vel_lim_rad_s = vel_lim_rad_s;
+    j->tgt.tau_lim_Nm    = tau_lim_Nm;
+    j->tgt.have_limits    = 1u;
 }
 
 void jsdk_joint_set_current_A(jsdk_joint_t *j, double amp)
@@ -10631,6 +10729,43 @@ void jsdk_joint_hold_position_pd(jsdk_joint_t *j, double kp, double kd)
 static int mode_feeds_watchdog(uint8_t msgtype)
 {
     return jsdk_msgtype_feeds_watchdog(msgtype);
+}
+
+/**
+ * POS/VEL 帧里那个「限流」字段要填的**电机端 A**。
+ *
+ * 线上确实以 A 为单位（固件：`torque_lim = cur_limit_a * torque_constant`），
+ * 但它驱动的是固件 `motor.config.torque_lim`（**正常工作力矩上限**），
+ * **不是** `current_lim`（过流告警门限）。所以这里从 `tau_lim_Nm` 反推 A。
+ *
+ * ⚠ 必须保证**永不为 0**（除非设备真的禁用了力矩）。
+ *   固件每收到一帧 CSP/CSV 都会**无条件覆盖** `torque_lim`：
+ *       axis.motor_.config_.torque_lim = cur_limit_a * torque_constant;
+ *   一旦这里发出 0，`torque_lim` 就变 0 ⇒ 电流环被钳到 0 ⇒ 电机**不出力但
+ *   不报任何错**（`is_enabled()` 仍为 1、无 fault），现场表现为“使能成功却
+ *   转不动”。这正是 F32 探测首次失败的原因（脚本忘了 set_limits()）。
+ *
+ *   因此当 `tau_lim_Nm` 还是 0（客户从未设置、且标定也没给出默认值）时，
+ *   退回设备的 `min(current_lim, mit_max_torque)` 语义等价值；
+ *   两者都拿不到才用固件自带的 `torque_lim` 默认量级兑底并置 sticky flag。
+ */
+static double jsdk_joint__tau_lim_to_wire_a(jsdk_joint_t *j)
+{
+    double tau = j->tgt.tau_lim_Nm;
+
+    if (!(tau > 0.0)) {                       /* 0 或 NaN */
+        double fallback = j->tau_lim_default_Nm;   /* configure() 从 current_lim 读回 */
+        if (!(fallback > 0.0)) {
+            /* 连默认值都没读回来（描述符里没有 current_lim）：用固件
+               `motor.hpp` 的 torque_lim 默认量级（2.58 N·m）当保底，
+               宁可给出一个保守的非 0 值，也不要让电机静默假死。 */
+            fallback = 2.58;
+            jsdk_joint_set_flags(j, (uint16_t)JSDK_JF_TORQUE_LIM_UNSET);
+        }
+        tau = fallback;
+    }
+    if (j->torque_constant > 0.0) return tau / j->torque_constant;
+    return 0.0;
 }
 
 /** 越界处理：返回 1 = 已按安全帧替换目标，0 = 目标可用。 */
@@ -10751,13 +10886,14 @@ static int send_one_frame(jsdk_joint_t *j)
     case JSDK_MODE_CSP: {
         float pos_deg = (float)(j->tgt.pos_rad * 180.0 / 3.14159265358979323846);
         float vel_rpm = (float)jsdk_units_rad_s_to_rpm(j->tgt.vel_lim_rad_s);
-        float cur_a   = (float)j->tgt.cur_lim_A;
+        float cur_a   = (float)jsdk_joint__tau_lim_to_wire_a(j);
         n = cb_ctrl_pos_pack(payload, classic, pos_deg, vel_rpm, cur_a, &flags);
         break;
     }
     case JSDK_MODE_CSV: {
         float vel_rpm = (float)jsdk_units_rad_s_to_rpm(j->tgt.vel_rad_s);
-        n = cb_ctrl_vel_pack(payload, vel_rpm, (float)j->tgt.cur_lim_A, &flags);
+        n = cb_ctrl_vel_pack(payload, vel_rpm, (float)jsdk_joint__tau_lim_to_wire_a(j),
+                             &flags);
         break;
     }
     case JSDK_MODE_CST: {
