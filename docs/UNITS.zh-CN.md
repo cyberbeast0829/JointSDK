@@ -130,6 +130,90 @@ axis.motor_.config_.torque_lim = cur_limit_a * axis.motor_.config_.torque_consta
 
 ---
 
+## 4.1 function 端点调用（Fibre 方法）
+
+描述符里除了属性（可读写的值），还有一类 **function**（`"type":"function"`）——
+它没有 `access` 字段、也没有线宽，语义是"写它 = 执行"。
+实测 v8 描述符里有 **30 个**，例如：
+
+| function | 后果 |
+|---|---|
+| `save_configuration` | 写 Flash |
+| `clear_errors` | 清错误位 |
+| `reboot` / `enter_dfu_mode` / `enter_bootloader_mode` | **设备重启/断开** |
+| `erase_configuration` | **擦除全部配置** |
+| `oscilloscope.get_val` | 采样（有入参/出参） |
+| `axis0.controller.move_incremental` | **让电机运动** |
+| `axis0.controller.start_anticogging_calibration` | 长时间标定，电机会动 |
+
+### 调用序列
+
+```
+1. 写 inputs   —— 每个入参在描述符里都有自己的端点 ID，
+                  路径 = "<function_path>.<input_name>"
+2. 写 function —— 无值（DataLen = 0），**这一步才触发执行**
+3. 读 outputs  —— 同样各有自己的端点 ID
+```
+
+以 `axis0.controller.move_incremental` 为例（描述符实测）：
+
+| 端点 | ID | 类型 | 权限 |
+|---|---|---|---|
+| `axis0.controller.move_incremental` | 349 | function | — |
+| ├ `.displacement` | 350 | float | rw ← **input** |
+| └ `.from_input_pos` | 351 | bool | rw ← **input** |
+
+**SDK 用法：**
+
+```c
+jsdk_value_t in[2] = {
+    { .type = JSDK_EP_F32,  .v.f32     = 0.5f },   /* → .displacement */
+    { .type = JSDK_EP_BOOL, .v.boolean = 1     },   /* → .from_input_pos */
+};
+jsdk_joint_ep_invoke(j, "axis0.controller.move_incremental", in, 2, NULL, 0, NULL);
+```
+
+有出参的例子 `oscilloscope.get_val`（input `index` u32 → output `val` float）：
+
+```c
+jsdk_value_t in[1]  = { { .type = JSDK_EP_U32, .v.u32 = 3 } };
+jsdk_value_t out[1];
+unsigned got = 0;
+jsdk_joint_ep_invoke(j, "oscilloscope.get_val", in, 1, out, 1, &got);
+/* got == 1, out[0].v.f32 = 采样值 */
+```
+
+CLI：`jsdk-cli invoke --yes oscilloscope.get_val 3`
+
+Python：`j.ep_invoke("oscilloscope.get_val", 3)` → `[1.25]`
+
+> **CLI 的参数按描述符类型解析**（不是猜）：`oscilloscope.get_val` 的入参是
+> `uint32`、`move_incremental.displacement` 是 `float` —— 两者在命令行上都是
+> "一个数字"，CLI 先查描述符拿到真实类型再解析，超出值域即拒绝（**不静默截断**）。
+> 真机实测教训：早期版本用"字面量像整数就当 i32"的猜法，
+> `invoke oscilloscope.get_val 0` 必然以 `descriptor=uint32 given=int32` 失败。
+
+### 几点须知
+
+* **入参顺序必须与描述符 `inputs` 一致**；类型也必须一致（不符 → `JSDK_ERR_PROTOCOL`）。
+* **参数校验在发帧之前完成** —— 数量/类型/路径任一不对就一帧都不发，
+  不会把设备的 input 改成"半新半旧"。
+* **function 端点不能用 `jsdk_joint_param_set()`** 调用（它会以 "read-only" 拒绝，
+  因为 function 没有 access 字段）。`ep_invoke()` 是**唯一**通路。
+* 有专用帧的功能**并存**，两条路等价：
+
+  | function | 专用帧 |
+  |---|---|
+  | `save_configuration` | `CONFIG_SAVE(0x22)` / CLI `save` |
+  | `clear_errors` | `CLEAR_ERRORS(0x65)` / CLI `fault-reset` |
+  | `reboot` | `RESET_DEVICE(0x64)` / CLI `reset` |
+  | `set_current_pos_zero` | `SET_ZERO(0x61)` / CLI `set-zero` |
+
+* ⚠ **没有白名单**（这是刻意的）。`erase_configuration` / `reboot` / `enter_dfu_mode`
+  会立刻改变设备状态或使其失联；CLI 对 `invoke` 强制要 `--yes`。
+
+---
+
 ## 5. `unit_scale_*`：什么时候**真的**需要它
 
 ### 先给结论

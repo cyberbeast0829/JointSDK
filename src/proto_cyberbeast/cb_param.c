@@ -325,8 +325,10 @@ size_t cb_param_pack_write_req(uint8_t *dst, size_t cap, uint16_t ep_id,
     uint8_t i;
 
     if (!dst) return 0u;
-    if (value_len == 0u || value_len > CB_PARAM_MAX_VALUE) return 0u;
-    if (!value) return 0u;
+    if (value_len > CB_PARAM_MAX_VALUE) return 0u;
+    /* `value_len == 0` 合法：**调用 function 端点**就是这个形状（无值，写即执行），
+       此时 `value` 可以为 NULL。真机 `cmd_param_write()` 只检查 `data_len > 8`。 */
+    if (value_len != 0u && !value) return 0u;
 
     /* ⚠⚠ 帧长必须 ≥ CB_PARAM_WRITE_REQ_MIN（8）：固件 `cmd_param_write()` 首句
        就是 `if (msg.len < 8) return;` —— 短帧整帧丢掉、连 ACK 都不回。

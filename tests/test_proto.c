@@ -1035,9 +1035,23 @@ static void test_param_write(void)
         CHECK_EQ(len, 8u);
         CHECK(memcmp(got, "ABCDEFGH", 8) == 0);
 
-        /* 非法：长度 0 / > 8 */
-        CHECK_EQ(cb_param_pack_write_req(buf, sizeof buf, 1, val, 0u), 0u);
+        /*
+         * 长度 0 是**合法**的：调用 function 端点（Fibre 方法）就是这个形状 ——
+         * 无值，写即执行（入参在各自的 input 子端点上）。帧长仍补到 8 字节，
+         * 否则固件 `cmd_param_write()` 的 `if (msg.len < 8) return;` 会整帧丢掉。
+         */
+        n = cb_param_pack_write_req(buf, sizeof buf, 1, val, 0u);
+        CHECK_EQ(n, 8u);                       /* 补到最小帧长 */
+        CHECK_EQ(cb_param_unpack_write_req(buf, n, &fl, &ep2, got, &len), 0);
+        CHECK_EQ(len, 0u);                     /* 真实长度是 0 */
+        CHECK_EQ(fl, 0u);
+
+        /* 值可以为 NULL（function 调用不携带载荷） */
+        CHECK_EQ(cb_param_pack_write_req(buf, sizeof buf, 1, NULL, 0u), 8u);
+
+        /* 非法：> 8；或长度非 0 却没给值 */
         CHECK_EQ(cb_param_pack_write_req(buf, sizeof buf, 1, val, 9u), 0u);
+        CHECK_EQ(cb_param_pack_write_req(buf, sizeof buf, 1, NULL, 1u), 0u);
     }
 
     /* 写确认 */

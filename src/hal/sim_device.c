@@ -82,6 +82,24 @@ static const sim_ep_def_t k_eps[] = {
     EP(372, "axis0.encoder.pos_estimate",                   SIM_T_F32, SIM_ACC_READ,                 pos_estimate),
     EP(378, "axis0.encoder.vel_estimate",                   SIM_T_F32, SIM_ACC_READ,                 vel_estimate),
     EP(390, "axis0.encoder.config.cpr",                     SIM_T_I32, SIM_ACC_READ | SIM_ACC_WRITE, cpr),
+    /* ------------------------------------------------------------------
+     * 仅供**测试**的 function 端点（“Fibre 方法”）
+     *
+     * 真机固件的 30 个 function（clear_errors / save_configuration / …）由
+     * 设备自己的描述符声明，仿真器不模拟它们。这里放一组最小集合，把
+     * `jsdk_joint_ep_invoke()` 的三步序列（写 inputs → 写 function → 读 outputs）
+     * 完整跑通。
+     *
+     * ⚠ SIM_T_FUNCTION 没有线宽（sim_ep_width 返回 0），写它 = 执行；
+     *   实际执行逻辑在 sim_ep_write() 里特判（见那里的 SIM_T_FUNCTION 分支）。
+     * ⚠ 这些端点**不在**真机描述符里，所以要用它们的测试必须自己提供一份
+     *   含这些条目的 JSON（见 tests/test_ops.c 的 ep_invoke 用例）。
+     * ------------------------------------------------------------------ */
+    EP(3000, "sim_fn_demo",                                 SIM_T_FUNCTION, SIM_ACC_READ,            fn_demo_calls),
+    EP(3001, "sim_fn_scale.in",                             SIM_T_F32, SIM_ACC_READ | SIM_ACC_WRITE, fn_scale_in),
+    EP(3002, "sim_fn_scale.factor",                         SIM_T_F32, SIM_ACC_READ | SIM_ACC_WRITE, fn_scale_factor),
+    EP(3003, "sim_fn_scale",                                SIM_T_FUNCTION, SIM_ACC_READ,            fn_scale_calls),
+    EP(3004, "sim_fn_scale.out",                            SIM_T_F32, SIM_ACC_READ,                 fn_scale_out),
 };
 #undef EP
 
@@ -100,6 +118,8 @@ uint8_t sim_ep_width(uint8_t type)
     case SIM_T_U16: case SIM_T_I16:               return 2u;
     case SIM_T_U32: case SIM_T_I32: case SIM_T_F32: return 4u;
     case SIM_T_U64: case SIM_T_I64: case SIM_T_F64: return 8u;
+    /* function 没有线宽：写它就是“调用”，不携带值（入参在各自子端点上） */
+    case SIM_T_FUNCTION:                          return 0u;
     default: return 0u;
     }
 }
@@ -157,7 +177,34 @@ int sim_ep_write(sim_node_t *n, const sim_ep_def_t *def,
     uint8_t *p;
     uint8_t w;
 
-    if (!n || !def || !in) return -1;
+    if (!n || !def) return -1;
+
+    /*
+     * function 端点（Fibre 方法）：**写 = 调用**，没有值可存。
+     *
+     * ⚠ 两条与普通端点不同的规则：
+     *   (a) **不看 SIM_ACC_WRITE** —— 真机描述符里 function 连 access 字段
+     *       都没有（`test_jsondesc` 已断言 30/30 如此），固件的 PARAM_WRITE
+     *       对它就是"写即执行"；
+     *   (b) **不需要载荷**（`in` 可以为 NULL、`len` 为 0）—— 入参已经分别写在
+     *       各自的 input 子端点上了。
+     * 这里执行纯本地动作：累加调用计数、由 input 算出 output。
+     */
+    if (def->type == SIM_T_FUNCTION) {
+        switch (def->id) {
+        case 3000u:                                  /* sim_fn_demo：无参无出参 */
+            n->fn_demo_calls++;
+            return 0;
+        case 3003u:                                  /* sim_fn_scale：out = in × factor */
+            n->fn_scale_calls++;
+            n->fn_scale_out = n->fn_scale_in * n->fn_scale_factor;
+            return 0;
+        default:
+            return -1;
+        }
+    }
+
+    if (!in) return -1;
     if (!(def->access & SIM_ACC_WRITE)) return -1;
 
     w = sim_ep_width(def->type);
@@ -787,6 +834,7 @@ static const char *sim_type_name(uint8_t t)
     case SIM_T_F32:  return "float";
     case SIM_T_F64:  return "double";
     case SIM_T_BOOL: return "bool";
+    case SIM_T_FUNCTION: return "function";
     default:         return NULL;
     }
 }
@@ -816,15 +864,27 @@ static char *sim_build_builtin_desc(size_t *len_out)
         int n;
         if (!tn) continue;                /* 未知类型：跳过而不是发坏描述符 */
 
-        n = snprintf(&buf[off], need - off,
-                     "%s{\"name\":\"%s\",\"id\":%u,\"type\":\"%s\","
-                     "\"access\":\"%s%s\"}",
-                     (off > 1u) ? "," : "",
-                     k_eps[i].path,
-                     (unsigned)k_eps[i].id,
-                     tn,
-                     (k_eps[i].access & SIM_ACC_READ) ? "r" : "",
-                     (k_eps[i].access & SIM_ACC_WRITE) ? "w" : "");
+        /*
+         * ⚠ function 端点在真固件描述符里**没有 access 字段**
+         *   （`test_jsondesc` 已断言 30/30 如此）。仿真器必须同形，否则
+         *   “function 无 access” 这条契约在仿真上测不出来。
+         */
+        if (k_eps[i].type == SIM_T_FUNCTION) {
+            n = snprintf(&buf[off], need - off,
+                         "%s{\"name\":\"%s\",\"id\":%u,\"type\":\"%s\"}",
+                         (off > 1u) ? "," : "",
+                         k_eps[i].path, (unsigned)k_eps[i].id, tn);
+        } else {
+            n = snprintf(&buf[off], need - off,
+                         "%s{\"name\":\"%s\",\"id\":%u,\"type\":\"%s\","
+                         "\"access\":\"%s%s\"}",
+                         (off > 1u) ? "," : "",
+                         k_eps[i].path,
+                         (unsigned)k_eps[i].id,
+                         tn,
+                         (k_eps[i].access & SIM_ACC_READ) ? "r" : "",
+                         (k_eps[i].access & SIM_ACC_WRITE) ? "w" : "");
+        }
         if (n < 0 || (size_t)n >= need - off) { free(buf); return NULL; }
         off += (size_t)n;
     }

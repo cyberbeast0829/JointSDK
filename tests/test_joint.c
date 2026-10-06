@@ -159,6 +159,66 @@ static int fx_up(fix_t *fx, const char *node_spec)
     return 0;
 }
 
+/**
+ * 与 fx_up 相同，但**不覆盖**设备内建描述符。
+ *
+ * 内建描述符由仿真器的 `k_eps` 生成，含一组**仅供测试**的 function 端点
+ * （sim_fn_demo / sim_fn_scale*）—— 真机夹具 endpoints_v8.json 里没有它们，
+ * 所以测 `jsdk_joint_ep_invoke()` 必须走这条路。
+ */
+static int fx_up_builtin_desc(fix_t *fx, const char *node_spec)
+{
+    jsdk_context_config_t *cfg = &fx->cfg;
+    jsdk_joint_config_t    jc;
+    jsdk_status_t          st;
+    static uint8_t         arena[32768];
+    unsigned               guard = 0u;
+
+    memset(fx, 0, sizeof *fx);
+
+    if (jsdk_hal_virtual_open(&fx->hal, &fx->h, node_spec) != JSDK_OK) return -1;
+    fx->sim = jsdk_hal_virtual_sim(fx->h);
+    if (!fx->sim) return -1;
+    /* 刻意不调 sim_set_desc()：让设备用它自己的 k_eps 内建描述符 */
+
+    jsdk_context_config_default(cfg);
+    cfg->hal = fx->hal;
+    cfg->master_id = 1u;
+    cfg->is_fd = 1u;
+    cfg->period_ns = 1000000u;
+    cfg->auto_keepalive = 1u;
+    cfg->desc.retain = JSDK_DESC_RETAIN_ALL;
+    cfg->desc.arena = arena;
+    cfg->desc.arena_size = sizeof arena;
+    cfg->desc.timeout_ms = 5000u;
+
+    if (jsdk_context_init((jsdk_context_t *)&fx->store, cfg) != JSDK_OK) return -1;
+    fx->ctx = (jsdk_context_t *)&fx->store;
+
+    memset(&jc, 0, sizeof jc);
+    jc.node_id = 1u;
+    jc.initial_mode = JSDK_MODE_MIT;
+    if (jsdk_context_add_joint(fx->ctx, &jc, &fx->j) != JSDK_OK) return -1;
+
+    for (guard = 0u; guard < 4000u; ++guard) {
+        st = jsdk_context_desc_poll(fx->ctx, 0u);
+        if (st == JSDK_OK) break;
+        if (st != JSDK_ERR_BUSY) {
+            printf("      desc_poll -> %d (%s)\n", (int)st,
+                   jsdk_context_last_error(fx->ctx));
+            return -1;
+        }
+        jsdk_hal_virtual_advance_ms(fx->h, 1u);
+    }
+    if (guard >= 4000u) return -1;
+
+    if (jsdk_context_configure(fx->ctx) != JSDK_OK) {
+        printf("      configure -> %s\n", jsdk_context_last_error(fx->ctx));
+        return -1;
+    }
+    return 0;
+}
+
 static void fx_down(fix_t *fx)
 {
     if (fx->ctx) jsdk_context_destroy(fx->ctx);
@@ -1142,10 +1202,146 @@ static void test_can_state_follows_heartbeat(void)
     fx_down(&fx);
 }
 
+/* ==========================================================================
+ * function 端点调用（Fibre 方法）
+ * ======================================================================== */
+
+/**
+ * `jsdk_joint_ep_invoke()` 的三步序列：
+ *     写 inputs → 写 function 端点 → 读 outputs
+ *
+ * 夹具用的是仿真器的内建描述符，里面有 3 个**仅供测试**的 function
+ * （见 sim_device.c 的 k_eps 尾部）：
+ *   sim_fn_demo          (3000) 无参无出参；写 = 调用，计数 +1
+ *   sim_fn_scale         (3003) 出参 out = in × factor
+ *     ├ sim_fn_scale.in     (3001) f32 rw   ← 入参
+ *     ├ sim_fn_scale.factor (3002) f32 rw   ← 入参
+ *     └ sim_fn_scale.out    (3004) f32 r    ← 出参
+ *
+ * ⚠ 真机的 function（clear_errors / save_configuration / …）由真描述符声明，
+ *   仿真器不模拟；这里测的是**调用通路本身**（参数传递 + 顺序 + 返回值）。
+ */
+static void test_ep_invoke(void)
+{
+    fix_t fx;
+    jsdk_value_t in[2], out[2];
+    unsigned got = 99u;
+    sim_node_t *n;
+
+    printf("[9] function 端点调用（ep_invoke）\n");
+
+    if (fx_up_builtin_desc(&fx, "0:id=1,gear=16.0,tconst=0.0385,pmax=12.5,vmax=65,"
+                                 "tmax=50,kpmax=500,kdmax=5,hb=10,fd") != 0) {
+        printf("      FATAL: fixture setup failed\n");
+        g_fail++; g_checks++;
+        return;
+    }
+
+    n = sim_find_node(fx.sim, 1u);
+    if (!n) {
+        printf("      FATAL: sim node 1 not found\n");
+        g_fail++; g_checks++;
+        fx_down(&fx);
+        return;
+    }
+
+    /* ---- 1. 无参无出参：一次调用即可 ---- */
+    {
+        jsdk_status_t st = jsdk_joint_ep_invoke(fx.j, "sim_fn_demo",
+                                                NULL, 0u, NULL, 0u, &got);
+        CHECK_EQ(st, JSDK_OK);
+        CHECK_EQ(got, 0u);
+        CHECK_EQ(n->fn_demo_calls, 1u);
+        printf("      sim_fn_demo(): rc=OK, 设备侧计数=%u\n", n->fn_demo_calls);
+    }
+
+    /* ---- 2. 入参 + 出参：out = in × factor ---- */
+    {
+        jsdk_status_t st;
+
+        in[0].type = JSDK_EP_F32; in[0].v.f32 = 2.5f;      /* → .in     */
+        in[1].type = JSDK_EP_F32; in[1].v.f32 = 4.0f;      /* → .factor */
+        memset(out, 0, sizeof out);
+
+        st = jsdk_joint_ep_invoke(fx.j, "sim_fn_scale", in, 2u, out, 2u, &got);
+        CHECK_EQ(st, JSDK_OK);
+        CHECK_EQ(got, 1u);                                  /* 只有 1 个出参 */
+        CHECK_EQ(out[0].type, JSDK_EP_F32);
+        CHECK_NEAR(out[0].v.f32, 10.0f, 1e-6);              /* 2.5 × 4.0 */
+        CHECK_EQ(n->fn_scale_calls, 1u);
+        printf("      sim_fn_scale(in=2.5, factor=4.0) -> out=%.3f\n",
+               (double)out[0].v.f32);
+    }
+
+    /* ---- 3. 端点数量/类型校验：错一个就**一帧都不发** ---- */
+    {
+        jsdk_value_t bad[2];
+        unsigned calls_before = n->fn_scale_calls;
+
+        /* (a) 入参个数不对 */
+        bad[0].type = JSDK_EP_F32; bad[0].v.f32 = 1.0f;
+        CHECK_EQ(jsdk_joint_ep_invoke(fx.j, "sim_fn_scale", bad, 1u, NULL, 0u, NULL),
+                 JSDK_ERR_INVALID_ARG);
+
+        /* (b) 类型不对 */
+        bad[0].type = JSDK_EP_U32; bad[0].v.u32 = 1u;
+        bad[1].type = JSDK_EP_F32; bad[1].v.f32 = 2.0f;
+        CHECK_EQ(jsdk_joint_ep_invoke(fx.j, "sim_fn_scale", bad, 2u, NULL, 0u, NULL),
+                 JSDK_ERR_PROTOCOL);
+
+        /* (c) 不是 function 端点 */
+        CHECK_EQ(jsdk_joint_ep_invoke(fx.j, "axis0.encoder.config.cpr",
+                                      NULL, 0u, NULL, 0u, NULL),
+                 JSDK_ERR_UNSUPPORTED);
+
+        /* (d) 路径不存在 */
+        CHECK_EQ(jsdk_joint_ep_invoke(fx.j, "sim_fn_no_such",
+                                      NULL, 0u, NULL, 0u, NULL),
+                 JSDK_ERR_NOT_FOUND);
+
+        /* ⚠ 关键：以上四次都必须在**发任何帧之前**失败 ⇒ 设备侧没被执行过 */
+        CHECK_EQ(n->fn_scale_calls, calls_before);
+        printf("      4 种非法调用全部在发帧前拒绝，设备侧计数未变（%u）\n",
+               n->fn_scale_calls);
+
+        /* (e) 参数个数不匹配时，host 侧的 input 值也不该被改写 */
+    }
+
+    /* ---- 4. 出参容量不足：仍调用成功，只是截断（got 报真实个数） ---- */
+    {
+        in[0].type = JSDK_EP_F32; in[0].v.f32 = 3.0f;
+        in[1].type = JSDK_EP_F32; in[1].v.f32 = 3.0f;
+        got = 0u;
+        CHECK_EQ(jsdk_joint_ep_invoke(fx.j, "sim_fn_scale", in, 2u, NULL, 0u, &got),
+                 JSDK_OK);
+        CHECK_EQ(got, 1u);                       /* 不取返回值，但个数如实回报 */
+        CHECK_NEAR(n->fn_scale_out, 9.0f, 1e-6);
+        printf("      不取返回值也能执行（out 设备侧=%.3f, got=%u）\n",
+               (double)n->fn_scale_out, got);
+    }
+
+    /* ---- 5. 连续调用是幂等可重复的 ---- */
+    {
+        unsigned k;
+        for (k = 0u; k < 3u; ++k) {
+            in[0].type = JSDK_EP_F32; in[0].v.f32 = (float)(k + 1u);
+            in[1].type = JSDK_EP_F32; in[1].v.f32 = 2.0f;
+            CHECK_EQ(jsdk_joint_ep_invoke(fx.j, "sim_fn_scale", in, 2u,
+                                          NULL, 0u, NULL), JSDK_OK);
+        }
+        CHECK_NEAR(n->fn_scale_out, 6.0f, 1e-6);      /* 3 × 2 */
+        /* 累计：第 2 步 1 次 + 第 4 步 1 次 + 本轮 3 次 = 5 */
+        CHECK_EQ(n->fn_scale_calls, 5u);
+        printf("      连调 3 次 -> 设备侧 out=%.3f, 累计调用=%u\n",
+               (double)n->fn_scale_out, n->fn_scale_calls);
+    }
+
+    fx_down(&fx);
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
-
     printf("=== joint layer (WP3) tests ===\n\n");
 
     if (load_fixture() != 0) {
@@ -1162,6 +1358,7 @@ int main(void)
     test_watchdog();           printf("\n");
     test_cache_roundtrip();    printf("\n");
     test_can_state_follows_heartbeat(); printf("\n");
+    test_ep_invoke();          printf("\n");
 
     free(g_json);
 

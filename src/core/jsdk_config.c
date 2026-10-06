@@ -202,8 +202,16 @@ int jsdk_ctx_write_param(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_id,
     size_t   n;
     int      rc;
 
-    if (!jsdk_ctx_check(ctx) || !val) return JSDK_ERR_INVALID_ARG;
-    if (len == 0u || len > CB_PARAM_MAX_VALUE) return JSDK_ERR_INVALID_ARG;
+    if (!jsdk_ctx_check(ctx)) return JSDK_ERR_INVALID_ARG;
+    /*
+     * `len == 0` 曾经被拒，但那正是**调用 function 端点**所需的形状：
+     * Fibre 方法没有值，写它就是"执行"（入参已经分别写到各自的 input 子端点上）。
+     * 见 `jsdk_joint_ep_invoke()`。真机固件对 `0x21` 的 `DataLen = 0` 也是接受的
+     * （`cmd_param_write()` 只检查 `data_len > 8`）。
+     * 此时 `val` 允许为 NULL（没有值可指）。
+     */
+    if (len > CB_PARAM_MAX_VALUE) return JSDK_ERR_INVALID_ARG;
+    if (len != 0u && !val) return JSDK_ERR_INVALID_ARG;
 
     /* --- 单帧可达（≤ 4 B，或 FD 下 ≤ 8 B）--- */
     if (len <= 4u || ctx->cfg.is_fd) {

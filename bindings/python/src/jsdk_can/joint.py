@@ -733,6 +733,63 @@ class Joint:
                                                  ctypes.byref(v)),
                   f"param_set_auto({path})")
 
+    def ep_invoke(self, path: str, *args: object) -> list:
+        """调用描述符里声明的 **function 端点**（Fibre 方法）。
+
+        :param path: function 的完整路径（``Context.endpoints()`` 可查）
+        :param args: 入参，**顺序必须与描述符 ``inputs`` 一致**
+        :return: 出参列表（函数没有返回值时是空列表）
+        :raises JsdkNotFoundError: 路径不是 function / 不存在
+        :raises JsdkProtocolError: 入参类型与描述符不符
+
+        线上序列（与 ODrive Fibre 一致）：
+
+        1. 逐个写 ``inputs``（每个入参各有自己的端点 ID，
+           路径为 ``<path>.<input_name>``）
+        2. 写 function 端点本身 —— **这一步才触发设备执行**
+        3. 逐个读 ``outputs``
+
+        ⚠ **后果自负**：没有白名单，参数也只做描述符类型校验。
+        以下函数会立刻改变设备状态或使其失联：
+
+        ==============================  ==================================
+        ``erase_configuration``         **擦除全部配置**，通常需重新标定
+        ``reboot`` / ``enter_dfu_mode`` **设备重启/断开**，拿不到有效应答
+        ``save_configuration``          写 Flash（有磨损，勿循环调用）
+        ``…move_incremental``           **会让电机运动**
+        ``…set_linear_count`` 等        **改变位置零点**
+        ==============================  ==================================
+
+        多数功能已有专用帧且**并存**（两条路等价）：
+        ``save_configuration`` ↔ :meth:`Context.save`；
+        ``clear_errors`` ↔ :meth:`fault_reset`；
+        ``reboot`` ↔ CLI ``reset``；``set_current_pos_zero`` ↔ CLI ``set-zero``。
+
+        >>> j.ep_invoke("oscilloscope.get_val", 3)          # 有入参有出参
+        [1.25]
+        >>> j.ep_invoke("axis0.mechanical_brake.engage")    # 无参无出参
+        []
+        """
+        in_vals = [_python_to_value(a) for a in args]
+        n_in = len(in_vals)
+        in_arr = ((_abi.Value * n_in)(*in_vals)) if n_in else None
+
+        # 先问一眼有几个出参：用 descriptor 数 <path>.* 里只读且为标量的那些。
+        # 简化起见给一个足够大的缓冲，C 侧用 out_got 如实回报实际个数。
+        cap = 8
+        out_arr = (_abi.Value * cap)()
+        got = _abi.c_uint(0)
+
+        self._chk(self._lib.jsdk_joint_ep_invoke(
+                      self._ptr, path.encode("utf-8"),
+                      ctypes.cast(in_arr, _abi.c_void_p) if in_arr else None,
+                      _abi.c_uint(n_in),
+                      ctypes.cast(out_arr, _abi.c_void_p), _abi.c_uint(cap),
+                      ctypes.byref(got)),
+                  f"ep_invoke({path})")
+
+        return [_value_to_python(out_arr[i]) for i in range(int(got.value))]
+
     def param_get_f32(self, path: str) -> float:
         out = _abi.c_float()
         self._chk(self._lib.jsdk_joint_param_get_f32(self._ptr, path.encode("utf-8"),

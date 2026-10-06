@@ -74,6 +74,8 @@ void cli_usage(FILE *f, const char *argv0)
         "  reset                         RESET_DEVICE(0x64)\n"
         "\n"
         "动作子命令（需 --yes）\n"
+        "  invoke <fn> [args...]         调用 function 端点（Fibre 方法）；\n"
+        "                                序列：写 inputs → 写 function → 读 outputs\n"
         "  calibrate                     写 requested_state = 3 并等待\n"
         "  home                          写 requested_state = 11 并等待\n"
         "  estop                         广播 ESTOP(0xC0)（**全局广播**，打到总线上所有节点）\n"

@@ -116,7 +116,14 @@ extern "C" {
 typedef enum {
     SIM_T_U8 = 0, SIM_T_I8, SIM_T_U16, SIM_T_I16,
     SIM_T_U32, SIM_T_I32, SIM_T_U64, SIM_T_I64,
-    SIM_T_F32, SIM_T_F64, SIM_T_BOOL
+    SIM_T_F32, SIM_T_F64, SIM_T_BOOL,
+    /*
+     * 只用于**测试**：描述符里的 `"type":"function"`（Fibre 方法）。
+     * 它没有线宽、不能读写值 —— 写它就等于“调用”，这正是 ep_invoke 要测的。
+     * 真实固件的 function 端点（如 clear_errors / save_configuration）由
+     * 真机描述符提供；仿真器只在测试夹具里放几个例子。
+     */
+    SIM_T_FUNCTION
 } sim_val_type_t;
 
 #define SIM_ACC_READ  0x01u
@@ -215,6 +222,25 @@ typedef struct {
     float    cmd_torque_motor_nm;
     float    pos_target_motor;
     float    vel_target_motor;
+
+    /* ------------------------------------------------------------------
+     * 仅供**测试**的 function 端点（“Fibre 方法”）
+     *
+     * 真机描述符里有 30 个 function（clear_errors / save_configuration / …），
+     * 它们带 inputs/outputs 子端点，固件收到写就执行。仿真器用下面这一组
+     * 最小集合把 `jsdk_joint_ep_invoke()` 的三步序列跑通：
+     *
+     *   sim_fn_demo        (id 3000)  无参无出参，写 = 调用，计数 +1
+     *   sim_fn_scale.in    (id 3001)  f32 rw  ← 入参（先写它）
+     *   sim_fn_scale.factor(id 3002)  f32 rw  ← 第二入参
+     *   sim_fn_scale       (id 3003)  function 写 = 执行，出参 = in*factor
+     *   sim_fn_scale.out   (id 3004)  f32 r    ← 出参（后读它）
+     * ------------------------------------------------------------------ */
+    uint32_t fn_demo_calls;        /* sim_fn_demo 被调用次数 */
+    uint32_t fn_scale_calls;       /* sim_fn_scale 被调用次数 */
+    float    fn_scale_in;          /* sim_fn_scale.in   入参 */
+    float    fn_scale_factor;      /* sim_fn_scale.factor 入参 */
+    float    fn_scale_out;         /* sim_fn_scale.out  出参（= in × factor） */
 } sim_node_t;
 
 /** 虚拟总线（多节点） */

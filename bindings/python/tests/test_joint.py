@@ -227,6 +227,44 @@ def test_legacy_set_limits_still_works(ctx_enabled):
     assert j.feedback().tx_frames > 0
 
 
+def test_ep_invoke_function_endpoint(ctx_joint):
+    """调用 function 端点（Fibre 方法）：写 inputs → 写 function → 读 outputs。
+
+    仿真器的内建描述符自带 3 个**仅供测试**的 function：
+      sim_fn_demo (3000)   无参无出参
+      sim_fn_scale (3003)  out = in × factor
+        .in (3001) / .factor (3002) / .out (3004)
+    """
+    _ctx, j = ctx_joint
+
+    # 无参无出参：一次调用即可
+    assert j.ep_invoke("sim_fn_demo") == []
+
+    # 有入参有出参：out = in × factor
+    assert j.ep_invoke("sim_fn_scale", 2.5, 4.0) == [pytest.approx(10.0)]
+
+    # 连续调用可重复
+    assert j.ep_invoke("sim_fn_scale", 3.0, 3.0) == [pytest.approx(9.0)]
+
+
+def test_ep_invoke_rejects_non_function(ctx_joint):
+    """路径存在但不是 function → UNSUPPORTED；不存在 → NOT_FOUND。"""
+    _ctx, j = ctx_joint
+    with pytest.raises(Exception):
+        j.ep_invoke("axis0.encoder.config.cpr")     # 普通端点
+    with pytest.raises(Exception):
+        j.ep_invoke("sim_fn_no_such")               # 不存在
+
+
+def test_ep_invoke_rejects_wrong_arg_count(ctx_joint):
+    """入参个数/类型不对必须在**发帧前**拒绝。"""
+    _ctx, j = ctx_joint
+    with pytest.raises(Exception):
+        j.ep_invoke("sim_fn_scale", 1.0)             # 少一个入参
+    with pytest.raises(Exception):
+        j.ep_invoke("sim_fn_demo", 1.0)              # 多一个入参
+
+
 # ==========================================================================
 # 参数
 # ==========================================================================

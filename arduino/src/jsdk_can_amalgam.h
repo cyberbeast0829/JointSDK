@@ -1392,6 +1392,69 @@ JSDK_API int jsdk_joint_sdo_write(jsdk_joint_t *j, jsdk_sdo_handle_t h);
 JSDK_API jsdk_status_t jsdk_joint_param_get(jsdk_joint_t *j, const char *path, jsdk_value_t *out);
 JSDK_API jsdk_status_t jsdk_joint_param_set(jsdk_joint_t *j, const char *path, const jsdk_value_t *in);
 
+/**
+ * 调用描述符里声明的 **function 端点**（Fibre 方法），如 `clear_errors`、
+ * `save_configuration`、`axis0.controller.move_incremental`、`oscilloscope.get_val`。
+ *
+ * @param j      关节
+ * @param path   function 的完整路径（`jsdk_endpoint_lookup()` / CLI `ep-list` 可查）
+ * @param in     入参数组，长度 `n_in`；**顺序必须与描述符 `inputs` 一致**。
+ *               可传 NULL（等价 `n_in = 0`）。每项的 `type` 必须与描述符一致。
+ * @param n_in   入参个数
+ * @param out    出参数组，容量 `n_out`；传 NULL 表示不取返回值
+ * @param n_out  `out` 的容量
+ * @param out_got 输出：实际写入 `out` 的个数（可为 NULL）。**小于 `n_out` 是正常的**
+ *               （函数出参比容量少）；大于容量会报 `JSDK_ERR_BUFFER_TOO_SMALL`。
+ *
+ * @par 线上序列（与 ODrive Fibre 语义一致）
+ *   1. 逐个写 `inputs` —— 每个入参在描述符里都有**自己的端点 ID**，
+ *      路径为 `<function_path>.<input_name>`；
+ *   2. 写 **function 端点本身**（这一步触发设备侧执行）；
+ *   3. 逐个读 `outputs`（同样各有独立端点 ID）。
+ *
+ * @par 端点自动发现（不依赖名字猜测）
+ *   `inputs`/`outputs` 里的嵌套对象由描述符解析器**自动展平成带路径的端点**
+ *   （如 `axis0.controller.move_incremental.displacement` → id 350）。
+ *   本函数用 `<path>.<name>` 精确查表取 ID 与类型；查不到就在**发任何帧之前**
+ *   返回 `JSDK_ERR_NOT_FOUND`（不做"只写一部分再发现不对"）。
+ *
+ * @par ⚠ function 端点没有 `access` 字段
+ *   `jsdk_joint_param_set()` 会以"endpoint is read-only"拒绝它们 —— 本函数是
+ *   **唯一**的调用通路，内部按 Fibre 语义放行（写 function = 执行）。
+ *
+ * @par ⚠ 后果自负（没有白名单，这是刻意的）
+ *   参数**不校验**语义，只有描述符类型校验。以下函数会**立即**改变设备状态或
+ *   使其失联，调用前请确认后果：
+ *   | function | 后果 |
+ *   |---|---|
+ *   | `erase_configuration` | **擦除全部配置**，通常需重新标定 |
+ *   | `reboot` / `enter_dfu_mode` / `enter_bootloader_mode` | **设备重启/断开**，本调用不会返回有效应答 |
+ *   | `save_configuration` | 写 Flash（有磨损，勿在循环里调） |
+ *   | `axis0.controller.move_incremental` | **会让电机运动** |
+ *   | `axis0.encoder.set_linear_count` / `set_current_pos_zero` | **改变位置零点** |
+ *   | `axis0.controller.start_anticogging_calibration` / `measure_inertia` | 长时间占用、电机会动 |
+ *
+ *   有**专用协议帧**的更常用功能仍然并存，可任选其一（两者等价）：
+ *   `save_configuration` ↔ `CONFIG_SAVE(0x22)` / CLI `save`；
+ *   `clear_errors` ↔ `CLEAR_ERRORS(0x65)` / CLI `fault-reset`；
+ *   `reboot` ↔ `RESET_DEVICE(0x64)` / CLI `reset`；
+ *   `set_current_pos_zero` ↔ `SET_ZERO(0x61)` / CLI `set-zero`。
+ *
+ * @par 阻塞与线程
+ *   本函数**逐帧阻塞等应答**（配置阶段 API，与 `param_get/set` 同类），
+ *   **不可**在 1 kHz 控制循环里调用。设备执行耗时长的函数（如惯性辨识）时，
+ *   请在调用前把超时放宽（见 @ref jsdk_context_set_timeout_ms）。
+ *
+ * @note 出参个数以**描述符**为准，不是 `n_out`：多给容量不会写坏，少给会报错。
+ *       想知道有多少个出参，可用 `jsdk_endpoint_lookup("<path>.<name>")` 逐个试。
+ * @note 无入参无出参的函数（30 个里的 10 个，如 `save_configuration`、
+ *       `axis0.mechanical_brake.engage`）直接 `jsdk_joint_ep_invoke(j, path, NULL, 0, NULL, 0, NULL)`。
+ */
+JSDK_API jsdk_status_t jsdk_joint_ep_invoke(jsdk_joint_t *j, const char *path,
+                                            const jsdk_value_t *in, unsigned n_in,
+                                            jsdk_value_t *out,      unsigned n_out,
+                                            unsigned *out_got);
+
 /* 类型化便利包装（实际端点中大量为整型：node_id/heartbeat_rate_ms 为 u32、
  * break_timeout 为 u16、requested_state 为 u8、enable_watchdog 为 bool） */
 JSDK_API jsdk_status_t jsdk_joint_param_get_f32 (jsdk_joint_t *j, const char *path, float    *out);

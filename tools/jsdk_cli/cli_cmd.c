@@ -991,6 +991,175 @@ static int cmd_ep_lookup(cli_app_t *a)
     return CLI_EXIT_OK;
 }
 
+/**
+ * `invoke <path> [args...]` —— 调用 function 端点（Fibre 方法）。
+ *
+ * 用法：`invoke <function_path> [arg ...]`
+ *
+ * 入参按位置顺序传给描述符里声明的 `inputs`。**类型由描述符决定**（不是命令行猜）：
+ * `oscilloscope.get_val` 的入参是 uint32，`move_incremental.displacement` 是 float ——
+ * 两者在命令行上都是"一个数字"，靠 `jsdk_endpoint_enumerate()` 查出真实类型再解析。
+ * 超出值域即拒绝（**不静默截断**）。
+ * 出参按描述符顺序打印。
+ *
+ * ⚠ 没有白名单：`erase_configuration` / `reboot` / `enter_dfu_mode` 等会立刻
+ *   改变设备状态或使其失联（见 joint_sdk.h 的 jsdk_joint_ep_invoke 文档）。
+ *   因此本命令归入"动作子命令"，需要 `--yes`。
+ */
+
+/** `invoke` 的参数解析上下文（配合 jsdk_endpoint_enumerate 用）。 */
+typedef struct {
+    const char   *fn_path;
+    const char *const *args;  /**< 命令行里 function 之后的那串参数 */
+    unsigned      want;       /**< 命令行给的入参个数 */
+    jsdk_value_t *vals;       /**< 输出：按 input 声明顺序装箱 */
+    unsigned      seen;       /**< 已装箱个数 */
+    int           err;        /**< 0 正常 / -1 解析失败 / -2 越界 */
+    jsdk_ep_type_t bad_type;  /**< 出错那个 input 的类型（供报错文案） */
+} invoke_args_t;
+
+/**
+ * 遍历回调：挑出 `<fn_path>.<name>` 的直接**可写**子端点（= inputs），
+ * 按声明顺序解析对应的命令行参数。
+ */
+static int invoke_arg_visit(void *user, const char *path, uint16_t ep_id,
+                            jsdk_ep_type_t type, uint8_t access)
+{
+    invoke_args_t *ia = (invoke_args_t *)user;
+    size_t plen = strlen(ia->fn_path);
+    int rc;
+
+    (void)ep_id;
+
+    if (ia->err != 0) return 1;               /* 已出错：立刻停止遍历 */
+    if (ia->seen >= ia->want) return 1;       /* 命令行参数已用完 */
+    if (!path) return 0;
+    if (strncmp(path, ia->fn_path, plen) != 0) return 0;
+    if (path[plen] != '.') return 0;
+    if (strchr(path + plen + 1u, '.') != NULL) return 0;   /* 只要直接子节点 */
+    if (!(access & JSDK_EP_ACCESS_W)) return 0;            /* 只取 input */
+
+    rc = text_to_value(ia->args[ia->seen], type, &ia->vals[ia->seen]);
+    ia->bad_type = type;
+    if (rc != 0) {
+        ia->err = rc;                          /* -1 / -2，由调用方决定退出码 */
+        return 1;
+    }
+    ia->seen++;
+    return 0;
+}
+
+static int cmd_invoke(cli_app_t *a)
+{
+    const char *path = (a->o.nargs > 0u) ? a->o.args[0] : NULL;
+    jsdk_value_t in[8], out[8];
+    unsigned n_in, i, got = 0u;
+    jsdk_status_t st;
+
+    if (!path) {
+        cli_fprintf(a->err, "jsdk-cli: invoke 需要 <function_path> [args...]\n");
+        return CLI_EXIT_USAGE;
+    }
+    {
+        /* 没有白名单：任何 function 都可能改设备状态或让它失联，一律要 --yes */
+        int rc = require_yes(a, "invoke");
+        if (rc != 0) return rc;
+    }
+    n_in = (a->o.nargs > 0u) ? (a->o.nargs - 1u) : 0u;
+    if (n_in > (unsigned)(sizeof in / sizeof in[0])) {
+        cli_fprintf(a->err, "jsdk-cli: 入参最多 %u 个\n",
+                (unsigned)(sizeof in / sizeof in[0]));
+        return CLI_EXIT_USAGE;
+    }
+
+    /* 先查一次，确认它真的是 function（顺便把出参个数报给用户） */
+    {
+        uint16_t ep_id = 0u;
+        jsdk_ep_type_t type = JSDK_EP_JSON;
+        uint8_t access = 0u;
+        st = jsdk_endpoint_lookup(a->ctx, path, &ep_id, &type, &access);
+        if (st != JSDK_OK) { cli_error(a, path, st); return CLI_EXIT_FAIL; }
+        if (type != JSDK_EP_FUNCTION) {
+            cli_fprintf(a->err, "jsdk-cli: %s 不是 function 端点（type=%s）\n",
+                    path, jsdk_ep_type_string(type));
+            return CLI_EXIT_FAIL;
+        }
+    }
+
+    /*
+     * 参数解析：**按描述符声明的类型**解析，而不是猜。
+     *
+     * ⚠ 这里曾经用"字面量长得像整数就当 i32"的猜法，于是 `oscilloscope.get_val 0`
+     *   必然以 `descriptor=uint32 given=int32` 失败（真机实测）—— 因为该 function
+     *   的入参是 **uint32**。用户没法从命令行表达"这是 u32"，所以必须查描述符。
+     *
+     * 入参按 `<path>.<input_name>` 逐个查（与 ep_invoke 内部的发现方式一致）；
+     * 只取**可写**的子端点（access 带 w），与 C 侧同一判据。
+     * 用**公共**的 jsdk_endpoint_enumerate()，不碰内部 store 结构。
+     */
+    {
+        invoke_args_t ia;
+        memset(&ia, 0, sizeof ia);
+        ia.fn_path = path;
+        ia.args    = &a->o.args[1];                  /* 跳过 function 路径本身 */
+        ia.want    = n_in;
+        ia.vals    = in;
+
+        (void)jsdk_endpoint_enumerate(a->ctx, invoke_arg_visit, &ia);
+
+        if (ia.err == -1) {
+            cli_fprintf(a->err, "jsdk-cli: 无法把参数 %u 解析成 %s：'%s'\n",
+                    ia.seen, jsdk_ep_type_string(ia.bad_type),
+                    a->o.args[ia.seen + 1u]);
+            return CLI_EXIT_USAGE;
+        }
+        if (ia.err == -2) {
+            cli_fprintf(a->err, "jsdk-cli: 参数 %u 超出 %s 值域：'%s'\n",
+                    ia.seen, jsdk_ep_type_string(ia.bad_type),
+                    a->o.args[ia.seen + 1u]);
+            return CLI_EXIT_FAIL;
+        }
+        if (ia.seen != n_in) {
+            cli_fprintf(a->err, "jsdk-cli: %s 期望 %u 个入参，收到 %u 个\n",
+                    path, ia.seen, n_in);
+            return CLI_EXIT_USAGE;
+        }
+    }
+
+    st = jsdk_joint_ep_invoke(cli_joint(a), path, n_in ? in : NULL, n_in,
+                              out, (unsigned)(sizeof out / sizeof out[0]), &got);
+    if (st != JSDK_OK) { cli_error(a, path, st); return CLI_EXIT_FAIL; }
+
+    if (a->o.json) {
+        cli_json_t j;
+        cli_json_init(&j, a->out, 0);
+        cli_json_str(&j, "function", path);
+        cli_json_i64(&j, "outputs", (long long)got);
+        cli_json_finish(&j);
+        return CLI_EXIT_OK;
+    }
+
+    if (got == 0u) {
+        cli_fprintf(a->out, "%s: OK（无返回值）\n", path);
+    } else {
+        cli_fprintf(a->out, "%s: OK\n", path);
+        for (i = 0u; i < got; ++i) {
+            cli_fprintf(a->out, "  [%u] %s = ", i, jsdk_ep_type_string(out[i].type));
+            switch (out[i].type) {
+            case JSDK_EP_F32:  cli_fprintf(a->out, "%.6g\n", (double)out[i].v.f32); break;
+            case JSDK_EP_F64:  cli_fprintf(a->out, "%.10g\n", out[i].v.f64); break;
+            case JSDK_EP_BOOL: cli_fprintf(a->out, "%s\n", out[i].v.boolean ? "true" : "false"); break;
+            case JSDK_EP_I32:  cli_fprintf(a->out, "%d\n", (int)out[i].v.i32); break;
+            case JSDK_EP_U32:  cli_fprintf(a->out, "%u\n", (unsigned)out[i].v.u32); break;
+            case JSDK_EP_I64:  cli_fprintf(a->out, "%lld\n", (long long)out[i].v.i64); break;
+            case JSDK_EP_U64:  cli_fprintf(a->out, "%llu\n", (unsigned long long)out[i].v.u64); break;
+            default:           cli_fprintf(a->out, "(type %d)\n", (int)out[i].type); break;
+            }
+        }
+    }
+    return CLI_EXIT_OK;
+}
+
 static int cmd_desc_export(cli_app_t *a)
 {
     size_t cap, len = 0u;
@@ -998,7 +1167,6 @@ static int cmd_desc_export(cli_app_t *a)
     jsdk_status_t st;
     FILE  *f;
     const char *path = (a->o.nargs > 0u) ? a->o.args[0] : NULL;
-
     if (!path) { cli_fprintf(a->err, "jsdk-cli: desc-export 需要 <file>\n"); return CLI_EXIT_USAGE; }
 
     cap = jsdk_desc_export_max_size(a->ctx);
@@ -1758,6 +1926,9 @@ static const cmd_t CMDS[] = {
     { "read",           cmd_read,           CLI_DESC_ONLY, 0 },
     { "batch-read",     cmd_batch_read,     CLI_DESC_ONLY, 0 },
     { "write",          cmd_write,          CLI_DESC_ONLY, 0 },
+    /* 调用 function 端点（Fibre 方法）：要描述符 + **要 --yes**
+       （没有白名单，erase_configuration / reboot 等会让设备失联） */
+    { "invoke",         cmd_invoke,         CLI_DESC_FULL, 0 },
     { "save",           cmd_save,           CLI_DESC_ONLY, 0 },
     { "set-node-id",    cmd_set_node_id,    CLI_DESC_ONLY, 0 },
     { "reset",          cmd_reset,          CLI_DESC_ONLY, 0 },

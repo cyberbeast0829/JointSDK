@@ -3032,7 +3032,14 @@ extern "C" {
 typedef enum {
     SIM_T_U8 = 0, SIM_T_I8, SIM_T_U16, SIM_T_I16,
     SIM_T_U32, SIM_T_I32, SIM_T_U64, SIM_T_I64,
-    SIM_T_F32, SIM_T_F64, SIM_T_BOOL
+    SIM_T_F32, SIM_T_F64, SIM_T_BOOL,
+    /*
+     * 只用于**测试**：描述符里的 `"type":"function"`（Fibre 方法）。
+     * 它没有线宽、不能读写值 —— 写它就等于“调用”，这正是 ep_invoke 要测的。
+     * 真实固件的 function 端点（如 clear_errors / save_configuration）由
+     * 真机描述符提供；仿真器只在测试夹具里放几个例子。
+     */
+    SIM_T_FUNCTION
 } sim_val_type_t;
 
 #define SIM_ACC_READ  0x01u
@@ -3131,6 +3138,25 @@ typedef struct {
     float    cmd_torque_motor_nm;
     float    pos_target_motor;
     float    vel_target_motor;
+
+    /* ------------------------------------------------------------------
+     * 仅供**测试**的 function 端点（“Fibre 方法”）
+     *
+     * 真机描述符里有 30 个 function（clear_errors / save_configuration / …），
+     * 它们带 inputs/outputs 子端点，固件收到写就执行。仿真器用下面这一组
+     * 最小集合把 `jsdk_joint_ep_invoke()` 的三步序列跑通：
+     *
+     *   sim_fn_demo        (id 3000)  无参无出参，写 = 调用，计数 +1
+     *   sim_fn_scale.in    (id 3001)  f32 rw  ← 入参（先写它）
+     *   sim_fn_scale.factor(id 3002)  f32 rw  ← 第二入参
+     *   sim_fn_scale       (id 3003)  function 写 = 执行，出参 = in*factor
+     *   sim_fn_scale.out   (id 3004)  f32 r    ← 出参（后读它）
+     * ------------------------------------------------------------------ */
+    uint32_t fn_demo_calls;        /* sim_fn_demo 被调用次数 */
+    uint32_t fn_scale_calls;       /* sim_fn_scale 被调用次数 */
+    float    fn_scale_in;          /* sim_fn_scale.in   入参 */
+    float    fn_scale_factor;      /* sim_fn_scale.factor 入参 */
+    float    fn_scale_out;         /* sim_fn_scale.out  出参（= in × factor） */
 } sim_node_t;
 
 /** 虚拟总线（多节点） */
@@ -6511,8 +6537,10 @@ size_t cb_param_pack_write_req(uint8_t *dst, size_t cap, uint16_t ep_id,
     uint8_t i;
 
     if (!dst) return 0u;
-    if (value_len == 0u || value_len > CB_PARAM_MAX_VALUE) return 0u;
-    if (!value) return 0u;
+    if (value_len > CB_PARAM_MAX_VALUE) return 0u;
+    /* `value_len == 0` 合法：**调用 function 端点**就是这个形状（无值，写即执行），
+       此时 `value` 可以为 NULL。真机 `cmd_param_write()` 只检查 `data_len > 8`。 */
+    if (value_len != 0u && !value) return 0u;
 
     /* ⚠⚠ 帧长必须 ≥ CB_PARAM_WRITE_REQ_MIN（8）：固件 `cmd_param_write()` 首句
        就是 `if (msg.len < 8) return;` —— 短帧整帧丢掉、连 ACK 都不回。
@@ -7141,8 +7169,16 @@ int jsdk_ctx_write_param(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_id,
     size_t   n;
     int      rc;
 
-    if (!jsdk_ctx_check(ctx) || !val) return JSDK_ERR_INVALID_ARG;
-    if (len == 0u || len > CB_PARAM_MAX_VALUE) return JSDK_ERR_INVALID_ARG;
+    if (!jsdk_ctx_check(ctx)) return JSDK_ERR_INVALID_ARG;
+    /*
+     * `len == 0` 曾经被拒，但那正是**调用 function 端点**所需的形状：
+     * Fibre 方法没有值，写它就是"执行"（入参已经分别写到各自的 input 子端点上）。
+     * 见 `jsdk_joint_ep_invoke()`。真机固件对 `0x21` 的 `DataLen = 0` 也是接受的
+     * （`cmd_param_write()` 只检查 `data_len > 8`）。
+     * 此时 `val` 允许为 NULL（没有值可指）。
+     */
+    if (len > CB_PARAM_MAX_VALUE) return JSDK_ERR_INVALID_ARG;
+    if (len != 0u && !val) return JSDK_ERR_INVALID_ARG;
 
     /* --- 单帧可达（≤ 4 B，或 FD 下 ≤ 8 B）--- */
     if (len <= 4u || ctx->cfg.is_fd) {
@@ -12403,6 +12439,192 @@ int jsdk_joint_sdo_write(jsdk_joint_t *j, jsdk_sdo_handle_t h)
                               s->data, (uint8_t)s->size, 0u);
     s->state = (uint8_t)((rc == JSDK_OK) ? JSDK_SDO_SUCCESS : JSDK_SDO_ERROR);
     return rc;
+}
+
+/* ==========================================================================
+ * function 端点调用（Fibre 方法）
+ *
+ * 线上序列（与 ODrive Fibre 一致）：
+ *   1. 逐个写 inputs —— 每个入参在描述符里都有自己的端点 ID，
+ *      路径 = "<function_path>.<input_name>"
+ *   2. 写 function 端点本身（触发设备侧执行）
+ *   3. 逐个读 outputs（同样各有自己的端点 ID）
+ *
+ * ⚠ 为什么不能用现成的 param_set/param_get：
+ *   (a) function 端点**没有 access 字段** ⇒ param_set 会以"read-only"拒绝；
+ *   (b) `jsdk_ep_type_size(FUNCTION) == 0` ⇒ value_to_le 直接失败。
+ *   所以本函数自己按路径解析子端点并编解码。
+ *
+ * ⚠ 端点发现不靠"猜名字"：解析器把 inputs/outputs 里的嵌套对象**自动展平**成
+ *   带路径的端点（实测 v8：`axis0.controller.move_incremental.displacement`
+ *   → id 350，access=rw；其 output 为 `…remove_anticogging_bias.val`，access=r）。
+ *   因此这里用精确查表；任一子端点缺失就在**发任何帧之前**返回 NOT_FOUND，
+ *   绝不"写了一半才发现不对"。
+ *
+ * ⚠ 子端点顺序 = 描述符声明顺序 = `jsdk_ep_store_at()` 的遍历顺序
+ *   （解析器按 JSON 文本顺序 emit）。inputs 在前、outputs 在后由**协议生成器**
+ *   保证；这里不假设两者在文本里的相对次序，而是**按 access 位**区分：
+ *   可写 → input，不可写 → output。这与固件语义一致（入参 rw，出参 r）。
+ * ======================================================================== */
+
+/** 收集 `<fn_path>.<name>` 形式的**直接**子端点（一层，名字里不再含 '.'）。 */
+static unsigned fn_children(jsdk_joint_t *j, const char *fn_path,
+                            uint16_t *ids, jsdk_ep_type_t *types, uint8_t *accs,
+                            unsigned max)
+{
+    size_t flen = strlen(fn_path);
+    unsigned n = jsdk_ep_store_count(&j->ctx->store);
+    unsigned i, got = 0u;
+
+    for (i = 0u; i < n && got < max; ++i) {
+        const char *path = NULL;
+        uint16_t id = 0u;
+        jsdk_ep_type_t ty = JSDK_EP_JSON;
+        uint8_t acc = 0u;
+
+        if (jsdk_ep_store_at(&j->ctx->store, i, &path, &id, &ty, &acc) != JSDK_OK) {
+            continue;
+        }
+        if (!path) continue;
+        if (strncmp(path, fn_path, flen) != 0) continue;
+        if (path[flen] != '.') continue;
+        if (strchr(path + flen + 1u, '.') != NULL) continue;   /* 只要直接子节点 */
+
+        ids[got]   = id;
+        types[got] = ty;
+        accs[got]  = acc;
+        got++;
+    }
+    return got;
+}
+
+/** function 子端点上限：实测 v8 最多 3 个（inputs+outputs 合计）。留足余量。 */
+#define JSDK_FN_MAX_CHILDREN 8u
+
+jsdk_status_t jsdk_joint_ep_invoke(jsdk_joint_t *j, const char *path,
+                                   const jsdk_value_t *in, unsigned n_in,
+                                   jsdk_value_t *out,      unsigned n_out,
+                                   unsigned *out_got)
+{
+    uint16_t fn_ep = 0u;
+    jsdk_ep_type_t fn_type = JSDK_EP_JSON;
+    uint8_t fn_access = 0u;
+    jsdk_status_t st;
+    uint16_t      cids[JSDK_FN_MAX_CHILDREN];
+    jsdk_ep_type_t ctypes[JSDK_FN_MAX_CHILDREN];
+    uint8_t       caccs[JSDK_FN_MAX_CHILDREN];
+    unsigned n_child, n_in_ep = 0u, n_out_ep = 0u, k;
+
+    if (out_got) *out_got = 0u;
+    if (!j || !path) return JSDK_ERR_INVALID_ARG;
+    if (!j->ctx->desc_present) {
+        jsdk_joint_seterr(j, "descriptor not available: configure() first");
+        return JSDK_ERR_BAD_STATE;
+    }
+
+    /* --- 0. 目标必须是 function --- */
+    st = resolve(j, path, &fn_ep, &fn_type, &fn_access);
+    if (st != JSDK_OK) return st;
+    if (fn_type != JSDK_EP_FUNCTION) {
+        jsdk_joint_seterr(j, "not a function endpoint: %s (type=%s)", path,
+                          jsdk_ep_type_string(fn_type));
+        return JSDK_ERR_UNSUPPORTED;
+    }
+
+    /*
+     * --- 1. 预勘察：解析全部子端点，保证"要么全都合法、要么一帧都不发" ---
+     *
+     * 若边写边查，中途失败会把设备 input 改成"半新半旧"，下一次调用可能用错
+     * 参数 —— 比直接报错危险得多。
+     */
+    n_child = fn_children(j, path, cids, ctypes, caccs, JSDK_FN_MAX_CHILDREN);
+    for (k = 0u; k < n_child; ++k) {
+        if (!jsdk_ep_type_is_scalar(ctypes[k]) || jsdk_ep_type_size(ctypes[k]) == 0u) {
+            jsdk_joint_seterr(j, "function child %u is not a scalar (type=%s)", k,
+                              jsdk_ep_type_string(ctypes[k]));
+            return JSDK_ERR_UNSUPPORTED;
+        }
+        if (caccs[k] & JSDK_EP_ACCESS_W) n_in_ep++;
+        else                            n_out_ep++;
+    }
+
+    if (n_in != n_in_ep) {
+        jsdk_joint_seterr(j, "%s expects %u input(s), got %u", path, n_in_ep, n_in);
+        return JSDK_ERR_INVALID_ARG;
+    }
+
+    /* --- 2. 逐个写 inputs（按声明顺序，第 written 个对应 in[written]） --- */
+    {
+        unsigned written = 0u;
+
+        for (k = 0u; k < n_child && written < n_in_ep; ++k) {
+            uint8_t buf[8];
+            uint8_t len = 0u;
+
+            if (!(caccs[k] & JSDK_EP_ACCESS_W)) continue;   /* 是 output */
+            if (in[written].type != ctypes[k]) {
+                jsdk_joint_seterr(j,
+                    "input %u type mismatch for %s: descriptor=%s given=%s",
+                    written, path, jsdk_ep_type_string(ctypes[k]),
+                    jsdk_ep_type_string(in[written].type));
+                return JSDK_ERR_PROTOCOL;
+            }
+            if (value_to_le(ctypes[k], &in[written], buf, &len) != 0) {
+                jsdk_joint_seterr(j, "input %u cannot be encoded", written);
+                return JSDK_ERR_UNSUPPORTED;
+            }
+            {
+                int rc = jsdk_ctx_write_param(j->ctx, j->cfg.node_id, cids[k],
+                                              buf, len, 0u);
+                if (rc != JSDK_OK) {
+                    jsdk_joint_seterr(j, "write input %u failed (%s)", written,
+                                      jsdk_status_string((jsdk_status_t)rc));
+                    return (jsdk_status_t)rc;
+                }
+            }
+            written++;
+        }
+    }
+
+    /* --- 3. 写 function 端点本身：这一步触发设备侧执行 --- */
+    {
+        int rc = jsdk_ctx_write_param(j->ctx, j->cfg.node_id, fn_ep, NULL, 0u, 0u);
+        if (rc != JSDK_OK) {
+            jsdk_joint_seterr(j, "invoke %s failed (%s)", path,
+                              jsdk_status_string((jsdk_status_t)rc));
+            return (jsdk_status_t)rc;
+        }
+    }
+
+    /* --- 4. 逐个读 outputs --- */
+    {
+        unsigned got = 0u;
+
+        for (k = 0u; k < n_child; ++k) {
+            uint8_t buf[8];
+            uint8_t need, len = 0u;
+
+            if (caccs[k] & JSDK_EP_ACCESS_W) continue;      /* 是 input */
+
+            if (out && got < n_out) {
+                need = (uint8_t)jsdk_ep_type_size(ctypes[k]);
+                {
+                    int rc = jsdk_ctx_read_param_exact(j->ctx, j->cfg.node_id,
+                                                       cids[k], buf, need, &len, 0u);
+                    if (rc != JSDK_OK) {
+                        jsdk_joint_seterr(j, "read output %u failed (%s)", got,
+                                          jsdk_status_string((jsdk_status_t)rc));
+                        return (jsdk_status_t)rc;
+                    }
+                }
+                le_to_value(ctypes[k], buf, &out[got]);
+            }
+            got++;
+        }
+        if (out_got) *out_got = got;
+    }
+
+    return JSDK_OK;
 }
 
 /* ======================== src/core/jsdk_state_poll.c ======================== */
