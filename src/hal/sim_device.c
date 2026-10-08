@@ -617,8 +617,12 @@ static void apply_requested_state(sim_bus_t *b, sim_node_t *n, uint8_t want)
         break;
 
     case SIM_AS_FULL_CALIB:
-        /* ⚠ 报**子状态**（真机实测 4 → 7 → 1），而不是 3：
-           否则“拿 current_state == 3 当判据”的错在仿真上永远绿。 */
+        /* ⚠ 报**子状态**、且复刻**真机的完整轨迹**，而不是只报一个：
+           固件 `axis.cpp:487-493` 的 task_chain 是
+             MOTOR_CALIBRATION(4) → MOTOR_DEADTIME_CALIBRATION(16)
+             → ENCODER_INDEX_SEARCH(6) → ENCODER_OFFSET_CALIBRATION(7)
+           旧模型只走 `4 → 7 → 1`，于是 `state_is_busy()` 漏判 15/16 的缺陷
+           在仿真里**永远绿**（真机复现：calibrate 在 state=16 时就返回 OK）。 */
         n->armed              = 0u;
         n->cal_stage          = 1u;
         n->current_state      = SIM_AS_MOTOR_CALIB;
@@ -628,12 +632,17 @@ static void apply_requested_state(sim_bus_t *b, sim_node_t *n, uint8_t want)
 
     case SIM_AS_HOMING:
         n->armed = 1u;
+        n->cal_stage = 0u;          /* 新请求取代之前的序列（与固件一致） */
         n->current_state = SIM_AS_HOMING;
         n->transient_until_ms = b->now_ms + SIM_TRANSIENT_MS;
         n->settle_to = SIM_AS_CLOSED_LOOP;
         break;
 
     default:
+        /* ⚠ 也清 `cal_stage`：否则“上一次标定被打断”会残留在 stage 里，
+           下一次瞬时到期时按**旧 stage** 跳转 —— 真机不会这样
+           （写 `requested_state` 会重置 task_chain）。 */
+        n->cal_stage = 0u;
         n->current_state = want;
         n->transient_until_ms = b->now_ms + SIM_TRANSIENT_MS;
         n->settle_to = SIM_AS_IDLE;
@@ -1357,15 +1366,29 @@ void sim_tick(sim_bus_t *b, uint32_t now_ms)
             if (n->transient_until_ms != 0u
                 && (int32_t)(t - n->transient_until_ms) >= 0) {
                 if (n->cal_stage == 1u) {
-                    /* 电机标定跑完 → 进第二个子状态（真机实测：7 = 索引搜索），
-                       并置 motor.pre_calibrated（固件在电机标定成功后就置）。 */
+                    /* 电机标定(4)跑完 → 置 motor.pre_calibrated（固件在电机标定
+                       成功后就置），进**死区标定(16)**。
+                       ⚠ 16 必须走：真机复现过——它不在 `state_is_busy()` 里时，
+                         SDK 会在电机仍转动时就把 calibrate 判成“跑完”。 */
                     n->motor_pre_cal      = 1u;
                     n->cal_stage          = 2u;
-                    n->current_state      = SIM_AS_ENC_INDEX_SEARCH;
+                    n->current_state      = SIM_AS_MOTOR_DEADTIME;
                     n->state_change_ms    = t;
                     n->transient_until_ms = t + SIM_CAL_STAGE_MS;
                 } else if (n->cal_stage == 2u) {
-                    /* 第二个子状态跑完 → 编码器标定生效，回静息 */
+                    /* 死区标定(16) → 索引搜索(6) */
+                    n->cal_stage          = 3u;
+                    n->current_state      = SIM_AS_ENC_INDEX_SEARCH;
+                    n->state_change_ms    = t;
+                    n->transient_until_ms = t + SIM_CAL_STAGE_MS;
+                } else if (n->cal_stage == 3u) {
+                    /* 索引搜索(6) → 编码器偏置(7) */
+                    n->cal_stage          = 4u;
+                    n->current_state      = SIM_AS_ENC_OFFSET;
+                    n->state_change_ms    = t;
+                    n->transient_until_ms = t + SIM_CAL_STAGE_MS;
+                } else if (n->cal_stage == 4u) {
+                    /* 偏置标定(7)跑完 → 编码器标定生效，回静息 */
                     n->enc_pre_cal        = 1u;
                     n->cal_stage          = 0u;
                     n->current_state      = n->settle_to;

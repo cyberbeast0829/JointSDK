@@ -87,14 +87,25 @@ extern "C" {
 #define SIM_CM_TORQUE   1u
 #define SIM_CM_VELOCITY 2u
 #define SIM_CM_POSITION 3u
-/** `Axis::AxisState` */
-#define SIM_AS_IDLE              1u
-#define SIM_AS_MOTOR_CALIB       4u   /* 全标定的第一个子状态 */
-#define SIM_AS_ENC_INDEX_SEARCH  7u   /* 真机实测的第二个子状态 */
-#define SIM_AS_CLOSED_LOOP       8u
+/** `Axis::AxisState` —— **值以固件 `autogen/interfaces.hpp` 的 `AxisState` 为准**。
+ *
+ *  ⚠⚠ 这里曾经写错并因此**漏掉一个真缺陷**：旧表把 7 当成 `ENC_INDEX_SEARCH`
+ *  （实际 `AXIS_STATE_ENCODER_OFFSET_CALIBRATION = 7`，
+ *    `AXIS_STATE_ENCODER_INDEX_SEARCH = 6`），并且**完全没有 16**
+ *  （`MOTOR_DEADTIME_CALIBRATION`）。于是模型只走 `4 → 7 → 1`，
+ *  而真机全标定走 `4 → 16 → 6 → 7 → 1` —— 模型不复刻真轨迹，
+ *  就让 `state_is_busy()` 漏判 15/16 的缺陷在仿真里**永远是绿的**。 */
+#define SIM_AS_UNDEFINED         0u   /* AXIS_STATE_UNDEFINED */
+#define SIM_AS_IDLE              1u   /* AXIS_STATE_IDLE */
 #define SIM_AS_FULL_CALIB        3u   /* AXIS_STATE_FULL_CALIBRATION_SEQUENCE */
+#define SIM_AS_MOTOR_CALIB       4u   /* AXIS_STATE_MOTOR_CALIBRATION */
+#define SIM_AS_ENC_INDEX_SEARCH  6u   /* AXIS_STATE_ENCODER_INDEX_SEARCH（**6**） */
+#define SIM_AS_ENC_OFFSET        7u   /* AXIS_STATE_ENCODER_OFFSET_CALIBRATION（**7**） */
+#define SIM_AS_CLOSED_LOOP       8u   /* AXIS_STATE_CLOSED_LOOP_CONTROL */
 #define SIM_AS_HOMING           11u   /* AXIS_STATE_HOMING */
-#define SIM_AS_UNDEFINED         0u
+#define SIM_AS_MOTOR_DEADTIME   16u   /* AXIS_STATE_MOTOR_DEADTIME_CALIBRATION
+                                         —— 全标定会经过它；SDK 曾把 16 误判成
+                                         “非忙态” ⇒ 电机还在转就返回 OK */
 
 /** 标定/回零瞬时状态持续多久（ms）—— 真实固件是几百 ms 到数秒。 */
 #define SIM_TRANSIENT_MS        50u
