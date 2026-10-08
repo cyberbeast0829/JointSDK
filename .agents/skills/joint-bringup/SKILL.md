@@ -1,6 +1,6 @@
 ---
-name: joint-debug
-description: "Debug and commission CyberBeast joint modules over CAN using the jsdk-joint MCP tools. Use when: a joint won't move, reports an error or fault, parameters won't write or won't take effect, calibration (calibrate) or homing (home) fails, or you need to read joint state / raw error bits / telemetry / endpoint descriptors. 适用于：关节不动、报错、参数写不进去、标定或回零过不去、要读状态/原始错误位/遥测/端点表。"
+name: joint-bringup
+description: "Bring up, commission and debug CyberBeast joint modules over CAN using the jsdk-joint MCP tools. Use when: bringing a joint up from power-on, calibrating or homing it, or when a joint won't move, reports an error or fault, parameters won't write or won't take effect, calibration or homing fails, or you need to read joint state / raw error bits / telemetry / endpoint descriptors. 适用于：把关节从首次上电调通、标定/回零，以及关节不动、报错、参数写不进去、标定或回零过不去、要读状态/原始错误位/遥测/端点表。"
 ---
 
 # 关节模组调测（CyberBeast / JointSDK）
@@ -15,6 +15,7 @@ description: "Debug and commission CyberBeast joint modules over CAN using the j
 
 ## 何时用
 
+- **把一台关节从首次上电调通**（建链 → 读状态 → 写参数 → 标定）
 - 关节**不动** / 报错 / 行为异常
 - **参数写不进去**，或写成功但"没生效"
 - **标定 / 回零过不去**

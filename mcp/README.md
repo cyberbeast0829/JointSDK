@@ -151,7 +151,7 @@ MCP 层只做一件事：**如实转译语义**，并补上 SDK 不做的那一�
 |---|---|---|
 | `AGENTS.md` | 关节模组的**领域知识**（铁律、物理事实、单位陷阱） | **纪律** |
 | 本 MCP server | **能实际读、写设备**的 16 个工具 | **手** |
-| `.agents/skills/joint-debug/` | 把上面两者编排成**可执行流程** | **脑** |
+| `.agents/skills/joint-bringup/` | 把上面两者编排成**可执行流程** | **脑** |
 
 ⚠ **要给别的 AI 工具的用户用，看 [`docs/AI_AGENT_SETUP.zh-CN.md`](../docs/AI_AGENT_SETUP.zh-CN.md)** ——
 skill 目录各家不重合（Codex 读 `.agents/skills/`、Claude Code 只读 `.claude/skills/`），

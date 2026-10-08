@@ -12,7 +12,7 @@
 | 交付物 | 作用 | 它是什么形态 | 怎么分发 |
 |---|---|---|---|
 | **`AGENTS.md`**（仓库根） | **纪律** —— 关节的领域规则（写后必读回、窄类型会静默丢帧、单位陷阱…） | 一个 Markdown 文件 | 放进仓库根，**多数工具自动读** |
-| **`.agents/skills/joint-debug/`** | **脑** —— 把规则编排成可执行流程 | Agent Skills 标准目录 | 复制/软链到你的工具的 skills 目录 |
+| **`.agents/skills/joint-bringup/`** | **脑** —— 把规则编排成可执行流程 | Agent Skills 标准目录 | 复制/软链到你的工具的 skills 目录 |
 | **`mcp/jsdk_joint_mcp/`** | **手** —— 16 个工具，能实际读写关节 | Python 包（任何 MCP 客户端可用） | **随仓库克隆**（不必安装 Python 包）+ 在客户端里配 MCP server |
 
 三者**缺一不可**：
@@ -58,7 +58,7 @@ python -c "from jsdk_can import _abi; print(_abi.loaded_path())"
 
 ---
 
-## 2. 装 Skill（`joint-debug`）
+## 2. 装 Skill（`joint-bringup`）
 
 ### 2.1 为什么放在 `.agents/skills/`
 
@@ -78,7 +78,7 @@ Agent Skills 是**开放标准**（[agentskills.io](https://agentskills.io/)）�
 
 ### 2.2 仓库内（推荐：团队共享）
 
-什么都不用做 —— `.agents/skills/joint-debug/` 已在仓库里。
+什么都不用做 —— `.agents/skills/joint-bringup/` 已在仓库里。
 你在 JointSDK 仓库里打开 AI 工具，**Codex 与 VS Code Copilot 会直接发现它**。
 
 ### 2.3 Claude Code 用户
@@ -88,12 +88,12 @@ Claude Code **只**读 `.claude/skills/`。在你的项目里加一个软链或�
 ```bash
 # 软链（推荐：改一处即可，不会漂移）
 mkdir -p .claude/skills
-ln -s ../../.agents/skills/joint-debug .claude/skills/joint-debug   # Linux / macOS
+ln -s ../../.agents/skills/joint-bringup .claude/skills/joint-bringup   # Linux / macOS
 # Windows（需开发者模式或管理员）：
-mklink /D .claude\skills\joint-debug ...\.agents\skills\joint-debug
+mklink /D .claude\skills\joint-bringup ...\.agents\skills\joint-bringup
 
 # 或者直接拷贝（简单，但要记得重新同步）
-cp -r .agents/skills/joint-debug .claude/skills/
+cp -r .agents/skills/joint-bringup .claude/skills/
 ```
 
 ### 2.4 装在**用户级**（不克隆仓库也想用）
@@ -101,7 +101,7 @@ cp -r .agents/skills/joint-debug .claude/skills/
 技能文件夹是自包含的，拷到用户目录即可在所有项目里生效：
 
 ```bash
-SKILL=<JointSDK>/.agents/skills/joint-debug
+SKILL=<JointSDK>/.agents/skills/joint-bringup
 
 mkdir -p ~/.agents/skills  && cp -r "$SKILL" ~/.agents/skills/     # Codex
 mkdir -p ~/.claude/skills  && cp -r "$SKILL" ~/.claude/skills/     # Claude Code
@@ -123,7 +123,7 @@ mkdir -p ~/.copilot/skills && cp -r "$SKILL" ~/.copilot/skills/    # VS Code / C
 
 | 工具 | 怎么看装好了 |
 |---|---|
-| VS Code | 命令面板 `MCP: List Servers` 旁的 skill 列表，或聊天框输入 `/` 找 `joint-debug` |
+| VS Code | 命令面板 `MCP: List Servers` 旁的 skill 列表，或聊天框输入 `/` 找 `joint-bringup` |
 | Codex | `/skills` |
 | Claude Code | `/skills` |
 
@@ -131,7 +131,7 @@ mkdir -p ~/.copilot/skills && cp -r "$SKILL" ~/.copilot/skills/    # VS Code / C
 *"参数写不进去"*。
 
 ⚠ **发现 ≠ 一定会调用**：各家都是按 `description` 匹配，不保证每个相关提问都会触发。
-需要时直接点名：`/joint-debug`、`$joint-debug`。
+需要时直接点名：`/joint-bringup`。
 
 ---
 
