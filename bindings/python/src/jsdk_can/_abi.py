@@ -466,7 +466,7 @@ def library_search_path() -> list[str]:
 
     here = os.path.dirname(os.path.abspath(__file__))
     lib = os.path.join(here, "lib")
-    out.extend(os.path.join(lib, n) for n in names)
+    out.extend(_lib_dir_candidates(lib, names))
 
     # ⚠ **兜底 glob**（B9）：包内 lib/ 里到底叫什么名字，不能假设。
     #   真实事故：CMake 在 Linux 上拷进去的是 `libjsdk_can.so.0.1.0`
@@ -474,9 +474,6 @@ def library_search_path() -> list[str]:
     #   `libjsdk_can.so` / `.so.0` → **包自带库却找不到**，Windows 因为 dll 不带
     #   版本号而一直没暴露。这里把 lib/ 下所有 `libjsdk_can.*` / `jsdk_can.*`
     #   都列上（已存在的才列），于是“换个版本号就找不到”这类问题不再可能。
-    if os.path.isdir(lib):
-        out.extend(sorted(glob.glob(os.path.join(lib, "libjsdk_can.*"))
-                          + glob.glob(os.path.join(lib, "jsdk_can.*"))))
 
     # 开发布局：bindings/python/src/jsdk_can/_abi.py → 仓库根
     root = os.path.abspath(os.path.join(here, "..", "..", "..", ".."))
@@ -494,7 +491,62 @@ def library_search_path() -> list[str]:
     return uniq
 
 
+def _lib_dir_candidates(lib: str, names: list[str]) -> list[str]:
+    """包内 ``lib/`` 下的候选，**按 mtime 从新到旧**。
+
+    ⚠ 为什么必须看 mtime（真机踩过，代价是一次错误的"修复无效"结论）：
+    Windows 上两个名字都可能存在，取决于**哪个工具链最后构建过**：
+
+    | 工具链 | 产物 |
+    |---|---|
+    | MinGW | ``libjsdk_can.dll`` |
+    | MSVC  | ``jsdk_can.dll`` |
+
+    而 ``_LIB_CANDIDATES["windows"]`` 把 ``jsdk_can.dll`` 排在前面 ⇒
+    **另一个工具链留下的旧产物会把新构建的库盖掉**。症状极具迷惑性：
+    "改了 C 代码、重建了 dll、跑真机 —— 行为**一点没变**"（实测：标定修复前后
+    ``elapsed`` 完全相同，13.437 s），于是很容易得出"修复无效"的错误结论。
+
+    CMake 的清理清单只删**其它平台**的名字，管不到同平台的另一个名字，
+    所以这里按时间择优；同时在 :func:`loaded_path` 里记录实际加载的文件，
+    让"我到底在跑哪个库"**可回答**。
+    """
+    if not os.path.isdir(lib):
+        return [os.path.join(lib, n) for n in names]
+
+    found: list[str] = []
+    for n in names:
+        p = os.path.join(lib, n)
+        if os.path.isfile(p):
+            found.append(p)
+    # 连带 glob 进来的（带版本号等）一起参与排序
+    for p in (glob.glob(os.path.join(lib, "libjsdk_can.*"))
+              + glob.glob(os.path.join(lib, "jsdk_can.*"))):
+        if p not in found:
+            found.append(p)
+
+    # 保持"确实存在"的在前，再按 mtime 降序（新的优先）
+    existing = [p for p in found if os.path.isfile(p)]
+    existing.sort(key=os.path.getmtime, reverse=True)
+    # 不存在的裸名仍保留在后面，交给系统加载器兜底
+    missing = [os.path.join(lib, n) for n in names]
+    return existing + missing
+
+
 _CACHED_LIB: ctypes.CDLL | None = None
+#: 实际加载成功的文件路径（``None`` = 交给系统加载器）。
+#: ⚠ 别再靠猜 —— "我改了 C 代码重建了，行为却没变" 的第一问就是它。
+_LOADED_PATH: str | None = None
+
+
+def loaded_path() -> str | None:
+    """返回**实际加载**的库文件路径（未加载时先尝试加载）。
+
+    排查"陈旧二进制"专用：把它的 mtime 和源文件对一下就知道了。
+    """
+    if _CACHED_LIB is None:
+        lib()
+    return _LOADED_PATH
 
 
 def lib() -> ctypes.CDLL:
@@ -514,6 +566,7 @@ def load_library(path: str | None = None) -> ctypes.CDLL:
     """加载共享库。``path`` 为 None 时按 :func:`library_search_path` 依次尝试。"""
     from .errors import LibraryNotFoundError
 
+    global _LOADED_PATH
     tried: list[str] = []
     candidates = [path] if path else library_search_path()
 
@@ -524,6 +577,8 @@ def load_library(path: str | None = None) -> ctypes.CDLL:
             tried.append(f"{cand or '(系统加载器)'}: {exc}")
             continue
         _initialise(lib)
+        # ⚠ 记录**实际加载**的文件（可回答"我跑的是哪个库、它多旧"）
+        _LOADED_PATH = cand or None
         return lib
 
     raise LibraryNotFoundError(

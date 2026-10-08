@@ -287,12 +287,19 @@ if(JSDK_BUILD_SHARED AND JSDK_BUILD_PYTHON)
   #   `libjsdk_can.dll` 本来就不带版本号，一直没暴露。
   if(WIN32)
     set(_jsdk_py_libname "$<TARGET_FILE_NAME:jsdk_can_shared>")
-    # 别的平台的库（lib/ 里全是构建产物；混一份用不上的进来会让打出的 wheel 变脏，
-    # 也会让"包内库叫什么名字"同时存在两个真相）
-    set(_jsdk_py_stale "libjsdk_can.so" "jsdk_can.so" "libjsdk_can.dylib")
+    # ⚠ **Windows 上两个名字都要清**：
+    #   MinGW 产出 `libjsdk_can.dll`，MSVC 产出 `jsdk_can.dll`（MSVC 不加 lib 前缀）。
+    #   而包内加载器（`_abi.py` 的 `_LIB_CANDIDATES["windows"]`）把 `jsdk_can.dll`
+    #   排在前面 ⇒ **另一个工具链留下的旧产物会盖掉刚构建的库**，症状是
+    #   "改了 C 代码、重建了 dll、行为一点没变"（真机踩过：标定修复前后 elapsed
+    #   完全相同）。这里先两个都删掉，再拷入本次构建的产物。
+    #   （加载器侧另有 mtime 择优 + `_abi.loaded_path()` 可查，双保险。）
+    set(_jsdk_py_stale "libjsdk_can.dll" "jsdk_can.dll"
+                       "libjsdk_can.so" "jsdk_can.so" "libjsdk_can.dylib")
   elseif(APPLE)
     set(_jsdk_py_libname "libjsdk_can.dylib")
-    set(_jsdk_py_stale "libjsdk_can.dll" "jsdk_can.dll" "libjsdk_can.so")
+    set(_jsdk_py_stale "libjsdk_can.dll" "jsdk_can.dll"
+                       "libjsdk_can.so" "jsdk_can.so")
   else()
     set(_jsdk_py_libname "libjsdk_can.so")
     set(_jsdk_py_stale "libjsdk_can.dll" "jsdk_can.dll" "libjsdk_can.dylib")
