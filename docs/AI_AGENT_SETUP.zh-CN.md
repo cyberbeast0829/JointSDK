@@ -13,7 +13,7 @@
 |---|---|---|---|
 | **`AGENTS.md`**（仓库根） | **纪律** —— 关节的领域规则（写后必读回、窄类型会静默丢帧、单位陷阱…） | 一个 Markdown 文件 | 放进仓库根，**多数工具自动读** |
 | **`.agents/skills/joint-debug/`** | **脑** —— 把规则编排成可执行流程 | Agent Skills 标准目录 | 复制/软链到你的工具的 skills 目录 |
-| **`mcp/jsdk_joint_mcp/`** | **手** —— 16 个工具，能实际读写关节 | Python 包（任何 MCP 客户端可用） | `pip install` + 在客户端里配置 MCP server |
+| **`mcp/jsdk_joint_mcp/`** | **手** —— 16 个工具，能实际读写关节 | Python 包（任何 MCP 客户端可用） | **随仓库克隆**（不必安装 Python 包）+ 在客户端里配 MCP server |
 
 三者**缺一不可**：
 只有 MCP → agent 有能力但不知何时用、容易误用（尤其写操作与动电机）；
@@ -107,6 +107,13 @@ mkdir -p ~/.agents/skills  && cp -r "$SKILL" ~/.agents/skills/     # Codex
 mkdir -p ~/.claude/skills  && cp -r "$SKILL" ~/.claude/skills/     # Claude Code
 mkdir -p ~/.copilot/skills && cp -r "$SKILL" ~/.copilot/skills/    # VS Code / Copilot
 ```
+
+⚠ **只拷 skill 是不够的**：skill 里的流程会让你调 `jsdk_*` 工具（**手**），
+而那些工具来自本仓库的 MCP server。所以要同时满足：**skill 已装** + **MCP server 已配**（第 3 节）。
+只装 skill 的表现是——agent 知道该做什么，但伸手都是空的。
+
+⚠ 本仓库目前**不发 PyPI**：MCP server 随仓库克隆使用。
+所以“用户级装 skill”适合**你已经有 JointSDK 仓库**、只是想在别的项目里也用上它的场景。
 
 > ⚠ 用户级与仓库级**同时存在**时，会出现两份 —— 按上面的表格选**一种**即可。
 > （Claude Code 对指向同一目标的软链会去重；仓库级路径在 `~/.claude/skills/` 面前

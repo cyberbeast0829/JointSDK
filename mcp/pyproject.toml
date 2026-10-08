@@ -8,13 +8,17 @@ version = "0.1.0"
 description = "MCP server for CyberBeast joint modules — help an AI agent get the joint working"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "Proprietary" }
-# ⚠ 不能把 Python 绑定列为**硬依赖**：`cyberbeast-joint-sdk` 尚未发布到 PyPI，
-#    硬依赖会让本包**根本装不上**（pip 解析依赖就失败）。
-#    绑定缺失时 paths.py 会给出可执行的提示（JSDK_PYTHON_SRC / 走仓库内 bindings/python）。
-#    等绑定发上去了，再 `pip install jsdk-joint-mcp[sdk]`。
+# 与仓库根 LICENSE 一致（MIT）。
+# 保留 `{ text = ... }` 写法而不是 PEP 639 的 `license = "MIT"`：后者要 setuptools>=77，
+# 而 build-system 只要求 >=64（旧工具链也要能构建）。
+license = { text = "MIT" }
+# 分发方式：**只随仓库克隆**，不发布到 PyPI。
+# 即便如此也不能把绑定写成硬依赖：`cyberbeast-joint-sdk` 不在 PyPI 上，
+# 硬依赖会让本包**根本装不上**（pip 解析依赖就失败）。
+# 绑定缺失时 paths.py 会给出可执行提示（JSDK_PYTHON_SRC / 自动向上找 bindings/python）。
 dependencies = []
 
+# 仅在「绑定也发到 PyPI」之后才有意义：`pip install jsdk-joint-mcp[sdk]`。
 [project.optional-dependencies]
 sdk = ["cyberbeast-joint-sdk>=0.1"]
 

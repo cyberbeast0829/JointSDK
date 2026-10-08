@@ -11,7 +11,9 @@ readme = "README.md"
 # 包内只用到注解层面的新语法，见各模块的 __future__ import）。
 # 开发机是 3.12，两套都在跑测试。
 requires-python = ">=3.8"
-license = { text = "Proprietary" }
+# 与仓库根 LICENSE 一致（MIT）。
+# 保留 `{ text = ... }` 写法而不是 PEP 639 的 `license = "MIT"`：后者要 setuptools>=77。
+license = { text = "MIT" }
 authors = [{ name = "JointSDK team" }]
 keywords = ["can", "canfd", "robotics", "joint", "mit", "odrive", "cyberbeast"]
 classifiers = [
