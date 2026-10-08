@@ -143,14 +143,22 @@ MCP 层只做一件事：**如实转译语义**，并补上 SDK 不做的那一�
 
 ----
 
-## 与 `AGENTS.md` 的关系
+## 与 `AGENTS.md` / Skill 的关系
 
-`AGENTS.md` 是**给 agent 的领域知识**（约束和流程）；
-本 server 是**给 agent 的手**（能实际读到、写到设备）。
+三者分工：
 
-两者配合：agent 从 `AGENTS.md` 学到"值宽 <4 的端点会静默丢帧"，
+| 部件 | 是什么 | 给 agent 的 |
+|---|---|---|
+| `AGENTS.md` | 关节模组的**领域知识**（铁律、物理事实、单位陷阱） | **纪律** |
+| 本 MCP server | **能实际读、写设备**的 16 个工具 | **手** |
+| `.github/skills/joint-debug/` | 把上面两者编排成**可执行流程** | **脑** |
+
+配合方式：agent 从 `AGENTS.md` 学到"值宽 <4 的端点会静默丢帧"，
 从本 server 的 `jsdk_write_param` 拿到 `verified:false` + 对应的 `hint`，
-于是知道下一步该查什么 —— 而不是去怀疑波特率。
+从 Skill 的 `references/write-param.md` 知道**下一步按什么顺序查** ——
+而不是去怀疑波特率。
+
+⚠ 三者**都不替 agent 下结论**：工具如实报告，判断由 agent 做。
 
 ---
 
