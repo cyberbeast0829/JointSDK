@@ -151,11 +151,22 @@ static int write_u8_ep(jsdk_joint_t *j, uint16_t ep, uint8_t v)
  */
 /**
  * “序列正在跑”的状态集合（固件 `AxisState`）：启动序列 / 全标定 / 电机标定 /
- * 编码器偏置 / 索引搜索 / LOCKIN 自转 / 方向探测 / 回零 / HALL 标定 / 齿槽标定。
+ * 索引搜索 / 编码器偏置 / LOCKIN 自转 / 方向探测 / 回零 / HALL 标定 /
+ * 惯量标定 / 线性化 / 死区标定。
  *
- * ⚠ 全标定（3）在运行期间报的是**子状态**（真机实测 4 → 7 → 1），**从不等于 3** ——
+ * ⚠ 全标定（3）在运行期间报的是**子状态**（真机实测 4 → … → 1），**从不等于 3** ——
  * 拿“等于请求值”当“已进入”，会把一次真跑起来的标定误判成“没开始”；
  * 反过来也不能把“不等于请求值”当“跑完了”（子状态本身就与请求值不等）。
+ *
+ * ⚠⚠ **枚举值/名字一律以 `jsdk_fault.c` 的 `k_can_axis_state[17]` 为准**
+ * （那是按固件 `autogen/interfaces.hpp` 的 `AxisState` 抄的）。本函数曾经：
+ *   ① 注释把 6/7 写反（6 是 INDEX_SEARCH、7 是 OFFSET_CALIBRATION）；
+ *   ② 14 的名字写成 ANTICOGGING（实际是 INERTIA_CALIBRATION）；
+ *   ③ **漏了 15（ENCODER_LINEARIZATION）与 16（MOTOR_DEADTIME_CALIBRATION）**。
+ * ③ 是有实际后果的：真机全标定路径会经过 `MOTOR_DEADTIME_CALIBRATION(16)`，
+ * 而它不在本表 ⇒ `request_state_and_wait()` 把 16 当成“已回到静息” ⇒
+ * **在电机仍在标定时就返回 JSDK_OK**（真机复现：calibrate 返回 OK 的瞬间
+ * `current_state == 16`，随后才走到 7 → 1）。
  */
 static int state_is_busy(uint8_t st)
 {
@@ -163,14 +174,16 @@ static int state_is_busy(uint8_t st)
     case 2u:  /* STARTUP_SEQUENCE                  */
     case 3u:  /* FULL_CALIBRATION_SEQUENCE         */
     case 4u:  /* MOTOR_CALIBRATION                 */
-    case 6u:  /* ENCODER_OFFSET_CALIBRATION        */
-    case 7u:  /* ENCODER_INDEX_SEARCH              */
+    case 6u:  /* ENCODER_INDEX_SEARCH              */
+    case 7u:  /* ENCODER_OFFSET_CALIBRATION        */
     case 9u:  /* LOCKIN_SPIN                       */
     case 10u: /* ENCODER_DIR_FIND                  */
     case 11u: /* HOMING（回零期间就停在这个值）       */
     case 12u: /* ENCODER_HALL_POLARITY_CALIBRATION */
     case 13u: /* ENCODER_HALL_PHASE_CALIBRATION    */
-    case 14u: /* ANTICOGGING_CALIBRATION           */
+    case 14u: /* INERTIA_CALIBRATION               */
+    case 15u: /* ENCODER_LINEARIZATION             */
+    case 16u: /* MOTOR_DEADTIME_CALIBRATION        */
         return 1;
     default:
         return 0;
