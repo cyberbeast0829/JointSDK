@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jsdk-joint-mcp"
+version = "0.1.0"
+description = "MCP server for CyberBeast joint modules — help an AI agent get the joint working"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Proprietary" }
+dependencies = ["jsdk-can>=0.34"]
+
+[project.scripts]
+jsdk-joint-mcp = "jsdk_joint_mcp.server:main"
+
+[tool.setuptools]
+packages = ["jsdk_joint_mcp"]

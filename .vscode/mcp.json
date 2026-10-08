@@ -1,0 +1,14 @@
+{
+  "servers": {
+    "jsdk-joint": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-m", "jsdk_joint_mcp"],
+      "cwd": "${workspaceFolder}\\mcp",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "JSDK_PYTHON_SRC": "${workspaceFolder}\\bindings\\python\\src"
+      }
+    }
+  }
+}
