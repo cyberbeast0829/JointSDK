@@ -29,15 +29,25 @@
 MCP server 通过 **JointSDK 的 Python 绑定**访问设备，所以先要有一个能用的共享库。
 
 ```bash
-# 在 JointSDK 仓库里构建（MinGW 例）
-cmake -S . -B bsh -G "MinGW Makefiles" -DJSDK_WERROR=ON -DJSDK_ENABLE_HEAP=ON -DJSDK_BUILD_SHARED=ON
+# 在 JointSDK 仓库里构建（Windows / MinGW 例）
+cmake -S . -B bsh -G "MinGW Makefiles" -DJSDK_WERROR=ON -DJSDK_ENABLE_HEAP=ON -DJSDK_BUILD_SHARED=ON -DJSDK_BUILD_PYTHON=ON
 cmake --build bsh
 
-# 装 Python 绑定
-pip install -e bindings/python
+# Linux / macOS 例
+cmake -S . -B bsh -DJSDK_WERROR=ON -DJSDK_ENABLE_HEAP=ON -DJSDK_BUILD_SHARED=ON -DJSDK_BUILD_PYTHON=ON
+cmake --build bsh -j
 ```
 
-⚠ 包内自带 `lib/libjsdk_can.dll`（或 `.so`），所以**通常不用**设 `JSDK_LIB_PATH`。
+`-DJSDK_BUILD_PYTHON=ON`（需要 `JSDK_BUILD_SHARED=ON`）会把共享库复制进
+`bindings/python/src/jsdk_can/lib/` —— 即**包内自带库**，所以**通常不用**设 `JSDK_LIB_PATH`。
+
+✅ **跑 MCP server 本身不需要安装 Python 包**：`mcp/jsdk_joint_mcp/paths.py` 会自己
+从文件位置向上找到 `bindings/python/src`。只有**想让普通 `python` 也能 `import jsdk_can`**
+时才需要装（见 §1.1）：
+
+```bash
+cd <JointSDK> && pip install -e bindings/python
+```
 
 **自检**（无硬件也能跑）：
 
@@ -49,12 +59,57 @@ python -m jsdk_joint_mcp.selftest        # 应输出 79/79 通过
 **排查"我到底在跑哪个库"**：
 
 ```bash
+# 走 server 自己的解析逻辑 —— 没装包、任何工作目录都能用（推荐）
+cd <JointSDK>/mcp
+python -c "from jsdk_joint_mcp import paths; paths.ensure_jsdk_can(); from jsdk_can import _abi; print(_abi.loaded_path())"
+
+# 仅当 jsdk_can 已可导入（已安装 / PYTHONPATH 已设）时才成立：
 python -c "from jsdk_can import _abi; print(_abi.loaded_path())"
 ```
+
+⚠ `JSDK_PYTHON_SRC` 只被 `mcp/jsdk_joint_mcp/paths.py` 读 —— 裸 `python -c` 不认它，
+所以上面第二条命令在"什么都没装"的机器上**必然报 ModuleNotFoundError**（不是坏了）。
 
 > ⚠ 真踩过：Windows 上 `jsdk_can.dll`（MSVC）与 `libjsdk_can.dll`（MinGW）可能同时存在，
 > 加载器原先偏好前者 ⇒ **改了 C 代码、重建了、行为一点没变**。已修（按 mtime 择优），
 > 但这条命令能让你随时确认。
+
+### 1.1 让**普通 `python`** 也能 `import jsdk_can`（可选；Linux 上有坑）
+
+⚠ `JSDK_PYTHON_SRC` 只被 `mcp/` 里的 `paths.py` 读；裸 `python -c "import jsdk_can"` 不认它。
+要让普通 Python 也能导入，得把 `bindings/python/src` 放进 `sys.path`（等价于 editable 安装）。
+
+**Linux：Ubuntu 22.04 上 `pip install -e` 会失败**（实测），两种可用修法：
+
+```bash
+# 修法 A（推荐，隔离干净）：venv —— 发行版默认没装 python3-venv
+sudo apt install python3.10-venv
+python3 -m venv ~/.venvs/jsdk
+~/.venvs/jsdk/bin/pip install -U pip setuptools wheel
+~/.venvs/jsdk/bin/pip install -e bindings/python
+# 之后 MCP 客户端里的 command 用 ~/.venvs/jsdk/bin/python
+
+# 修法 B（无 sudo、无副作用）：往用户级 site-packages 放一个 .pth 指向 src
+SP=$(python3 -c "import site; print(site.getusersitepackages())")
+echo "$PWD/bindings/python/src" > "$SP/jsdk-joint-sdk.pth"
+# 撤销：删掉这个 .pth 即可
+```
+
+> ⚠⚠ **根因**（2026-10 在 Ubuntu 22.04 实测）：发行版 **pip 22.0.2 + setuptools 59.6.0**。
+> setuptools 59.6 早于 PEP 621，读不到 `pyproject.toml` 里的 `[project] name`
+> （`python3 setup.py --name` 会输出 `UNKNOWN`）；而 pip < 23.1 的 `pip install -e` 仍走
+> 旧式 `setup.py develop`，把**工程根** `bindings/python`（而不是 `bindings/python/src`）
+> 写进 `easy-install.pth` —— 本包是 src-layout，于是**装了等于没装**
+> （`ModuleNotFoundError: No module named 'jsdk_can'`）。
+> 加 `--use-pep517` 也救不了；`--user` 则会被 setuptools 报
+> `The user site-packages directory is disabled`。
+>
+> ⚠ **别用 `sudo pip install -e` 绕**：会以 root 身份留下
+> `/usr/local/lib/python3.10/dist-packages/{easy-install.pth,UNKNOWN.egg-link}`，
+> 内容同样指向工程根（还是坏的），而且 root 所有，得 `sudo rm` 才清得掉。
+>
+> ⚠ **也别为了修它去升级用户级 setuptools**：跑 ROS（Humble 及更早）的机器上
+> `colcon-core` 要求 `setuptools<80`，用户级新版会**遮蔽**系统自带的那个。
 
 ---
 
@@ -137,7 +192,27 @@ mkdir -p ~/.copilot/skills && cp -r "$SKILL" ~/.copilot/skills/    # VS Code / C
 
 ## 3. 接 MCP server
 
-### 3.1 通用部分
+### 3.1 怎么启动 server（通用部分）
+
+**stdio 的 server 不用你手动常驻** —— 客户端按 3.2~3.5 的配置，在需要时自己 `spawn`
+一个 `python -m jsdk_joint_mcp`，用完关掉。手工跑**只用于排查**（区分"server 的问题"
+还是"客户端配置的问题"）：
+
+```bash
+cd <JointSDK>/mcp          # ⚠ 工作目录必须是 mcp/，否则 `-m jsdk_joint_mcp` 找不到模块
+python -m jsdk_joint_mcp   # 启动后静默等待：stdin 一行一个 JSON-RPC，stdout 一行一个响应
+```
+
+- ⚠ **`python` 这个命令未必存在**：Ubuntu 默认只装 `python3`（要 `python` 得装
+  `python-is-python3`）。本文示例统一写 `python`，你机器上只有 `python3` 就换成 `python3` ——
+  下面各客户端配置里的 `command` 同理。
+- **启动时不打印任何东西是正常的**（没有 "ready" 之类的问候语）。想确认它活着，喂一条
+  `tools/list`（见 §3.6）。
+- stdin 关闭（Ctrl-D）或管道结束 → 进程退出（码 0）。
+- ⚠ **stdout 只承载协议消息**，调试输出必须走 stderr；手工跑时也别往 stdout 打东西，
+  否则会污染 MCP 流（客户端表现为"解析失败"）。
+- **会话寿命 = 进程寿命**：`jsdk_connect` 建的是长寿命会话（描述符约 38 KB、标定约 30 s），
+  同进程内复用 —— 不要每次调用都重连。
 
 命令与参数在所有客户端里都一样，只是**配置文件的写法不同**：
 
@@ -219,14 +294,31 @@ claude mcp add jsdk-joint -- python -m jsdk_joint_mcp
 ⚠ **先确认你的客户端支持本地 stdio**：部分产品只支持远程 HTTP/SSE。
 本 server 目前**只实现 stdio** —— 需要远程传输的话要另外加（见 `mcp/README.md`）。
 
-### 3.6 验证
+### 3.6 验证（不装客户端也能验）
 
 ```bash
 cd <JointSDK>/mcp
+
+# 1) 握手（客户端开机第一句）
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}' | python -m jsdk_joint_mcp
+
+# 2) 工具清单
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | python -m jsdk_joint_mcp
 ```
 
 应返回 16 个 `jsdk_*` 工具。**这一条能区分"server 的问题"还是"客户端配置的问题"**。
+
+**启动失败对照表**：
+
+| 现象 | 原因 | 修法 |
+|---|---|---|
+| `No module named jsdk_joint_mcp` | 工作目录不是 `mcp/` | 配置里 `cwd` 写成 `<JointSDK>/mcp` |
+| 工具返回 `无法加载 jsdk_can（Python 绑定）`（带排查过程） | 绑定没构建 / 路径没配对 | 见 §1；也可显式设 `JSDK_PYTHON_SRC` |
+| 客户端里"连接断开"，命令行却正常 | 中文 Windows cp936 把 `⇒` 之类字符写崩了 | 配 `PYTHONIOENCODING=utf-8` |
+| 工具能调，但报 transport / 打不开通道 | 设备侧：端口权限、帧格式、通道名 | 先跑 `hw_smoke`（§5）；规则见 `AGENTS.md` §3.1 |
+| 手工跑下去"卡住不动" | **正常**：它在等 stdin | 喂 JSON，或 Ctrl-D |
+
+⚠ 排查顺序永远是：**`selftest`（无硬件）→ `tools/list`（协议层）→ `hw_smoke`（真机）**。
 
 ---
 
@@ -255,9 +347,15 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | python -m jsdk_joint_mcp
 
 ```bash
 cd mcp
-python -m jsdk_joint_mcp.selftest                                    # 无硬件：79/79
-python -m jsdk_joint_mcp.hw_smoke --channel COM4 --node 1            # 真机只读：24/24
+python -m jsdk_joint_mcp.selftest                                        # 无硬件：79/79
+python -m jsdk_joint_mcp.hw_smoke --if virtual                           # 无硬件也能跑
+python -m jsdk_joint_mcp.hw_smoke --if slcan --channel COM4 --node 1     # 真机只读：24/24
+python -m jsdk_joint_mcp.hw_smoke --if socketcan --channel can0 --node 1 # Linux SocketCAN / CANable
 ```
+
+⚠ `--channel` 的含义随后端不同：slcan 是串口（`COM4` / `/dev/ttyACM0`），
+socketcan 是接口名（`can0`）。Linux 上用 slcan 时串口通常属于 `root:dialout 660` ——
+把自己加进 `dialout` 组（`sudo usermod -aG dialout $USER`，重新登录）或用 `sudo` 跑。
 
 真机细节（含标定、写操作验证）见 **`mcp/TESTING.md`**。
 
@@ -268,4 +366,5 @@ python -m jsdk_joint_mcp.hw_smoke --channel COM4 --node 1            # 真机只
 ## 6. 一句话
 
 **`AGENTS.md` 放仓库根（自动生效）；Skill 放 `.agents/skills/`（Codex/VS Code 直接可用，
-Claude Code 加一步）；MCP server 用同一套命令配到各客户端（注意 `PYTHONIOENCODING=utf-8`）。**
+Claude Code 加一步）；MCP server 只用同一套命令配到各客户端 —— 配好后客户端会自己拉起
+server（工作目录必须是 `<JointSDK>/mcp`；中文 Windows 记得 `PYTHONIOENCODING=utf-8`）。**

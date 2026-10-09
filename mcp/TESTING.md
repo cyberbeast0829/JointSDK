@@ -70,7 +70,7 @@ python -c "import serial.tools.list_ports as lp; [print(p.device, p.description)
 
 ```bash
 cd /d/projects/cheetah/JointSDK/mcp
-python -m jsdk_joint_mcp.selftest          # 应输出 68/68 通过
+python -m jsdk_joint_mcp.selftest          # 应输出 79/79 通过
 ```
 
 ### 0.3 确认绑定可加载
@@ -86,6 +86,11 @@ set JSDK_PYTHON_SRC=D:\projects\cheetah\JointSDK\bindings\python\src
 ```
 
 > ⚠ 包内自带 `lib/libjsdk_can.dll`，所以**通常不需要**设 `JSDK_LIB_PATH`。
+>
+> ⚠ **Linux（Ubuntu 22.04 等）上别照抄上面的“方式 A”**：发行版 pip/setuptools 太旧
+> （pip 22.0.2 + setuptools 59.6）会让 `pip install -e` 静默装错路径（`UNKNOWN` +
+> 工程根 → 依旧 `ModuleNotFoundError`）。见
+> [`docs/AI_AGENT_SETUP.zh-CN.md` §1.1](../docs/AI_AGENT_SETUP.zh-CN.md)。
 
 ---
 
@@ -349,7 +354,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jsdk_get_s
 
 | 检查 | 通过标准 |
 |---|---|
-| ① 无硬件自检 | `68/68 通过` |
+| ① 无硬件自检 | `79/79 通过` |
 | ② CLI 直连 | `info` 能打印 hw/fw/serial |
 | ③ MCP 工具可见 | 客户端里能看到 16 个 `jsdk_*` 工具 |
 | ④ 只读调用 | `jsdk_get_state` 返回**结构化**字段（不是一句话） |

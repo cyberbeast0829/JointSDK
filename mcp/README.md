@@ -9,17 +9,26 @@
 ## 快速开始
 
 ```bash
-# 1. 确保 Python 绑定已构建（库要能加载）
-cd bindings/python && JSDK_LIB_PATH=../../bsh python -m pytest tests/ -q
+# 1. 构建 Python 绑定要用的共享库（-DJSDK_BUILD_PYTHON=ON 会把它复制进包内 lib/）
+cmake -S . -B bsh -DJSDK_WERROR=ON -DJSDK_ENABLE_HEAP=ON -DJSDK_BUILD_SHARED=ON -DJSDK_BUILD_PYTHON=ON
+cmake --build bsh -j
 
-# 2. 无硬件自检（先跑这个）
+# 2. 无硬件自检（先跑这个）—— 应输出 79/79 通过
 cd mcp && python -m jsdk_joint_mcp.selftest
 
-# 3. 作为 MCP server 跑（stdio）
+# 3. 作为 MCP server 跑（stdio）—— 启动后静默等待 stdin（一行一个 JSON-RPC），Ctrl-D 退出
 cd mcp && python -m jsdk_joint_mcp
 ```
 
-### 接到 Claude Desktop / VS Code
+⚠ **不需要 `pip install`**：`jsdk_joint_mcp/paths.py` 会自己从文件位置向上找到
+`bindings/python/src`。只有想让**普通 `python` 也 `import jsdk_can`** 时才要装 ——
+而 Linux（Ubuntu 22.04 等）上那条 `pip install -e` 有坑，见
+[`docs/AI_AGENT_SETUP.zh-CN.md` §1.1](../docs/AI_AGENT_SETUP.zh-CN.md)。
+
+⚠ 完整的“客户端怎么把 server 拉起来 / 起不来怎么查”在
+[`docs/AI_AGENT_SETUP.zh-CN.md` §3](../docs/AI_AGENT_SETUP.zh-CN.md)。
+
+### 接到 Claude Desktop / 其它 `mcpServers` 客户端
 
 ```json
 {
@@ -28,11 +37,22 @@ cd mcp && python -m jsdk_joint_mcp
       "command": "python",
       "args": ["-m", "jsdk_joint_mcp"],
       "cwd": "/path/to/JointSDK/mcp",
-      "env": { "JSDK_LIB_PATH": "/path/to/JointSDK/bsh" }
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "JSDK_PYTHON_SRC": "/path/to/JointSDK/bindings/python/src"
+      }
     }
   }
 }
 ```
+
+- ⚠ `cwd` **必须是** `<JointSDK>/mcp`，否则 `-m jsdk_joint_mcp` 找不到模块。
+- ⚠ `PYTHONIOENCODING=utf-8` 在**中文 Windows** 上是必需的（cp936 会让 server 崩在写 stdout 那一步，
+  客户端只看到“连接断开”）。
+- `JSDK_PYTHON_SRC` 是“没装包”时用来定位 Python 包的；装了就不需要。
+  `JSDK_LIB_PATH` 只在**包内没有共享库**时才要设 —— 两者都不是每个平台都必须。
+- **VS Code** 用 `servers` 键（不是 `mcpServers`）且要 `"type": "stdio"`：
+  照抄 [`docs/AI_AGENT_SETUP.zh-CN.md` §3.2](../docs/AI_AGENT_SETUP.zh-CN.md)。
 
 ---
 
@@ -172,7 +192,7 @@ skill 目录各家不重合（Codex 读 `.agents/skills/`、Claude Code 只读 `
 # 语法检查
 python -m compileall jsdk_joint_mcp
 
-# 无硬件自检（68 项；含标定收尾判定、遥测统计、装箱边界）
+# 无硬件自检（79 项；含标定收尾判定、遥测统计、装箱边界）
 python -m jsdk_joint_mcp.selftest
 
 # 手工发一条 JSON-RPC
