@@ -496,7 +496,22 @@ static int string_char(jsdk_jsondesc_t *p, uint8_t c)
     }
 }
 
-/** 处理字符串内的转义；返回 1 表示该字符已被消费，0 表示需按普通字符处理。 */
+/** 十六进制数字 → 0..15；非法返回 -1。 */
+static int hex_digit(uint8_t c)
+{
+    if (c >= '0' && c <= '9') return (int)(c - '0');
+    if (c >= 'a' && c <= 'f') return (int)(c - 'a') + 10;
+    if (c >= 'A' && c <= 'F') return (int)(c - 'A') + 10;
+    return -1;
+}
+
+/**
+ * 处理字符串内的转义。
+ * @return 0 = 普通字符（交给 string_char）
+ *         1 = 已消费，*out 是要追加的字节
+ *         2 = 已消费，但**没有**单字节输出（`\uXXXX` 的开始；后续 4 位由
+ *             `JSDK_JS_IN_STR` 的 uleft 分支拼成 UTF-8）
+ */
 static int escape_char(jsdk_jsondesc_t *p, uint8_t c, uint8_t *out)
 {
     if (!p->esc) {
@@ -514,8 +529,18 @@ static int escape_char(jsdk_jsondesc_t *p, uint8_t c, uint8_t *out)
     case 'n':  *out = '\n'; break;
     case 'r':  *out = '\r'; break;
     case 't':  *out = '\t'; break;
+    case 'u':
+        /* \uXXXX：描述符里的 unit 可能有非 ASCII（例如 "kg·m^2"），
+           不能因此拒绝整份描述符。解码成 UTF-8 后再走正常的 name/忽略逻辑。 */
+        if (p->in_key) {
+            jfail(p, "\\u escape in a key is not supported");
+            return 1;
+        }
+        p->uleft = 4u;
+        p->ucode = 0u;
+        return 2;
     default:
-        /* \uXXXX 等：本描述符不含，直接失败以免静默产生错误路径 */
+        /* 其它转义（\xNN、\0 …）：仍明确失败，避免静默产生错误路径 */
         jfail(p, "unsupported escape sequence in descriptor");
         return 1;
     }
@@ -615,8 +640,55 @@ int jsdk_jsondesc_feed(jsdk_jsondesc_t *p, const void *data, size_t len)
 
         case JSDK_JS_IN_STR: {
             uint8_t out = 0;
+            int     esc_rc;
+
+            /* --- \uXXXX：先拼 4 位十六进制，再一次性编码成 UTF-8 --- */
+            if (!p->in_key && p->uleft > 0u) {
+                int hv = hex_digit(c);
+
+                if (hv < 0) return jfail(p, "invalid \\u escape");
+                p->ucode = (uint16_t)((p->ucode << 4) | (uint16_t)hv);
+                p->uleft--;
+                i++;
+
+                if (p->uleft == 0u) {
+                    uint16_t cp = p->ucode;
+                    jsdk_json_frame_t *f = top(p);
+
+                    if (cp == 0u) {
+                        if (f->cur_key == JSDK_KEY_NAME)
+                            return jfail(p, "NUL in endpoint name");
+                    } else if (cp >= 0xD800u && cp <= 0xDFFFu) {
+                        /* 代理对：本描述符不含；名字里出现就明确拒绝，
+                           其它字段（unit 等）忽略即可。 */
+                        if (f->cur_key == JSDK_KEY_NAME)
+                            return jfail(p, "surrogate in endpoint name");
+                    } else if (cp < 0x80u) {
+                        if (string_char(p, (uint8_t)cp) != JSDK_OK)
+                            return p->fail_code;
+                    } else if (cp < 0x800u) {
+                        if (string_char(p, (uint8_t)(0xC0u | (cp >> 6))) != JSDK_OK)
+                            return p->fail_code;
+                        if (string_char(p, (uint8_t)(0x80u | (cp & 0x3Fu))) != JSDK_OK)
+                            return p->fail_code;
+                    } else {
+                        if (string_char(p, (uint8_t)(0xE0u | (cp >> 12))) != JSDK_OK)
+                            return p->fail_code;
+                        if (string_char(p, (uint8_t)(0x80u | ((cp >> 6) & 0x3Fu))) != JSDK_OK)
+                            return p->fail_code;
+                        if (string_char(p, (uint8_t)(0x80u | (cp & 0x3Fu))) != JSDK_OK)
+                            return p->fail_code;
+                    }
+                }
+                break;
+            }
+
             if (c == '"' && !p->esc) {
                 i++;
+                /* \uXXXX 只拼到一半就遇到结尾引号：必须**明确拒绝**（字符串被截断 /
+                   描述符流不完整），不能静默把半个转义丢掉 —— 那会得到一条
+                   “看着正确、实际少了一个字符”的端点名。 */
+                if (p->uleft != 0u) return jfail(p, "truncated \\u escape");
                 if (p->in_key) {
                     p->in_key = 0u;
                     if (finish_string_key(p) != JSDK_OK) return p->fail_code;   /* 粘性：可能是 NO_MEMORY */
@@ -626,9 +698,11 @@ int jsdk_jsondesc_feed(jsdk_jsondesc_t *p, const void *data, size_t len)
                 }
                 break;
             }
-            if (escape_char(p, c, &out)) {
+            esc_rc = escape_char(p, c, &out);
+            if (esc_rc) {
                 i++;
                 if (p->state == JSDK_JS_FAIL) return p->fail_code;   /* 粘性：可能是 NO_MEMORY */
+                if (esc_rc == 2) break;  /* \u 开始：等 4 位十六进制 */
                 if (p->esc) break;      /* 刚吃掉反斜杠 */
                 if (string_char(p, out) != JSDK_OK) return p->fail_code;   /* 粘性：可能是 NO_MEMORY */
                 break;

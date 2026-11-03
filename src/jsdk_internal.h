@@ -141,6 +141,8 @@ typedef struct jsdk_jsondesc {
     uint8_t  expect_key;   /**< 下一字符串是键；由 '{' / ',' 判定，与帧类型无关 */
     uint8_t  key_overflow;
     uint8_t  neg;
+    uint8_t  uleft;        /**< 还在等 \uXXXX 的剩余十六进制位数（0 = 无） */
+    uint16_t ucode;        /**< 正在拼的 UTF-16 码点 */
     uint32_t num;
     uint8_t  num_digits;
 

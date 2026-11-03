@@ -339,7 +339,14 @@ static void test_failures(void)
     expect_parse_failure("trailing data", "[{\"name\":\"a\",\"id\":1,\"type\":\"uint8\"}] junk", 44);
     expect_parse_failure("object without name", "[{\"id\":1,\"type\":\"uint8\"}]", 25);
     expect_parse_failure("mismatched brackets", "[{\"name\":\"a\",\"id\":1,\"type\":\"uint8\"]}", 39);
-    expect_parse_failure("unsupported escape", "[{\"name\":\"a\\u0041\",\"id\":1,\"type\":\"uint8\"}]", 42);
+    {
+        /* \uXXXX 现在是**支持**的（见 test_unicode_escape）；这里用真正
+           不认识的转义（\q）验证失败路径仍然有牙齿。 */
+        static const char bad_esc[] =
+            "[{\"name\":\"a\\q\",\"id\":1,\"type\":\"uint8\"}]";
+        expect_parse_failure("unsupported escape", bad_esc,
+                             sizeof bad_esc - 1u);
+    }
 }
 
 /* 真实描述符的截断（最有可能的现场故障：RX 丢帧） */
@@ -551,6 +558,71 @@ static void test_config_validation(void)
  * main
  * ======================================================================== */
 
+/**
+ * 固件描述符里的 `unit` 可能出现非 ASCII（真机：`config.inertia` 的 unit 是
+ * `"kg·m^2"`，线上写成 `kg\u00b7m^2`）。解析器**不能**因此拒绝整份描述符 ——
+ * 它只需要 name/id/type/access。这里把 `\uXXXX` 解码成 UTF-8，其余元数据忽略。
+ */
+static void test_unicode_escape(void)
+{
+    static const char json[] =
+        "[{\"name\":\"config.inertia\",\"id\":151,\"type\":\"float\","
+        "\"access\":\"rw\",\"unit\":\"kg\\u00b7m^2\"}]";
+    test_env_t e;
+    uint16_t id = 0u;
+    jsdk_ep_type_t t = JSDK_EP_JSON;
+    uint8_t acc = 0u;
+
+    printf("[unicode] \\uXXXX in ignored metadata is accepted\n");
+    env_setup(&e, 4096u, JSDK_DESC_RETAIN_ALL);
+    CHECK_EQ(jsdk_jsondesc_run(&e.cfg, &e.store, json, sizeof json - 1u), JSDK_OK);
+    CHECK_EQ(jsdk_ep_store_lookup(&e.store, "config.inertia", &id, &t, &acc),
+             JSDK_OK);
+    CHECK_EQ(id, 151u);
+    CHECK_EQ((int)t, (int)JSDK_EP_F32);
+
+    /* name 里的 \u 也要真的解码：a\u0041 → "aA"（否则路径会悄悄变空）。 */
+    {
+        static const char json_name[] =
+            "[{\"name\":\"a\\u0041\",\"id\":2,\"type\":\"uint8\"}]";
+        CHECK_EQ(jsdk_jsondesc_run(&e.cfg, &e.store, json_name,
+                                   sizeof json_name - 1u), JSDK_OK);
+        CHECK_EQ(jsdk_ep_store_lookup(&e.store, "aA", &id, &t, &acc), JSDK_OK);
+        CHECK_EQ(id, 2u);
+    }
+
+    /*
+     * 半个转义（`\u12"`）必须失败：描述符流被截断时会这样。
+     * 若静默接受，端点名会“少一个字符”，而调用方完全看不出来。
+     */
+    {
+        static const char json_trunc[] =
+            "[{\"name\":\"a\\u12\",\"id\":3,\"type\":\"uint8\"}]";
+        test_env_t e2;
+
+        env_setup(&e2, 4096u, JSDK_DESC_RETAIN_ALL);
+        CHECK(jsdk_jsondesc_run(&e2.cfg, &e2.store, json_trunc,
+                                sizeof json_trunc - 1u) != JSDK_OK);
+        /* 失败之后不应留下一个“看起来正常”的端点 */
+        CHECK(jsdk_ep_store_lookup(&e2.store, "a", &id, &t, &acc) != JSDK_OK);
+        env_teardown(&e2);
+    }
+
+    /* name 里出现非法转义字符（非十六进制）也必须失败 */
+    {
+        static const char json_bad_hex[] =
+            "[{\"name\":\"a\\u00zz\",\"id\":4,\"type\":\"uint8\"}]";
+        test_env_t e3;
+
+        env_setup(&e3, 4096u, JSDK_DESC_RETAIN_ALL);
+        CHECK(jsdk_jsondesc_run(&e3.cfg, &e3.store, json_bad_hex,
+                                sizeof json_bad_hex - 1u) != JSDK_OK);
+        env_teardown(&e3);
+    }
+
+    env_teardown(&e);
+}
+
 int main(void)
 {
     printf("=== jsondesc parser tests ===\n");
@@ -570,6 +642,8 @@ int main(void)
     test_arena_exhaustion();
     printf("\n");
     test_config_validation();
+    printf("\n");
+    test_unicode_escape();
 
     printf("\n=== %d 项检查，%d 项失败 ===\n", g_checks, g_fail);
     free(g_json);
