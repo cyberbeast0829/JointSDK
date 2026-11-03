@@ -122,6 +122,27 @@ size_t jsdk_slcan_encode(const jsdk_can_frame_t *f, char *out, size_t cap);
 jsdk_slcan_rc_t jsdk_slcan_decode(const char *line, size_t len,
                                   jsdk_can_frame_t *f, size_t *consumed);
 
+/**
+ * 把 CAN **仲裁段**波特率映射成 Lawicel 的 `S<n>` 命令（**纯逻辑**）。
+ *
+ * 为什么单独抽出来：`S<n>` 的 n 是规范里的**表索引**，不是 kHz/MHz，映射错了
+ * 只会表现为"适配器一条帧都收不到"。放进 codec（无平台依赖）就能离线把所有
+ * 档位钉死，而不是等到现场才发现。
+ *
+ * 收录范围：Lawicel 规范明确定义的 9 档 ——
+ * `S0`=10k、`S1`=20k、`S2`=50k、`S3`=100k、`S4`=125k、`S5`=250k、
+ * `S6`=500k、`S7`=800k、`S8`=1M。
+ *
+ * ⚠ `S9` 及以上是**固件私有扩展**（不同固件含义不同）⇒ 一律返回 0（不支持），
+ *   **不猜**。要别的速率请用厂家工具先配好，再让 SDK 不要碰适配器配置。
+ *
+ * @param bitrate 仲裁段速率（bps）
+ * @param out     输出缓冲，至少 4 字节（`"S8\r"` + NUL）；失败时置空串
+ * @param cap     输出缓冲容量
+ * @return 写入的字节数（**不含** NUL，固定 3）；0 = 表外速率或缓冲不足
+ */
+size_t jsdk_slcan_bitrate_cmd(uint32_t bitrate, char *out, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

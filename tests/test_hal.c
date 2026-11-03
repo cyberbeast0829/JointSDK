@@ -621,6 +621,17 @@ static void test_slcan_open_error_text(void)
     CHECK(strstr(jsdk_hal_slcan_last_open_error(), "123456") != NULL);
     CHECK(h == NULL);
 
+    /* 不支持的**仲裁段**速率：同样要在打开串口**之前**拒绝（否则会被
+       “串口打不开”掩盖成 invalid-argument） */
+    CHECK_EQ(jsdk_hal_slcan_open_ex(&hal, &h, "COM_NOT_USED", 115200u,
+                                    123456u, 0u), JSDK_ERR_UNSUPPORTED);
+    CHECK(strstr(jsdk_hal_slcan_last_open_error(), "123456") != NULL);
+    CHECK(h == NULL);
+    /* `S9` 及以后是固件私有扩展：必须拒绝，不猜 */
+    CHECK_EQ(jsdk_hal_slcan_open_ex(&hal, &h, "COM_NOT_USED", 115200u,
+                                    2000000u, 0u), JSDK_ERR_UNSUPPORTED);
+    CHECK(h == NULL);
+
     /* 不存在的端口：必须报 INVALID_ARG **并且**给出原因（含端口名） */
 #ifdef _WIN32
     st = jsdk_hal_slcan_open(&hal, &h, "COM199", 115200u, 0u);
@@ -647,6 +658,43 @@ static void test_slcan_open_error_text(void)
  * main
  * ======================================================================== */
 
+static void test_slcan_bitrate_cmd(void)
+{
+    /* 期望表：Lawicel 规范的 9 档（索引就是 `S<n>` 的 n） */
+    static const struct { uint32_t bps; const char *cmd; } T[] = {
+        {    10000u, "S0\r" }, {    20000u, "S1\r" },
+        {    50000u, "S2\r" }, {   100000u, "S3\r" },
+        {   125000u, "S4\r" }, {   250000u, "S5\r" },
+        {   500000u, "S6\r" }, {   800000u, "S7\r" },
+        {  1000000u, "S8\r" },
+    };
+    char   buf[8];
+    size_t n;
+    unsigned i;
+
+    printf("[6] slcan nominal bitrate -> S<n>\n");
+
+    for (i = 0u; i < (unsigned)(sizeof T / sizeof T[0]); ++i) {
+        memset(buf, 'x', sizeof buf);
+        n = jsdk_slcan_bitrate_cmd(T[i].bps, buf, sizeof buf);
+        CHECK_EQ(n, strlen(T[i].cmd));
+        CHECK(strcmp(buf, T[i].cmd) == 0);
+    }
+
+    /* 表外速率**必须拒绝**（S9 及以后是固件私有扩展，猜错 = “一条帧都收不到”） */
+    CHECK_EQ(jsdk_slcan_bitrate_cmd(0u, buf, sizeof buf), 0u);
+    CHECK_EQ(jsdk_slcan_bitrate_cmd(83333u, buf, sizeof buf), 0u);
+    CHECK_EQ(jsdk_slcan_bitrate_cmd(2000000u, buf, sizeof buf), 0u);
+    CHECK_EQ(jsdk_slcan_bitrate_cmd(5000000u, buf, sizeof buf), 0u);
+    CHECK(buf[0] == '\0');                       /* 失败时置空串，不留半截 */
+
+    /* 缓冲不足：拒绝，不写半截命令 */
+    CHECK_EQ(jsdk_slcan_bitrate_cmd(1000000u, buf, 3u), 0u);
+    CHECK_EQ(jsdk_slcan_bitrate_cmd(1000000u, NULL, 8u), 0u);
+
+    printf("      9 standard rates mapped, out-of-table rates rejected\n");
+}
+
 int main(void)
 {
     printf("=== WP1 tests (built-in HAL backends) ===\n\n");
@@ -660,6 +708,8 @@ int main(void)
     test_handles();
     printf("\n");
     test_slcan_open_error_text();
+    printf("\n");
+    test_slcan_bitrate_cmd();
 
     printf("\n=== %u checks, %u failures ===\n", g_checks, g_fail);
     return (g_fail == 0u) ? 0 : 1;

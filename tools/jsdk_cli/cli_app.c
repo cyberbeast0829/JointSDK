@@ -31,6 +31,8 @@ void cli_usage(FILE *f, const char *argv0)
         "  --if <socketcan|pcan|slcan|virtual>  传输后端（默认按平台）\n"
         "  --channel <can0|PCAN_USBBUS1|COM5|规格>  通道名\n"
         "  --bitrate N          仲裁段波特率（默认 1000000）\n"
+        "                       slcan：只在你**显式**给出时发 `S<n>` 改适配器；\n"
+        "                       不给则不动适配器已有设置（厂家工具配的值）\n"
         "  --data-bitrate N     数据段波特率（默认 5000000；写 0 或加 --classic 用 Classic）\n"
         "  --baud N             **串口**波特率（仅 slcan，默认 115200）\n"
         "  --classic            强制 Classic CAN\n"
@@ -245,7 +247,9 @@ int cli_opts_parse(cli_opts_t *o, int argc, char **argv, FILE *err)
                 switch (VAL[k].key) {
                 case 0:  o->ifname = v; break;
                 case 1:  o->channel = v; break;
-                case 2:  if (parse_u32(v, &o->bitrate) != 0) CLI_BAD_VALUE(); break;
+                case 2:  if (parse_u32(v, &o->bitrate) != 0) CLI_BAD_VALUE();
+                         o->bitrate_explicit = 1;   /* 写了才去改适配器（S<n>） */
+                         break;
                 case 3:  if (parse_u32(v, &o->data_bitrate) != 0) CLI_BAD_VALUE();
                          o->fd_explicit = 1;   /* 写了数据段波特率 = 明确要 FD */
                          break;
@@ -519,11 +523,15 @@ static int cli_bringup(cli_app_t *a, const char *ifname, const char *chan)
                     "请安装 PEAK 的 PCAN-Basic 驱动（32/64 位要与本进程一致）");
         }
     } else if (strcmp(ifname, "slcan") == 0) {
-        /* ⚠ 第 4 个参数是**串口**波特率（--baud），不是 CAN 仲裁段波特率。
-           早先错传了 --bitrate（默认 1 000 000），串口会以 1 Mbaud 打开，
-           而适配器通常在 115200 → 收到乱码，现场只表现为"什么都收不到"。
-           第 5 个参数是 FD **数据段**速率（--data-bitrate）：非 0 时后端会主动
-           发 Y<n> 适配器命令。
+        /* ⚠ 参数顺序（容易看错，写清楚）：
+             `jsdk_hal_slcan_open_ex(hal, out, chan, baud, bitrate, data_bitrate)`
+           - 第 4 个 `baud` 是 **串口**波特率（--baud），不是 CAN 仲裁段速率。
+             早先错把 --bitrate（默认 1 000 000）当串口波特率传，串口会以
+             1 Mbaud 打开，而适配器通常在 115200 → 收到乱码，现场只表现为
+             "什么都收不到"。
+           - 第 5 个 `bitrate` 是 **CAN 仲裁段**速率 → 打开序列里发 `S<n>`；
+             传 0 = 不碰适配器已有设置（默认行为）。
+           - 第 6 个 `data_bitrate` 是 FD **数据段**速率 → 发 `Y<n>`。
 
            ⚠⚠ `fd_auto`（客户没写 --classic/--data-bitrate）时**传 0**：
              先**不要**按 FD 配置适配器。真机实测（CyberBeast USB2CAN @1 Mbps
@@ -533,20 +541,29 @@ static int cli_bringup(cli_app_t *a, const char *ifname, const char *chan)
              重开）”后，同一条命令不传任何格式选项也能跑通。 */
         {
             uint32_t fd_rate = a->fd_auto ? 0u : a->o.data_bitrate;
+            /* ⚠ 仲裁段速率只在**显式**给了 `--bitrate` 时才下发给适配器
+               （`S<n>`）。默认值 1 Mbit 是协议默认，不是"要改适配器"：
+               适配器往往已被厂家工具配好，默认去改会把好好的链路弄断。 */
+            uint32_t nom_rate = a->o.bitrate_explicit ? a->o.bitrate : 0u;
 
-            st = jsdk_hal_slcan_open(&a->user_hal, &a->hal, chan, a->o.baud,
-                                     fd_rate);
+            st = jsdk_hal_slcan_open_ex(&a->user_hal, &a->hal, chan, a->o.baud,
+                                        nom_rate, fd_rate);
             if (st == JSDK_ERR_UNSUPPORTED) {
-                cli_fprintf(a->err, "jsdk-cli: slcan 的数据段速率 %u 不在已知表里"
-                                "（仅支持 2000000 与 5000000；"
-                                "其它速率请先用厂家工具配好，再传 --data-bitrate 0）\n",
-                        (unsigned)fd_rate);
+                const char *why = jsdk_hal_slcan_last_open_error();
+
+                if (why && why[0]) {
+                    cli_fprintf(a->err, "jsdk-cli: slcan：%s\n", why);
+                } else {
+                    cli_fprintf(a->err, "jsdk-cli: slcan 的数据段速率 %u 不在已知表里"
+                                    "（仅支持 2000000 与 5000000；"
+                                    "其它速率请先用厂家工具配好，再传 --data-bitrate 0）\n",
+                            (unsigned)fd_rate);
+                }
+            } else if (st == JSDK_OK && nom_rate == 0u && a->o.verbose) {
+                cli_fprintf(a->err, "jsdk-cli: slcan 仲裁段：**未改动**适配器设置"
+                                "（要固定成 %u bit/s 请显式给 --bitrate %u）\n",
+                        (unsigned)a->o.bitrate, (unsigned)a->o.bitrate);
             }
-        }
-        if (a->o.bitrate != 1000000u) {
-            cli_fprintf(a->err, "jsdk-cli: 提示：--bitrate 对 slcan 无意义"
-                            "（CAN 仲裁段速率由适配器自己配），串口速率用 --baud %u\n",
-                    (unsigned)a->o.baud);
         }
         /* 注：--classic 在解析阶段就把 data_bitrate 归 0（见 cli_app.c 的选项循环），
            所以"Classic 却要发 Y 命令"这种情况不可能出现，不需要额外提示。 */

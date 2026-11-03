@@ -109,7 +109,7 @@ python -c "d=open('gbk.bin','rb').read();print(d[:4].hex(' '), d.decode('gbk')[:
 |---|---|
 | `--if socketcan｜pcan｜slcan｜virtual` | 传输后端。默认：Windows/macOS → `pcan`，其它 → `socketcan` |
 | `--channel NAME` | `can0` / `PCAN_USBBUS1` / `COM5` / `/dev/ttyACM0`；`virtual` 时为节点规格 |
-| `--bitrate N` | CAN **仲裁段**波特率（默认 1000000，仅用于校验/初始化） |
+| `--bitrate N` | CAN **仲裁段**波特率（默认 1000000）。⚠ slcan 后端只在**显式**给出时才向适配器发 `S<n>`（只支持 Lawicel 标准 9 档：10k/20k/50k/100k/125k/250k/500k/800k/1M，其它值报 `UNSUPPORTED`）；不给则**不碰**适配器已有设置（厂家工具配的值） |
 | `--data-bitrate N` | CAN FD **数据段**波特率（默认 5000000；写 `0` 或加 `--classic` 用 Classic） |
 | `--baud N` | **串口**波特率（**仅 slcan**，默认 115200）。与 `--bitrate` 不是同一个量 |
 | `--classic` | 强制 Classic CAN。⚠ 传了它就是**明确指定**：SDK 的自动对齐（见下行）**不会**再改你的选择，两者冲突时只打一行警告；不传则走**自动探测**（见下条） |
@@ -197,7 +197,7 @@ python -c "d=open('gbk.bin','rb').read();print(d[:4].hex(' '), d.decode('gbk')[:
 | `save` | `CONFIG_SAVE(0x22)`，写后读回校验 |
 | `set-node-id N` | 改节点地址（含冲突检查、验证新地址有应答，可持久化） |
 | `watchdog MS` | 写 `can.config.break_timeout`。**`0` = 关闭**设备侧协议级超时检测（固件源码 `can_cyberbeast.cpp:1422` 的 `if (timeout_ms == 0) return;` 就是这条语义；旧固件把 0 当 100 ms）。输出里 `device_reports_ms` 是**独立再读一次设备**的结果，`verified:true` 才算确认到 |
-| `set-zero` | `SET_ZERO(0x61)`（当前位置设为零点，不落 Flash） |
+| `set-zero` | `SET_ZERO(0x61)`（当前位置设为零点）。⚠ 持久化与生效时机**看设备家族**：ODrive 当场归零、需 `save` 才持久；MIT 词汇会把零点**连 Flash 一起写**，报告位置是否立刻为 0 取决于设备内部多圈累计（不是 0 时提示 `reset`，看 `JSDK_JF_ZERO_PENDING_REBOOT`） |
 | `reset` | `RESET_DEVICE(0x64)`（软复位；重握手后才能继续） |
 | `fault-reset` | 清故障：`STOP_MOTOR` → `CLEAR_ERRORS(0x65)` → 等错误位归零（**不动电机**）。⚠ 它只能清**锁存位**：如果原因还在（典型：`enable_watchdog=true` 但 `watchdog_timeout=0` → 零容忍看门狗，CAN 一静默就置 `0x800`），错误位会**立刻回来** —— 那是正确行为，不是命令坏了；先改设备配置再重试 |
 

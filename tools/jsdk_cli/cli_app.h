@@ -33,6 +33,12 @@ typedef struct {
     const char *ifname;      /**< --if socketcan|pcan|slcan|virtual（NULL → 平台默认） */
     const char *channel;     /**< --channel */
     uint32_t    bitrate;     /**< --bitrate，默认 1000000（CAN 仲裁段） */
+    int         bitrate_explicit; /**< 调用者**明确**写了 `--bitrate`。
+                                      ⚠ slcan 后端只在置 1 时才向适配器发 `S<n>`：
+                                      默认值 1 Mbit 是协议默认，不是"我要改你的适配器"。
+                                      适配器往往已被厂家工具配好，默认去改它反而
+                                      会把一条本来能跑的链路弄断（与 `fd_auto`
+                                      不默认发 `Y5` 是同一条理由）。 */
     uint32_t    data_bitrate;/**< --data-bitrate，默认 5000000；0 = Classic */
     uint32_t    baud;        /**< --baud，**串口**波特率（仅 slcan），默认 115200。
                                   ⚠ 与 `--bitrate` 是两个完全不同的量：slcan 适配器

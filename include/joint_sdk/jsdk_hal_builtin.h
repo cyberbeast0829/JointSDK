@@ -123,8 +123,11 @@ JSDK_API jsdk_status_t jsdk_hal_pcan_open(jsdk_can_hal_t *hal, jsdk_hal_handle_t
  *           别的值，现场只会看到“帧发不出去”）。要别的速率请用厂家工具先配好
  *           再传 0。
  *
- * @note 打开时会发 `C\r`（回到关闭态）→ [`Y<n>\r`] → `O\r`（打开通道）。
- *       `O` 不可省：Lawicel 语义下通道上电是关闭的。
+ * @note 打开时会发 `C\r`（回到关闭态）→ `S\r`?（仅当指定了仲裁段速率）
+ *       → `Y<n>\r`（仅 FD）→ `M0\r`（正常模式）→ `A1\r`（自动上报收到的帧）
+ *       → `O\r`（打开通道）。`O` 不可省：Lawicel 语义下通道上电是关闭的。
+ *       ⚠ `M0`/`A1` 也不可省：`A0` 时适配器**收到帧也不往主机推**，现场表现
+ *       就是“心跳突然没了”，而关节其实在正常发 —— 厂商台架脚本同样先发这两条。
  * @note slcan 为 ASCII 行协议，Classic 实际约 100~500 fps，FD 单帧载荷更大、
  *       帧率更低；只建议用于配置、监控与低速 MIT 控制，高频控制请用
  *       SocketCAN / PCAN。
@@ -135,6 +138,37 @@ JSDK_API jsdk_status_t jsdk_hal_pcan_open(jsdk_can_hal_t *hal, jsdk_hal_handle_t
 JSDK_API jsdk_status_t jsdk_hal_slcan_open(jsdk_can_hal_t *hal, jsdk_hal_handle_t **out,
                                   const char *port, uint32_t baud,
                                   uint32_t data_bitrate);
+
+/**
+ * 打开 slcan 串口，并**可选地设置适配器的仲裁段速率**。
+ *
+ * 与 @ref jsdk_hal_slcan_open 的唯一区别是多了 @p bitrate：
+ *  - `bitrate == 0` ⇒ **完全不碰适配器配置**（等价于 `jsdk_hal_slcan_open()`，
+ *    行为逐字节不变）；
+ *  - 非 0 ⇒ 在打开序列里多一条 `S<n>`，把适配器切到该仲裁段速率。
+ *
+ * 打开序列变成：`C\r` → [`S<n>\r`] → [`Y<n>\r`] → `O\r`，**每条都等 ACK + 重发**
+ * （与原来同一套 `sl_cmd_sync`）。`S` 必须在通道关闭（`C` 之后、`O` 之前）发，
+ * 所以这件事只能发生在 `open` 里，事后补发是不行的 —— 这正是早先 CLI 的
+ * `--bitrate` "有参数、无效果"的根因。
+ *
+ * @param bitrate 仲裁段速率（bps）。只接受 Lawicel 规范里的 9 档：
+ *        10k / 20k / 50k / 100k / 125k / 250k / 500k / 800k / 1M；
+ *        其它值返回 `JSDK_ERR_UNSUPPORTED`（`S9` 及以上是固件私有扩展，
+ *        **不猜**）。
+ *
+ * @note **为什么不改原函数签名**：`jsdk_hal_slcan_open()` 是已发布的 ABI，
+ *       加参数会改变符号签名、静默打破所有已编译的客户程序（ABI 噪音换来的
+ *       只是少一个函数）。新能力放在 `_ex` 里，旧函数转调 `_ex(..., 0, ...)`。
+ *
+ * @note 与 @p data_bitrate 一样，这一步**会改适配器配置**（写它的 EEPROM/
+ *       RAM 设置），所以同样是显式 opt-in。不指定就保持适配器原状 ——
+ *       现场很多适配器已经被厂家工具配好了，默认去改它反而是破坏。
+ */
+JSDK_API jsdk_status_t jsdk_hal_slcan_open_ex(jsdk_can_hal_t *hal,
+                                     jsdk_hal_handle_t **out,
+                                     const char *port, uint32_t baud,
+                                     uint32_t bitrate, uint32_t data_bitrate);
 
 /* --- slcan 诊断（CLI / Python 绑定用；都只读，不动硬件状态） --- */
 
@@ -174,6 +208,18 @@ JSDK_API const char *jsdk_hal_slcan_last_open_error(void);
  */
 JSDK_API void jsdk_hal_slcan_fd_config(jsdk_hal_handle_t *h, int *enabled,
                                        uint32_t *bitrate);
+
+/**
+ * 取当前**仲裁段**速率配置（对应 `S<n>`）。
+ * @param enabled 输出：是否已向适配器发过 `S<n>`（0 = 没碰过适配器配置）
+ * @param bitrate 输出：已设置的仲裁段速率（bps）；`enabled=0` 时为 0
+ *
+ * @note `enabled=0` 不等于“速率未知”，而是“**我们没有改它**” —— 适配器可能
+ *       有一个自己存着的速率（厂家工具设的）。这两件事必须分开讲，否则又会
+ *       回到“CLI 说 1 Mbit、实际是适配器存的 500k”那种自相矛盾。
+ */
+JSDK_API void jsdk_hal_slcan_nominal_config(jsdk_hal_handle_t *h, int *enabled,
+                                            uint32_t *bitrate);
 
 /**
  * 取 FD 帧计数。

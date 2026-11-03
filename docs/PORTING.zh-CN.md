@@ -853,7 +853,8 @@ ls -l /dev/ttyACM0                # 3) 看一眼权限：通常是 root:dialout 
   （打开通道），**不设置** CAN 段速率。之前用 `slcand -s8` 配过 1 Mbps 就会留在
   适配器里；要改成别的速率请用厂家工具（或再跑一次 `slcand -s<n>`）配好。
 - `--baud` 是**串口**速率（适配器通常 115200，CDC 下甚至被忽略），**不是** CAN 速率；
-  `--bitrate` 对 slcan 无意义（CLI 会提示）。
+  `--bitrate` 对 slcan 现在**会生效**（打开序列里发 `S<n>`，见 `jsdk_hal_slcan_open_ex()`）；
+  不给则完全不碰适配器已有设置。
 - 要跑 **CAN FD** 再加 `--data-bitrate 5000000`（或 `0` = 不碰适配器配置）。
 - ⚠⚠ **Classic 还是 FD 由设备自己决定，协议没有运行时协商**（`can.config.baud_rate`）。
   现场真实例子：一套 **CyberBeast USB2CAN（`/dev/ttyACM0`）+ 1 Mbps Classic** 的设备，
@@ -955,7 +956,7 @@ sudo ./tools/live_can_smoke.sh  # 真链路：modprobe + vcan0(MTU72)/vcan1(MTU1
 |---|---|---|---|
 | 1 | `jsdk-cli --if socketcan --channel can0 scan` | 列出设备节点 ID | 需要真设备应答 |
 | 2 | 同一命令换 `--if pcan --channel PCAN_USBBUS1`（Windows） | 同上；未装驱动时报 `JSDK_ERR_NOT_FOUND` 且提示装驱动 | 需要 PCAN 硬件 |
-| 3 | `--if slcan --channel /dev/ttyACM0 --baud 115200 scan` | 同上；`--bitrate` 被忽略且打印提示 | 需要 CANable 之类的适配器 |
+| 3 | `--if slcan --channel /dev/ttyACM0 --baud 115200 scan` | 同上；`--bitrate` 只在显式给出时才下发 `S<n>` | 需要 CANable 之类的适配器 |
 | 3b | 同一适配器跑 **FD**：`--if slcan --data-bitrate 5000000 scan` | 与 3 同样列出节点；但 `--data-bitrate` 为**表外值**（如 3000000）时必须报 `UNSUPPORTED` 并提示支持的速率 | `Y<n>` 是**适配器固件的私有表**，只有真适配器知道 |
 | 3c | 适配器拔掉（端口不存在）时跑 `--data-bitrate 0` | 报 `INVALID_ARG`（**不是** `UNSUPPORTED`）—— 证明校验顺序是"先参数、后串口" | 需要真实的串口故障 |
 | 4 | `health` 在三种后端上 | `link_up=yes`、`age_ms` 稳定、`vbus_V` 与万用表一致（±2%） | 需要真电压基准 |

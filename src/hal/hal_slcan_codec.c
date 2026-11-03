@@ -271,3 +271,39 @@ jsdk_slcan_rc_t jsdk_slcan_decode(const char *line, size_t len,
 
     return JSDK_SLCAN_OK;
 }
+
+/* --------------------------------------------------------------------------
+ * 仲裁段波特率 -> `S<n>`
+ * ------------------------------------------------------------------------ */
+
+/**
+ * Lawicel 标准的 9 档仲裁段速率。**索引就是 `S<n>` 的 n**。
+ *
+ * ⚠ 只收录规范里明确定义的这 9 档。`S9` 及以上是各家固件的**私有扩展**
+ *   （而且不同固件含义不同），猜错就是把适配器的仲裁段速率设成别的值 ——
+ *   现场只会看到"一帧都收不到"，比明确报不支持难查得多。
+ */
+static const uint32_t k_slcan_bitrates[9] = {
+    10000u, 20000u, 50000u, 100000u, 125000u,
+    250000u, 500000u, 800000u, 1000000u
+};
+
+size_t jsdk_slcan_bitrate_cmd(uint32_t bitrate, char *out, size_t cap)
+{
+    unsigned i;
+
+    if (!out || cap < 4u) return 0u;
+
+    for (i = 0u; i < (unsigned)(sizeof k_slcan_bitrates /
+                                sizeof k_slcan_bitrates[0]); ++i) {
+        if (k_slcan_bitrates[i] == bitrate) {
+            out[0] = 'S';
+            out[1] = (char)('0' + (int)i);
+            out[2] = '\r';
+            out[3] = '\0';
+            return 3u;
+        }
+    }
+    out[0] = '\0';
+    return 0u;                        /* 表外速率：不猜 */
+}

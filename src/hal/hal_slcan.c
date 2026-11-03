@@ -23,7 +23,8 @@
  *     SDK 不碰"不同，因此是显式 opt-in；传 0 则完全不碰适配器配置）。
  *
  * @par 打开序列
- *  `C\r`（回到关闭态）→ [`Y<n>\r`]（仅 FD）→ `O\r`（打开通道）。
+ *  `C\r`（回到关闭态）→ [`S<n>\r`]（仅当调用方指定了仲裁段速率）
+ *  → [`Y<n>\r`]（仅 FD）→ `O\r`（打开通道）。
  *  `O` 不可省：Lawicel 语义下通道上电是关闭的，只发 `C` 而不发 `O`
  *  等于让适配器一直闭着（现场表现为"一条帧都收不到"）。 *
  *  ⚠ **每一步都等适配器的 ACK（`\r`），没 ACK 就重发**（见 `sl_cmd_sync`）。
@@ -32,6 +33,8 @@
  *  （真机实测约 1/10）。盲等一段固定时间无法区分“已经生效”与“整段丢掉”，
  *  等 ACK 才能把这件事从概率变成**有界重试**。 *
  * @par 已知局限（写进文档，不隐藏）
+ *  - `S<n>` 只收录 Lawicel 规范里的 9 档（10k…1M，见
+ *    `jsdk_slcan_bitrate_cmd()`）；`S9` 及以上是固件私有扩展，**不猜**；
  *  - `Y<n>` 的索引是**固件私有表**，这里只收录 CANable 2.0 公认的两个
  *    （`Y2`=2 Mbps、`Y5`=5 Mbps）；要别的速率请用厂家工具先配好再传 0；
  *  - 吞吐：Classic 约 100~500 fps；FD 单帧载荷更大，同样带宽下帧率更低 ——
@@ -434,6 +437,8 @@ typedef struct {
     sl_port_t port;
     uint8_t   fd_enabled;          /**< 1 = 已向适配器发过 Y<n>（数据段速率已设） */
     uint32_t  fd_data_bitrate;     /**< 已设置的数据段速率（0 = 没设过） */
+    uint8_t   nominal_enabled;     /**< 1 = 已向适配器发过 S<n>（仲裁段速率已设） */
+    uint32_t  nominal_bitrate;     /**< 已设置的仲裁段速率（0 = 没碰过） */
 
     uint8_t   rx[JSDK_SLCAN_RXBUF];
     size_t    rx_len;
@@ -636,6 +641,17 @@ static void sl_settle(sl_handle_t *h)
 /** 每条命令等 ACK 的最长时间 / 最多发几次。 */
 #define JSDK_SLCAN_ACK_WAIT_MS 250u
 #define JSDK_SLCAN_ACK_TRIES   3u
+/*
+ * 其余配置命令（`S`/`Y`/`M`/`A`/`O`）用**短等待**：
+ *  - 很多固件（含本项目的 CANable2）对它们根本不回 ACK，等 250 ms×3 纯属浪费；
+ *  - 更要紧的是**总时长**：错速率窗口里，设备自己的心跳因为没人 ACK 而累加
+ *    TEC，~3.2 s 就 bus-off。旧代码 6 条 × 750 ms = **4.5 s**，`S<n>` 还没发出去
+ *    设备已经死了（本会话反复踩到，“改速率救命”永远来不及）。
+ *    现在最坏 750 ms + 5×120 ms ≈ 1.35 s，安全地落在窗口内。
+ *  - 重试仍然保留（它修的是“端口刚打开前几笔写会丢”），只是等得更短。
+ */
+#define JSDK_SLCAN_CFG_WAIT_MS 60u
+#define JSDK_SLCAN_CFG_TRIES   2u
 
 /**
  * 发一条 slcan 命令，**等适配器的 ACK**；没等到就重发。
@@ -657,17 +673,23 @@ static void sl_settle(sl_handle_t *h)
  *     - 描述符下载偶尔成功（多帧传输把丢失的首帧掩盖了大半）。
  *   实测丢帧率约 **1/10 次进程**；修后 `desc-info` 30/30、`health` 12/12。
  *
- * @return 1 = 收到 ACK；0 = 反复超时（适配器不 ACK 或未就绪）
+ * @return 1 = 收到 ACK；0 = **写出去了但没 ACK**（合法：很多固件不回 ACK）；
+ *         -1 = 串口写失败（端口被拔、句柄失效）—— 调用方必须区分这三个值，
+ *              把“没 ACK”当失败会把正常适配器报成错误，把“写失败”当成功则会
+ *              返回一个**死的句柄**（现场表现：“打开了但一条帧都收发不了”）。
  */
-static int sl_cmd_sync(sl_handle_t *h, const char *cmd)
+static int sl_cmd_sync(sl_handle_t *h, const char *cmd,
+                       uint32_t wait_ms, unsigned tries)
 {
     unsigned try_i;
 
-    for (try_i = 0u; try_i < JSDK_SLCAN_ACK_TRIES; ++try_i) {
+    if (tries == 0u) tries = 1u;
+
+    for (try_i = 0u; try_i < tries; ++try_i) {
         uint32_t t0;
         unsigned ack = 0u;
 
-        if (sl_port_write_all(&h->port, cmd, strlen(cmd)) != 0) return 0;
+        if (sl_port_write_all(&h->port, cmd, strlen(cmd)) != 0) return -1;
         t0 = sl_now_ms();
 
         while (!ack) {
@@ -675,29 +697,43 @@ static int sl_cmd_sync(sl_handle_t *h, const char *cmd)
             int     n = sl_port_read(&h->port, buf, sizeof buf);
             unsigned i;
 
-            if (n < 0) return 0;
+            if (n < 0) return -1;
             for (i = 0u; i < (unsigned)n; ++i) {
                 /* `\r` = 命令 ACK。同时也把启动横幅/回声当“适配器在说话”
                    （那已经足够证明端口双向通了）。 */
                 if (buf[i] == '\r') { ack = 1u; }
             }
             if (ack) break;
-            if ((uint32_t)(sl_now_ms() - t0) >= JSDK_SLCAN_ACK_WAIT_MS) break;
+            if ((uint32_t)(sl_now_ms() - t0) >= wait_ms) break;
         }
         if (ack) return 1;
     }
     return 0;
 }
 
-jsdk_status_t jsdk_hal_slcan_open(jsdk_can_hal_t *hal, jsdk_hal_handle_t **out,
-                                  const char *port, uint32_t baud,
-                                  uint32_t data_bitrate)
+jsdk_status_t jsdk_hal_slcan_open_ex(jsdk_can_hal_t *hal, jsdk_hal_handle_t **out,
+                                     const char *port, uint32_t baud,
+                                     uint32_t bitrate, uint32_t data_bitrate)
 {
     sl_handle_t *h;
     /* `C` 让适配器回到关闭态；`O` 再把通道打开（Lawicel 语义）。 */
     static const char cmd_reset[] = "C\r";
     static const char cmd_open[]  = "O\r";
+    /*
+     * ⚠ `M0` / `A1` 不能省（厂商台架脚本 `MIT/motorcontrol/tools/slcan_cb.py`
+     *   的 `open()` 就是 `C → S<n> → Y<n> → M0 → A1 → O`）：
+     *   - `M0` = 正常模式（`M1` 是只监听不发）；
+     *   - `A1` = 自动上报收到的帧（`A0` 要主机逐个 poll）。
+     *   以前我们只发 `C/[S]/[Y]/O`，完全**依赖适配器自己存着的模式**。
+     *   一旦它不在 `M0+A1`（拔插、别的工具改过、出厂默认），现场表现就是
+     *   “心跳突然没了 / 只收不发”，而关节其实在正常发帧 —— 这类“看起来像
+     *   设备挂了”的故障排查代价极高，所以这里显式把它设成我们需要的样子。
+     */
+    static const char cmd_normal[] = "M0\r";
+    static const char cmd_autopoll[] = "A1\r";
+    char        nominal_cmd[8];
     const char *fd_cmd = NULL;
+    size_t      nominal_len = 0u;
     unsigned    i;
 
     /* ⚠ 先把 `*out` 置 NULL（API 承诺：失败时调用方拿到 NULL，才能安全地
@@ -717,6 +753,17 @@ jsdk_status_t jsdk_hal_slcan_open(jsdk_can_hal_t *hal, jsdk_hal_handle_t **out,
      *   错，很容易误判成硬件问题。这条也让测试能在**没有硬件**的机器上断言
      *   这个错误码。
      */
+    if (bitrate != 0u) {
+        nominal_len = jsdk_slcan_bitrate_cmd(bitrate, nominal_cmd,
+                                             sizeof nominal_cmd);
+        if (nominal_len == 0u) {
+            sl_open_err_set("仲裁段速率 %lu 不在 Lawicel 标准表里（10k/20k/50k/"
+                            "100k/125k/250k/500k/800k/1M；S9 及以后是固件私有扩展，"
+                            "不猜）—— 要别的速率请先 用厂家工具配好，再传 0",
+                            (unsigned long)bitrate);
+            return JSDK_ERR_UNSUPPORTED;
+        }
+    }
     if (data_bitrate != 0u) {
         for (i = 0u; i < JSDK_SLCAN_FD_RATE_COUNT; ++i) {
             if (k_slcan_fd_rates[i].bitrate == data_bitrate) {
@@ -748,24 +795,50 @@ jsdk_status_t jsdk_hal_slcan_open(jsdk_can_hal_t *hal, jsdk_hal_handle_t **out,
     }
 
     /*
-     * 复位 + （可选）FD 速率 + 打开。这三条都是**尽力而为**：
-     * 有些固件不认识 `Y` 或 `C`，照样能收发，所以失败不上升到错误
-     * （但适配器配置没生效时会更早、更明显地表现为"收不到帧"）。
+     * 复位 + （可选）速率 + 模式 + 打开。
      *
-     * ⚠ 每条命令都**等 ACK + 重发**（`sl_cmd_sync`）：串口刚打开时这几笔写会丢，
-     *   盲等无法区分“生效”与“整段丢掉”。真机实测：丢掉整个序列时通道从未打开，
-     *   于是“打开后的第一个请求”必丢 —— 这是本项目最贵的一个现场症状。
+     * ⚠ 三条语义上的区分（以前混在一起，导致“返回了一个死句柄”）：
+     *   - **写失败**（端口被拔）→ 必须**显式报错**，不能带着坏句柄返 OK；
+     *   - **没 ACK** → 合法（很多固件不回），继续，但**不**声称“已生效”；
+     *   - ACK 到了 → 确认生效。
+     * 重试仍然保留（它修的是“端口刚打开前几笔写会丢”）。
      */
     sl_settle(h);
-    (void)sl_cmd_sync(h, cmd_reset);
+    /* 第一条用长等待 + 多重试：它是"端口是否真的活了"的探底 */
+    if (sl_cmd_sync(h, cmd_reset, JSDK_SLCAN_ACK_WAIT_MS,
+                    JSDK_SLCAN_ACK_TRIES) < 0) {
+        sl_open_err_set("向 %s 写打开命令失败（串口写入出错：设备被拔？）", port);
+        sl_port_close(&h->port);
+        free(h);
+        return JSDK_ERR_TRANSPORT;
+    }
+    /*
+     * ⚠ **`S` 必须在这里发**：Lawicel 语义下仲裁段速率只能在通道关闭时设置
+     *   （`C` 之后、`O` 之前）。这是 CLI 的 `--bitrate` 以前"有参数、无效果"的
+     *   根因 —— 值传进了 `open()`，但打开序列里没有任何人用它。
+     */
+    if (nominal_len != 0u) {
+        int rc = sl_cmd_sync(h, nominal_cmd, JSDK_SLCAN_CFG_WAIT_MS,
+                             JSDK_SLCAN_CFG_TRIES);
+        if (rc < 0) goto write_failed;
+        h->nominal_enabled = 1u;
+        h->nominal_bitrate = bitrate;
+    }
     if (fd_cmd) {
         /* ⚠ 用 strlen 而不是写死 3：表里的命令今后可能变长，
            写死长度会静默截断 —— 那种 bug 在真机上只表现为“适配器没反应”。 */
-        (void)sl_cmd_sync(h, fd_cmd);
+        if (sl_cmd_sync(h, fd_cmd, JSDK_SLCAN_CFG_WAIT_MS,
+                        JSDK_SLCAN_CFG_TRIES) < 0) goto write_failed;
         h->fd_enabled       = 1u;
         h->fd_data_bitrate  = data_bitrate;
     }
-    (void)sl_cmd_sync(h, cmd_open);
+    /* 模式：正常收发 + 自动上报（原因见上面 cmd_normal 的注释） */
+    if (sl_cmd_sync(h, cmd_normal, JSDK_SLCAN_CFG_WAIT_MS,
+                    JSDK_SLCAN_CFG_TRIES) < 0) goto write_failed;
+    if (sl_cmd_sync(h, cmd_autopoll, JSDK_SLCAN_CFG_WAIT_MS,
+                    JSDK_SLCAN_CFG_TRIES) < 0) goto write_failed;
+    if (sl_cmd_sync(h, cmd_open, JSDK_SLCAN_CFG_WAIT_MS,
+                    JSDK_SLCAN_CFG_TRIES) < 0) goto write_failed;
     sl_settle(h);
 
     h->base.kind    = JSDK_HAL_KIND_SLCAN;
@@ -781,6 +854,22 @@ jsdk_status_t jsdk_hal_slcan_open(jsdk_can_hal_t *hal, jsdk_hal_handle_t **out,
     g_open_err[0] = '\0';          /* 打开成功：没有原因可说 */
     *out = &h->base;
     return JSDK_OK;
+
+write_failed:
+    /* 串口写失败（设备被拔/句柄失效）：带着坏句柄返回 OK 只会把问题推到后面 */
+    sl_open_err_set("向 %s 写适配器配置命令失败（串口写入出错：设备被拔？）", port);
+    sl_port_close(&h->port);
+    free(h);
+    return JSDK_ERR_TRANSPORT;
+}
+
+jsdk_status_t jsdk_hal_slcan_open(jsdk_can_hal_t *hal, jsdk_hal_handle_t **out,
+                                  const char *port, uint32_t baud,
+                                  uint32_t data_bitrate)
+{
+    /* 旧入口：仲裁段速率传 0 = **不碰适配器配置**（与加 `_ex` 之前逐字节一致）。
+       保留旧符号是为了不打破已编译的客户程序（ABI），不是为了兼容语义。 */
+    return jsdk_hal_slcan_open_ex(hal, out, port, baud, 0u, data_bitrate);
 }
 
 /* --------------------------------------------------------------------------
@@ -802,6 +891,15 @@ void jsdk_hal_slcan_fd_config(jsdk_hal_handle_t *h, int *enabled,
     if (!s) return;
     if (enabled) *enabled = (int)s->fd_enabled;
     if (bitrate) *bitrate = s->fd_data_bitrate;
+}
+
+void jsdk_hal_slcan_nominal_config(jsdk_hal_handle_t *h, int *enabled,
+                                   uint32_t *bitrate)
+{
+    sl_handle_t *s = sl(h);
+    if (!s) return;
+    if (enabled) *enabled = (int)s->nominal_enabled;
+    if (bitrate) *bitrate = s->nominal_bitrate;
 }
 
 void jsdk_hal_slcan_fd_frames(jsdk_hal_handle_t *h, uint32_t *tx_fd,
