@@ -12129,7 +12129,12 @@ jsdk_status_t jsdk_joint_set_zero_here(jsdk_joint_t *j)
 
         if (read_pos_turns(j, &turns) == 0
             && turns > -0.001f && turns < 0.001f) {
-            jsdk_ctx_seterr(j->ctx, "SET_ZERO verified: pos_estimate = 0");
+            /* ⚠ 把“**没落 Flash**”写进消息里：CLI 现在直接引用这句，
+               以前那句写死在 CLI 里的“需 save 持久化”不能再依赖
+               （MIT 词汇是**自动**落 Flash 的，两边说法不一样）。 */
+            jsdk_ctx_seterr(j->ctx,
+                "SET_ZERO verified: pos_estimate = 0 (not yet persisted — "
+                "call jsdk_joint_save_config() to save it to flash)");
             return JSDK_OK;
         }
 
