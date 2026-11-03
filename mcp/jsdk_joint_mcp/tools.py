@@ -321,7 +321,7 @@ _SESSION_PROPS = {
     "node": {"type": "integer", "description": "目标关节的 node_id"},
     "iface": {
         "type": "string",
-        "enum": ["slcan", "socketcan", "pcan", "virtual"],
+        "enum": ["slcan", "socketcan", "pcan", "gsusb", "virtual"],
         "default": "slcan",
         "description": "传输后端",
     },

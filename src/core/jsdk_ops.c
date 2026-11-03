@@ -101,20 +101,19 @@ jsdk_status_t jsdk_context_warmup(jsdk_context_t *ctx, uint32_t timeout_ms)
  * 内部工具
  * ======================================================================== */
 
-#define P_CURRENT_ST  "axis0.current_state"
-
-/** 读设备当前状态（固件 AxisState 0..16）；失败返回 -1。 */
+/**
+ * 读设备当前状态（固件 AxisState 0..16）；失败返回 -1。
+ *
+ * ⚠ 只有 ODrive 词汇有 `axis0.current_state`。MIT 词汇该端点为 0（不是错误），
+ *   状态由心跳 / MIT 响应 nibble 提供，因此这里直接返回失败，由调用方选择
+ *   另一条路径（见 `poll_mode_state()`）。
+ */
 static int read_current_state(jsdk_joint_t *j, uint8_t *out)
 {
     uint8_t buf[8];
     uint8_t len = 0u;
 
-    if (j->ep_current_state == 0u) {
-        if (jsdk_ep_store_lookup(&j->ctx->store, P_CURRENT_ST,
-                                 &j->ep_current_state, NULL, NULL) != JSDK_OK) {
-            return -1;
-        }
-    }
+    if (j->ep_current_state == 0u) return -1;
     /*
      * ⚠ 用 `_once`：这是标定/回零期间的**轮询**读（每 `pace_ms` 再问一次）。
      *   重发在这里等价于把节奏拖成一个额外的超时（真机 3 s 级），
@@ -361,9 +360,351 @@ static jsdk_status_t request_state_and_wait(jsdk_joint_t *j, uint8_t transient,
     return JSDK_ERR_TIMEOUT;
 }
 
+/**
+ * 同步查一次模式 nibble（QUERY_STATUS → MIT 响应）。配置阶段专用。
+ *
+ * 为什么要单独一个函数：`request_state_and_wait()` 依赖 `axis0.current_state`
+ * 端点，而 MIT 词汇没有它 —— 状态只在 MIT 响应/心跳的 nibble 里。
+ */
+static jsdk_status_t poll_mode_state(jsdk_joint_t *j, uint8_t *ms)
+{
+    jsdk_can_frame_t rsp;
+
+    if (!j || !ms) return JSDK_ERR_INVALID_ARG;
+
+    if (jsdk_ctx_send(j->ctx, CB_PRI_QUERY, CB_MSG_QUERY_STATUS, j->cfg.node_id,
+                      NULL, 0u) != 0) {
+        return JSDK_ERR_TRANSPORT;
+    }
+    j->ctx->tx_seq = cb_seq_next(j->ctx->tx_seq);
+
+    if (jsdk_ctx_wait_response(j->ctx, CB_MSG_MIT_CONTROL, j->cfg.node_id, &rsp,
+                               JSDK_CFG_TIMEOUT_MS) != JSDK_OK) {
+        return JSDK_ERR_TIMEOUT;
+    }
+    jsdk_joint__on_mit_response(j, rsp.data, rsp.len);
+    *ms = j->fb.mode_state;
+    return JSDK_OK;
+}
+
+/* ⚠ 名字与 jsdk_joint.c 的同名函数区分：amalgamate.py 会把所有 .c 拼进同一个
+   translation unit，两个 `static` 同名会直接报错。 */
+static int ops_mode_is_closed_loop(uint8_t ms)
+{
+    return (ms == JSDK_MODESTATE_MIT || ms == JSDK_MODESTATE_POSITION
+            || ms == JSDK_MODESTATE_VELOCITY || ms == JSDK_MODESTATE_TORQUE
+            || ms == JSDK_MODESTATE_CLOSED_LOOP) ? 1 : 0;
+}
+
+/**
+ * 通过 function 端点（`action.calibrate`）启动标定并等待完成。
+ *
+ * 判据与 ODrive 路径一致，但状态来源是 **MIT 响应 nibble**：
+ *   ① 先确认设备处于静息态（`action.calibrate` 在非 `MENU_MODE` 会被固件
+ *      **静默拒绝** —— 写 ACK 不含成败位，不预检就只能等一个永不到来的状态）；
+ *   ② 调用 `action.calibrate`（写 function 端点 = 执行）；
+ *   ③ 轮询 nibble：看到 `CALIBRATING(1)` = 已进入；回到 `IDLE(2)` = 结束；
+ *   ④ 结束时查 `0x45` 故障明细 —— “跑完”不等于“成功”（失败路径正是
+ *      进标定 → 出错 → 回静息）。
+ *
+ * ⚠ 轮询必须限速（首段 20 ms 抓住瞬态，之后 200 ms），且空闲期间**只收不发**。
+ */
+static jsdk_status_t action_calibrate_and_wait(jsdk_joint_t *j, uint32_t timeout_ms)
+{
+    const char *path = jsdk_profile_action_calibrate(j);
+    uint32_t t0, next_poll;
+    uint32_t poll_ms = JSDK_STATE_POLL_MS_FAST;
+    uint32_t last_now = 0u;
+    unsigned frozen = 0u;
+    int      seen_transient = 0;
+    uint8_t  ms = 0u;
+
+    if (!path) {
+        jsdk_joint_seterr(j, "no calibration action endpoint for family '%s'",
+                          jsdk_profile_name(j->dev_family));
+        return JSDK_ERR_UNSUPPORTED;
+    }
+
+    /* 期间禁止任何控制帧（标定会转电机） */
+    j->ctrl_blocked = 1u;
+
+    /* --- ① 预检：必须是静息态 --- */
+    if (poll_mode_state(j, &ms) == JSDK_OK && ops_mode_is_closed_loop(ms)) {
+        j->ctrl_blocked = 0u;
+        jsdk_joint_seterr(j,
+            "calibration refused: device is in closed loop (mode_state=%u); "
+            "call jsdk_joint_request_disable() / stop and wait for IDLE first",
+            (unsigned)ms);
+        return JSDK_ERR_BAD_STATE;
+    }
+
+    /* --- ② 触发（写 function 端点，值长度 0） --- */
+    if (jsdk_joint_ep_invoke(j, path, NULL, 0u, NULL, 0u, NULL) != JSDK_OK) {
+        j->ctrl_blocked = 0u;
+        jsdk_joint_seterr(j, "invoke %s failed (endpoint missing or not a "
+                             "function? see last_error)", path);
+        return JSDK_ERR_TRANSPORT;
+    }
+
+    /* --- ③ 等“进入 → 回到静息” --- */
+    t0 = j->ctx->cfg.hal.now_ms(j->ctx->cfg.hal.user);
+    next_poll = t0;
+    for (;;) {
+        uint32_t now = j->ctx->cfg.hal.now_ms(j->ctx->cfg.hal.user);
+
+        j->ctx->now_ms = now;
+        if (jsdk_elapsed(now, t0) >= timeout_ms) break;
+
+        /* 时钟冻结兜底（与 request_state_and_wait 同一条理由：不能用迭代次数
+           当超时预算 —— 真机 HAL 的 recv 无数据时立即返回，几秒就能撞到上限）。 */
+        if (now != last_now) {
+            last_now = now;
+            frozen = 0u;
+        } else if (++frozen >= 200000u) {
+            break;
+        }
+
+        if (jsdk_elapsed(now, next_poll) < poll_ms) {
+            /* 空闲期间只收不发（排掉 RX，避免适配器缓冲溢出丢帧） */
+            jsdk_can_frame_t f;
+            int n = j->ctx->cfg.hal.recv(j->ctx->cfg.hal.user, &f);
+            if (n > 0) {
+                j->ctx->bus.rx_frames++;
+                j->ctx->bus.link_up    = 1u;
+                j->ctx->last_rx_ms     = now;
+                (void)jsdk_ctx_handle_frame(j->ctx, &f);
+            }
+            continue;
+        }
+        next_poll = now;
+
+        if (poll_mode_state(j, &ms) != JSDK_OK) {
+            continue;              /* 单次读失败 ≠ 状态没变 */
+        }
+        if (ms == JSDK_MODESTATE_CALIBRATING) {
+            seen_transient = 1;
+            poll_ms = JSDK_STATE_POLL_MS;
+        } else if (seen_transient
+                   && (ms == JSDK_MODESTATE_IDLE || ms == JSDK_MODESTATE_RESET)) {
+            char fb[192];
+            int  f;
+
+            j->ctrl_blocked = 0u;
+            f = device_fault(j, fb, sizeof fb);
+            if (f == 1) {
+                jsdk_joint_seterr(j,
+                    "calibration ran but the device reports a fault: %s"
+                    "（先清故障再重试）", fb);
+                return JSDK_ERR_PROTOCOL;
+            }
+            jsdk_ctx_seterr(j->ctx, "node %u calibration finished (back to IDLE%s)",
+                            (unsigned)j->cfg.node_id,
+                            f == 0 ? ", no fault" : ", fault check unavailable");
+            return JSDK_OK;
+        }
+    }
+
+    j->ctrl_blocked = 0u;
+    {
+        char fb[192] = {0};
+        int  f = device_fault(j, fb, sizeof fb);
+
+        if (seen_transient) {
+            jsdk_joint_seterr(j, "calibration did not finish within %u ms%s%s",
+                              (unsigned)timeout_ms,
+                              f == 1 ? " | device fault: " : "", f == 1 ? fb : "");
+        } else {
+            jsdk_joint_seterr(j,
+                "device never left idle after invoking %s (waited %u ms)%s%s",
+                path, (unsigned)timeout_ms,
+                f == 1 ? " | device fault: " : "", f == 1 ? fb : "");
+        }
+    }
+    return JSDK_ERR_TIMEOUT;
+}
+
 /* ==========================================================================
  * 零点 / 标定 / 回零
  * ======================================================================== */
+
+/**
+ * 主动问一次位置（`0x41 QUERY_POS_VEL`，**电机端 turns**）；成功返回 0。
+ *
+ * 抽出来是因为两条置零判据都要读位置（“位置是否立刻归 0” / “存完零点后
+ * 位置读数是几”），**不要**复制第二份请求+解码逻辑。
+ */
+static int read_pos_turns(jsdk_joint_t *j, float *out)
+{
+    jsdk_can_frame_t    rsp;
+    cb_query_pos_vel_t  pv;
+
+    if (!j || !out) return -1;
+    if (jsdk_ctx_send(j->ctx, CB_PRI_QUERY, CB_MSG_QUERY_POS_VEL,
+                      j->cfg.node_id, NULL, 0u) != 0) {
+        return -1;
+    }
+    j->ctx->tx_seq = cb_seq_next(j->ctx->tx_seq);
+
+    if (jsdk_ctx_wait_response(j->ctx, CB_MSG_QUERY_POS_VEL, j->cfg.node_id,
+                               &rsp, JSDK_CFG_TIMEOUT_MS) != JSDK_OK) {
+        return -1;
+    }
+    if (cb_query_decode_pos_vel(rsp.data, rsp.len, &pv) != 0) return -1;
+
+    *out = pv.pos_turns;
+    return 0;
+}
+
+/** 读一个 4 字节整数端点（置零判据专用）；成功返回 0。 */
+static int read_i32_ep(jsdk_joint_t *j, uint16_t ep, int32_t *out)
+{
+    uint8_t buf[8];
+    uint8_t len = 0u;
+
+    if (ep == 0u || !out) return -1;
+    if (jsdk_ctx_read_param_once(j->ctx, j->cfg.node_id, ep, buf, &len, 0u)
+            != JSDK_OK) {
+        return -1;
+    }
+    if (len < 4u) return -1;
+    *out = (int32_t)cb_le_get_u32(buf);      /* 参数值是小端 */
+    return 0;
+}
+
+/**
+ * 发一次 `SET_ZERO(0x61)`（无应答）。返回 `JSDK_OK` 或错误状态码。
+ *
+ * 抽出来是因为两条判据（“位置立刻变 0” / “零点存储变了，下次上电生效”）
+ * 共用同一帧；**不要**复制第二份发送逻辑。
+ */
+static jsdk_status_t send_set_zero(jsdk_joint_t *j)
+{
+    if (jsdk_ctx_send(j->ctx, CB_PRI_CTRL, CB_MSG_SET_ZERO, j->cfg.node_id,
+                      NULL, 0u) != 0) {
+        jsdk_joint_seterr(j, "SET_ZERO could not be sent");
+        return JSDK_ERR_TRANSPORT;
+    }
+    j->ctx->tx_seq = cb_seq_next(j->ctx->tx_seq);
+    return JSDK_OK;
+}
+
+/**
+ * 置零判据：**存储式零点**（`JSDK_PF_ZERO_NEEDS_BOOT`）。
+ *
+ * 为什么不能用“位置变 0”作为判据（真机实测，MIT 固件）：
+ *   `position_sensor.c` 里 `count_wrapped = (count - M_ZERO) % CPR`，而 `turns`
+ *   会对超过半圈的跳变做**连续性补偿** ⇒ 运行期改零点只换“单圈回绕点”，
+ *   `angle_multiturn` 保持连续，报告位置**不会**跳到 0；要到下次上电时首采样
+ *   按零点选 `turns` 才归零。
+ *
+ * ⇒ 本节用**可核查的读回**代替位置判据：
+ *   ① 快照 `config.m_zero`（存储的零点）与 `telemetry.count`（当前计数）；
+ *   ② 发 `SET_ZERO`；
+ *   ③ 轮询直到 `m_zero` 变了（= 设备真的采样了当前计数并写入），
+ *      或本来就已在零点附近（`|m_zero - count| <= tol`）。
+ * 判据不依赖“位置”这个被补偿过的量，因此**不会再假报 TIMEOUT**。
+ *
+ * ⚠ 零点落在 Flash 里，但**报告位置是否立刻为 0 取决于设备内部的多圈累计**
+ *   （真机两种都出现过）—— 所以结尾要**再读一次位置**，并按结果措辞，
+ *   不能一刀切。也**不会**悄悄 reboot（那是改客户的设备状态）。
+ */
+static jsdk_status_t set_zero_stored_and_wait(jsdk_joint_t *j)
+{
+    int32_t z_before = 0, cnt_before = 0;
+    int32_t z_now = 0, cnt_now = 0;
+    int     have_ep = (j->ep_zero_offset != 0u && j->ep_enc_count != 0u);
+    /*
+     * 计数容差：两次读之间转子可能漂几个 count（自由轴实测 ~10/100 ms）。
+     * 64 = CPR 的千分之一量级，足够宽到不被漂移误判，又窄到能识别“没写进去”。
+     */
+    const int32_t tol = 64;
+    uint32_t t0;
+    jsdk_status_t st;
+
+    /*
+     * ⚠ 先确认“能不能校验”，**再动设备**：没有零点端点的设备不该因为我们
+     *   无法验证就先把 SET_ZERO 发出去（副作用 + 一个 UNSUPPORTED 更难解释）。
+     */
+    if (!have_ep
+        || read_i32_ep(j, j->ep_zero_offset, &z_before) != 0
+        || read_i32_ep(j, j->ep_enc_count, &cnt_before) != 0) {
+        jsdk_joint_seterr(j,
+            "SET_ZERO not sent: this device exposes no readable zero-offset "
+            "endpoint to verify against (family '%s')",
+            jsdk_profile_name(j->dev_family));
+        return JSDK_ERR_UNSUPPORTED;
+    }
+
+    st = send_set_zero(j);
+    if (st != JSDK_OK) return st;
+
+    /*
+     * 预算用时钟：固件是在**主循环**里 `M_ZERO = count; save_preferences();`，
+     * Flash 写可能几百 ms 到数秒（真机标定后紧接着置零就遇到过 200 ms 不够）。
+     */
+    t0 = j->ctx->cfg.hal.now_ms(j->ctx->cfg.hal.user);
+    for (;;) {
+        int changed;
+
+        j->ctx->now_ms = j->ctx->cfg.hal.now_ms(j->ctx->cfg.hal.user);
+
+        if (read_i32_ep(j, j->ep_zero_offset, &z_now) == 0
+            && read_i32_ep(j, j->ep_enc_count, &cnt_now) == 0) {
+            int32_t d = (int32_t)(z_now - cnt_now);
+
+            if (d < 0) d = -d;
+            changed = (z_now != z_before);
+            if (changed || d <= tol) {
+                /*
+                 * ⚠ 真机实测：置零后 `position` **有时**立刻变 0、有时不变 ——
+                 *   该固件的多圈位置是**连续累计**（`count_buff = count_wrapped +
+                 *   CPR*turns`，`turns` 只在跨半圈时 ±1），所以改零点只移动
+                 *   “单圈回绕点”，不是“把当前值设成 0”。是否立刻为 0 取决于
+                 *   当前累计了多少圈。
+                 *
+                 * ⇒ 不能写死“要重启才归零”（那是过度断言），也不能写“已归零”
+                 *   （那是假成功）。**去读一次位置，按结果说**。
+                 */
+                float pos_turns = 0.0f;
+                int   have_pos  = (read_pos_turns(j, &pos_turns) == 0);
+                int   at_zero   = have_pos && (pos_turns > -0.001f && pos_turns < 0.001f);
+
+                if (at_zero) {
+                    jsdk_ctx_seterr(j->ctx,
+                        "SET_ZERO verified: zero offset stored (m_zero %ld -> %ld, "
+                        "count=%ld) and the device now reads position 0",
+                        (long)z_before, (long)z_now, (long)cnt_now);
+                } else if (have_pos) {
+                    jsdk_ctx_seterr(j->ctx,
+                        "SET_ZERO verified: zero offset stored (m_zero %ld -> %ld, "
+                        "count=%ld), but the device still reads %.4f motor turns — "
+                        "it keeps the multi-turn position continuous, so restart the "
+                        "device (jsdk_joint_reset_device()) if you want it to start "
+                        "at 0", (long)z_before, (long)z_now, (long)cnt_now,
+                        (double)pos_turns);
+                    j->status_flags |= (uint16_t)JSDK_JF_ZERO_PENDING_REBOOT;
+                    j->fb.status_flags = j->status_flags;
+                } else {
+                    jsdk_ctx_seterr(j->ctx,
+                        "SET_ZERO verified: zero offset stored (m_zero %ld -> %ld, "
+                        "count=%ld); position read failed, so whether it is 0 now "
+                        "is unknown", (long)z_before, (long)z_now, (long)cnt_now);
+                }
+                return JSDK_OK;
+            }
+        }
+
+        if (jsdk_elapsed(j->ctx->now_ms, t0) >= JSDK_ZERO_VERIFY_MS) {
+            jsdk_joint_seterr(j,
+                "SET_ZERO sent but the zero offset did not change within %u ms "
+                "(m_zero %ld -> %ld, count=%ld) —— 设备可能仍在静息态检查之外，"
+                "或该帧被丢弃；先 get_state 看 mode_state/故障，再重试",
+                (unsigned)JSDK_ZERO_VERIFY_MS,
+                (long)z_before, (long)z_now, (long)cnt_now);
+            return JSDK_ERR_TIMEOUT;
+        }
+    }
+}
 
 jsdk_status_t jsdk_joint_set_zero_here(jsdk_joint_t *j)
 {
@@ -372,35 +713,46 @@ jsdk_status_t jsdk_joint_set_zero_here(jsdk_joint_t *j)
 
     if (!jsdk_joint_check(j)) return JSDK_ERR_INVALID_ARG;
 
-    /* 0x61 无应答；写完后**读回位置**来确认零点确实动了 —— 这比"发出去了"强得多 */
-    if (jsdk_ctx_send(j->ctx, CB_PRI_CTRL, CB_MSG_SET_ZERO, j->cfg.node_id,
-                      NULL, 0u) != 0) {
-        jsdk_joint_seterr(j, "SET_ZERO could not be sent");
-        return JSDK_ERR_TRANSPORT;
+    /*
+     * MIT 词汇的 SET_ZERO 只在 `MENU_MODE` 生效（固件 `CB_MSG_SET_ZERO` 分支
+     * 有 `state.state == MENU_MODE` 判断），而它**不应答** ⇒ 闭环里调用会
+     * 静默什么也不做，最后只报“position did not become 0”，误导性很强。
+     * ODrive 允许闭环里置零，所以按能力位区分。
+     */
+    if ((j->profile_flags & (uint8_t)JSDK_PF_ZERO_REQUIRES_IDLE) != 0u) {
+        uint8_t ms = 0u;
+        if (poll_mode_state(j, &ms) == JSDK_OK
+            && ms != JSDK_MODESTATE_IDLE && ms != JSDK_MODESTATE_RESET) {
+            jsdk_joint_seterr(j,
+                "SET_ZERO requires an idle axis on this device (mode_state=%u); "
+                "stop / disable first", (unsigned)ms);
+            return JSDK_ERR_BAD_STATE;
+        }
     }
-    j->ctx->tx_seq = cb_seq_next(j->ctx->tx_seq);
+
+    /*
+     * 两条判据按能力位选（**不是**按家族名硬编码）：
+     *   ZERO_NEEDS_BOOT → 零点存储式：比对零点端点（见上）
+     *   其它            → 位置立刻变 0（ODrive 语义）
+     */
+    if ((j->profile_flags & (uint8_t)JSDK_PF_ZERO_NEEDS_BOOT) != 0u) {
+        return set_zero_stored_and_wait(j);
+    }
+
+    /* 0x61 无应答；写完后**读回位置**来确认零点确实动了 —— 这比"发出去了"强得多 */
+    {
+        jsdk_status_t st = send_set_zero(j);
+        if (st != JSDK_OK) return st;
+    }
 
     t0 = j->ctx->cfg.hal.now_ms(j->ctx->cfg.hal.user);
     for (;;) {
         float turns = 0.0f;
-        jsdk_can_frame_t rsp;
 
-        if (jsdk_ctx_send(j->ctx, CB_PRI_QUERY, CB_MSG_QUERY_POS_VEL,
-                          j->cfg.node_id, NULL, 0u) != 0) {
-            return JSDK_ERR_TRANSPORT;
-        }
-        j->ctx->tx_seq = cb_seq_next(j->ctx->tx_seq);
-
-        if (jsdk_ctx_wait_response(j->ctx, CB_MSG_QUERY_POS_VEL, j->cfg.node_id,
-                                   &rsp, JSDK_CFG_TIMEOUT_MS) == JSDK_OK) {
-            cb_query_pos_vel_t pv;
-            if (cb_query_decode_pos_vel(rsp.data, rsp.len, &pv) == 0) {
-                turns = pv.pos_turns;
-                if (turns > -0.001f && turns < 0.001f) {
-                    jsdk_ctx_seterr(j->ctx, "SET_ZERO verified: pos_estimate = 0");
-                    return JSDK_OK;
-                }
-            }
+        if (read_pos_turns(j, &turns) == 0
+            && turns > -0.001f && turns < 0.001f) {
+            jsdk_ctx_seterr(j->ctx, "SET_ZERO verified: pos_estimate = 0");
+            return JSDK_OK;
         }
 
         j->ctx->now_ms = j->ctx->cfg.hal.now_ms(j->ctx->cfg.hal.user);
@@ -415,6 +767,8 @@ jsdk_status_t jsdk_joint_set_zero_here(jsdk_joint_t *j)
 
 jsdk_status_t jsdk_joint_calibrate(jsdk_joint_t *j)
 {
+    uint32_t budget;
+
     if (!jsdk_joint_check(j)) return JSDK_ERR_INVALID_ARG;
 
     /* 固件要求标定前处于 IDLE；使能中调用会与闭环控制打架 */
@@ -424,14 +778,44 @@ jsdk_status_t jsdk_joint_calibrate(jsdk_joint_t *j)
         return JSDK_ERR_BAD_STATE;
     }
 
-    return request_state_and_wait(j, 3u,
-                                  state_budget_ms(j, JSDK_STATE_TIMEOUT_CALIBRATE_MS));
+    budget = state_budget_ms(j, JSDK_STATE_TIMEOUT_CALIBRATE_MS);
+
+    /*
+     * 两种实现，按能力位选：
+     *   ODRIVE   → 写 `axis0.requested_state = 3`（全标定序列），等 AxisState 回静息；
+     *   MIT      → 写 `action.calibrate`（function），等 MIT 响应 nibble 回 IDLE。
+     * 两者都不存在的设备**明确报 UNSUPPORTED**，不去猜某个 action 的名字。
+     */
+    if (j->ep_requested_state != 0u) {
+        return request_state_and_wait(j, 3u, budget);
+    }
+    if ((j->profile_flags & (uint8_t)JSDK_PF_ACTION_CALIBRATE) != 0u) {
+        return action_calibrate_and_wait(j, budget);
+    }
+
+    jsdk_joint_seterr(j,
+        "calibrate() unsupported: family '%s' exposes neither "
+        "axis0.requested_state nor action.calibrate",
+        jsdk_profile_name(j->dev_family));
+    return JSDK_ERR_UNSUPPORTED;
 }
 
 jsdk_status_t jsdk_joint_home(jsdk_joint_t *j)
 {
     if (!jsdk_joint_check(j)) return JSDK_ERR_INVALID_ARG;
     if (!j->calibrated) return JSDK_ERR_BAD_STATE;
+
+    /* `home()` 的语义是 ODrive 的 AxisState = HOMING(11)。
+       ⚠ **绝不能**把 MIT 的 `action.zero` 当回零：那是“把当前位置设为零点”，
+       与“限速运动去找原点”完全不同。 */
+    if ((j->profile_flags & (uint8_t)JSDK_PF_HAS_HOME) == 0u) {
+        jsdk_joint_seterr(j,
+            "home() unsupported on family '%s' (no requested_state/HOMING); "
+            "use jsdk_joint_set_zero_here() for a zero offset instead",
+            jsdk_profile_name(j->dev_family));
+        return JSDK_ERR_UNSUPPORTED;
+    }
+
     return request_state_and_wait(j, 11u,
                                   state_budget_ms(j, JSDK_STATE_TIMEOUT_HOME_MS));
 }
@@ -452,14 +836,15 @@ jsdk_status_t jsdk_joint_save_config(jsdk_joint_t *j)
     }
     j->ctx->tx_seq = cb_seq_next(j->ctx->tx_seq);
 
-    /* 校验点：读回 break_timeout（标定量程里唯一不该被我们改过的可写值之一） */
+    /* 校验点：读回协议超时（标定量程里唯一不该被我们改过的可写值之一）。
+       ⚠ 宽度按描述符：ODrive 是 u16，MIT 的 `config.can_timeout` 是 int32。 */
     if (j->ep_break_timeout != 0u) {
-        uint8_t buf[8];
-        uint8_t len = 0u;
-        if (jsdk_ctx_read_param(j->ctx, j->cfg.node_id, j->ep_break_timeout,
-                                buf, &len, 0u) != JSDK_OK || len < 2u) {
+        uint32_t v = 0u;
+        if (jsdk_ctx_read_u32_typed(j->ctx, j->cfg.node_id, j->ep_break_timeout,
+                                    (jsdk_ep_type_t)j->wd_type, &v, 0u)
+                != JSDK_OK) {
             jsdk_joint_seterr(j, "CONFIG_SAVE verification failed: cannot read "
-                                 "back can.config.break_timeout");
+                                 "back the protocol timeout endpoint");
             return JSDK_ERR_TIMEOUT;
         }
     }
@@ -586,17 +971,22 @@ jsdk_status_t jsdk_joint_set_node_id(jsdk_joint_t *j, uint8_t new_id, int persis
 
 jsdk_status_t jsdk_joint_set_watchdog_ms(jsdk_joint_t *j, uint32_t ms)
 {
-    uint8_t le[2];
-    int     disable;
+    jsdk_ep_type_t type;
+    int      disable;
+    uint32_t back = 0u;
 
     if (!jsdk_joint_check(j)) return JSDK_ERR_INVALID_ARG;
     if (j->ep_break_timeout == 0u) {
-        jsdk_joint_seterr(j, "can.config.break_timeout endpoint unavailable");
+        jsdk_joint_seterr(j, "protocol timeout endpoint unavailable for family '%s'",
+                          jsdk_profile_name(j->dev_family));
         return JSDK_ERR_NOT_FOUND;
     }
-    if (ms > 65535u) {
-        /* 端点只有 u16；静默截断会让客户以为设成了更大的值 */
-        jsdk_joint_seterr(j, "break_timeout max is 65535 ms (got %u)", (unsigned)ms);
+
+    type = (jsdk_ep_type_t)j->wd_type;
+    if (ms > 65535u && jsdk_ep_type_size(type) <= 2u) {
+        /* 端点只有 1/2 字节；静默截断会让客户以为设成了更大的值 */
+        jsdk_joint_seterr(j, "protocol timeout max is 65535 ms on this endpoint "
+                             "(got %u)", (unsigned)ms);
         return JSDK_ERR_INVALID_ARG;
     }
     disable = (ms == 0u);
@@ -604,13 +994,14 @@ jsdk_status_t jsdk_joint_set_watchdog_ms(jsdk_joint_t *j, uint32_t ms)
     /* 每次调用重新判定“能不能读回校验”，所以先清掉上一次的结果位 */
     jsdk_joint_clear_status_flags(j, (uint16_t)JSDK_JF_WATCHDOG_UNVERIFIED);
 
-    /* ⚠ 参数值在线上是**小端**（设备端 memcpy 主机序），见 cb_frame.h。
-       旧注释曾写"大端"并把 250→64000 归咎于"传主机序"——那是错的：
-       64000 恰恰是**按大端发包**的结果，真机上是小端。 */
-    cb_le_put_u16(le, (uint16_t)ms);
-    if (jsdk_ctx_write_param(j->ctx, j->cfg.node_id, j->ep_break_timeout,
-                             le, 2u, 0u) != JSDK_OK) {
-        jsdk_joint_seterr(j, "failed to write can.config.break_timeout");
+    /*
+     * ⚠ 宽度**按描述符**：ODrive 的 `can.config.break_timeout` 是 u16，
+     *   MIT 词汇的 `config.can_timeout` 是 int32。写死 2 字节会让后者被固件
+     *   以 `EP_ERR_BAD_LEN` 静默丢弃（写 ACK 不含成败位，主站完全看不出来）。
+     */
+    if (jsdk_ctx_write_u32_typed(j->ctx, j->cfg.node_id, j->ep_break_timeout,
+                                 type, ms, 0u) != JSDK_OK) {
+        jsdk_joint_seterr(j, "failed to write the protocol timeout endpoint");
         return JSDK_ERR_TRANSPORT;
     }
 
@@ -630,12 +1021,8 @@ jsdk_status_t jsdk_joint_set_watchdog_ms(jsdk_joint_t *j, uint32_t ms)
      *      - 其它不一致          → 真矛盾 → PROTOCOL（这条不能放松）。
      */
     {
-        uint8_t buf[8];
-        uint8_t len = 0u;
-
-        if (jsdk_ctx_read_param(j->ctx, j->cfg.node_id, j->ep_break_timeout,
-                                buf, &len, 0u) == JSDK_OK && len >= 2u) {
-            uint32_t back = cb_le_get_u16(buf);
+        if (jsdk_ctx_read_u32_typed(j->ctx, j->cfg.node_id, j->ep_break_timeout,
+                                    type, &back, 0u) == JSDK_OK) {
             if (back == ms) {
                 j->break_timeout_ms = back;          /* 含 0 == 0：禁用也能量化确认 */
             } else if (back == 0u && ms != 0u) {
@@ -643,7 +1030,7 @@ jsdk_status_t jsdk_joint_set_watchdog_ms(jsdk_joint_t *j, uint32_t ms)
                 j->break_timeout_ms = ms;            /* 保守：按“已武装”继续喂狗 */
             } else {
                 j->break_timeout_ms = back;
-                jsdk_joint_seterr(j, "break_timeout read back as %u, expected %u",
+                jsdk_joint_seterr(j, "protocol timeout read back as %u, expected %u",
                                   (unsigned)back, (unsigned)ms);
                 return JSDK_ERR_PROTOCOL;
             }
@@ -653,14 +1040,15 @@ jsdk_status_t jsdk_joint_set_watchdog_ms(jsdk_joint_t *j, uint32_t ms)
         }
 
         jsdk_ctx_seterr(j->ctx,
-            "break_timeout set to %u ms on node %u%s%s (not persisted; call "
-            "save_config())",
+            "protocol timeout set to %u ms on node %u (%s)%s%s (not persisted; "
+            "call save_config())",
             (unsigned)ms, (unsigned)j->cfg.node_id,
+            jsdk_profile_name(j->dev_family),
             disable ? "; 0 = protocol timeout DISABLED on the device" : "",
             (j->status_flags & (uint16_t)JSDK_JF_WATCHDOG_UNVERIFIED)
-                ? "; NOTE: could not verify by read-back (this firmware's "
-                  "can.config.break_timeout reads back 0 — see FIRMWARE_ISSUES "
-                  "F28): treat the watchdog as NOT confirmed"
+                ? "; NOTE: could not verify by read-back (on the ODrive-family "
+                  "endpoint this is FIRMWARE_ISSUES F28): treat the watchdog "
+                  "as NOT confirmed"
                 : "");
     }
 

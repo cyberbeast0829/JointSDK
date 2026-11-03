@@ -72,7 +72,7 @@ JSDK_HAL_LISTEN_ONLY = 0x00000010
 
 # §6.2 关节配置里的 0 表示"从设备读取"
 JSDK_MAX_JOINTS_STATIC = 8
-JSDK_CONTEXT_MAX_SIZE = 6144
+JSDK_CONTEXT_MAX_SIZE = 7168
 
 
 # ==========================================================================
@@ -94,9 +94,15 @@ class CanFrame(ctypes.Structure):
 class CanHal(ctypes.Structure):
     """``jsdk_can_hal_t``。
 
-    Python **从不调用**这些回调（见模块文档第 1 点），所以函数指针统一声明成
-    ``c_void_p``：既不引入 CFUNCTYPE 的样板，也不会因为调用约定写错而在运行期
-    崩。字段数量必须与 C 一致 —— ``_check_abi`` 会核对总尺寸。
+    **内置**后端（socketcan/pcan/slcan/virtual）由 C 侧工厂填好，Python 侧
+    从不调用这些回调，所以函数指针就声明成 ``c_void_p``：既不引入 CFUNCTYPE
+    的样板，也不会因为调用约定写错而在运行期崩。
+
+    ⚠ 但**插件式**后端（:class:`~jsdk_can.hal.CallbackHal`）确实要自己填
+    这几个指针 —— 那时用下面 :data:`HAL_SEND_FN` 等类型生成回调对象，
+    再 ``ctypes.cast`` 成 ``c_void_p`` 存进来。
+
+    字段数量必须与 C 一致 —— ``_check_abi`` 会核对总尺寸。
     """
 
     _fields_ = [
@@ -107,6 +113,16 @@ class CanHal(ctypes.Structure):
         ("on_error", c_void_p),
         ("bus_status", c_void_p),
     ]
+
+
+# 插件式 HAL 的四个回调签名（与 ``jsdk_can_hal_t`` 逐字对应）。
+# ``on_error`` 故意**不**提供：后端拿不到调用方的 on_error（结构体在
+# ``jsdk_context_init`` 时被复制），所以按仓库既有做法把原因**锁存**起来、
+# 由 ``bus_status`` 上报（见 hal_socketcan.c 的同名注释）。
+HAL_SEND_FN = ctypes.CFUNCTYPE(c_int, c_void_p, POINTER(CanFrame))
+HAL_RECV_FN = ctypes.CFUNCTYPE(c_int, c_void_p, POINTER(CanFrame))
+HAL_NOW_MS_FN = ctypes.CFUNCTYPE(c_uint32, c_void_p)
+HAL_BUS_STATUS_FN = ctypes.CFUNCTYPE(c_int, c_void_p, POINTER(c_uint32))
 
 
 class DescConfig(ctypes.Structure):
@@ -613,8 +629,12 @@ _FUNCS: dict[str, tuple[list, object]] = {
                             c_uint32, c_uint32], c_int),
     "jsdk_hal_slcan_open": ([POINTER(CanHal), POINTER(c_void_p), c_char_p,
                              c_uint32, c_uint32], c_int),
+    "jsdk_hal_slcan_open_ex": ([POINTER(CanHal), POINTER(c_void_p), c_char_p,
+                                c_uint32, c_uint32, c_uint32], c_int),
     "jsdk_hal_slcan_supports_fd": ([], c_int),
     "jsdk_hal_slcan_last_open_error": ([], c_char_p),
+    "jsdk_hal_slcan_nominal_config": ([c_void_p, POINTER(c_int),
+                                       POINTER(c_uint32)], None),
     "jsdk_hal_slcan_fd_config": ([c_void_p, POINTER(c_int),
                                   POINTER(c_uint32)], None),
     "jsdk_hal_slcan_fd_frames": ([c_void_p, POINTER(c_uint32),
@@ -656,6 +676,9 @@ _FUNCS: dict[str, tuple[list, object]] = {
     "jsdk_joint_is_fault": ([c_void_p], c_int),
     "jsdk_joint_get_mode_state": ([c_void_p], c_int),
     "jsdk_joint_get_can_state": ([c_void_p], c_int),
+    # 设备词汇家族（jsdk_devfamily_t）：AUTO/ODRIVE/CYBERBEAST_MIT
+    "jsdk_joint_get_device_family": ([c_void_p], c_int),
+    "jsdk_joint_set_device_family": ([c_void_p, c_int], c_int),
     "jsdk_joint_clear_status_flags": ([c_void_p, c_uint16], None),
     "jsdk_joint_request_enable": ([c_void_p, c_int], None),
     "jsdk_joint_request_disable": ([c_void_p], None),

@@ -142,6 +142,7 @@ set(JSDK_SOURCES
   src/core/jsdk_state_poll.c
   src/core/jsdk_desc.c
   src/core/jsdk_config.c
+  src/core/jsdk_profile.c
   src/core/jsdk_fault.c
   src/core/jsdk_ops.c
   src/core/jsdk_param.c

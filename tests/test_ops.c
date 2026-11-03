@@ -97,6 +97,30 @@ static int load_fixture(void)
     return 0;
 }
 
+/* 第二份描述符：MIT 扁平词汇（`config.*`），端阆 ID 复用虚拟设备的表。 */
+static char  *g_json_mit;
+static size_t g_json_mit_len;
+
+static int load_mit_fixture(void)
+{
+    FILE *fh = fopen(JSDK_TEST_DATA_DIR "/endpoints_mit.json", "rb");
+    long  sz;
+
+    if (!fh) return -1;
+    if (fseek(fh, 0L, SEEK_END) != 0) { fclose(fh); return -1; }
+    sz = ftell(fh);
+    if (sz <= 0) { fclose(fh); return -1; }
+    rewind(fh);
+    g_json_mit = (char *)malloc((size_t)sz);
+    if (!g_json_mit) { fclose(fh); return -1; }
+    if (fread(g_json_mit, 1u, (size_t)sz, fh) != (size_t)sz) {
+        free(g_json_mit); g_json_mit = NULL; fclose(fh); return -1;
+    }
+    fclose(fh);
+    g_json_mit_len = (size_t)sz;
+    return 0;
+}
+
 typedef struct {
     /* 内层：虚拟后端原生回调（user = jsdk_hal_handle_t*） */
     jsdk_can_hal_t     inner;
@@ -2784,6 +2808,144 @@ static void test_state_poll(void)
     fx_close(&fx);
 }
 
+/**
+ * 设备 profile：同一份 SDK 接 MIT 扁平词汇。
+ *
+ * 验证三件事（就是现场报告的三个阻断点）：
+ *   ① `configure()` 不再要求 7 条 ODrive 路径，而是按描述符识别 MIT 词汇；
+ *   ② 没有 `mit_max_torque` 时，用 `i_max × kt × gr` **派生**（且必须真读到）；
+ *   ③ 看门狗端点宽度按描述符（这里故意声明为 **int32**）——写死 2 字节会被
+ *      固件以 `EP_ERR_BAD_LEN` 静默丢弃。
+ */
+static void test_mit_profile(void)
+{
+    fix_t fx;
+
+    printf("[mit] flat endpoint vocabulary + derived torque range + int32 watchdog\n");
+
+    if (fx_open(&fx, "0:id=1,hb=0,timeout=30000,fd", 1u) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+    if (sim_set_desc(fx.sim, g_json_mit, (uint32_t)g_json_mit_len, 0x1234u) != 0) {
+        printf("      FATAL: sim_set_desc(mit) failed\n"); g_fail++; g_checks++;
+        fx_close(&fx); return;
+    }
+    if (fx_configure(&fx) != 0) {
+        printf("      FATAL: configure(mit) failed\n"); g_fail++; g_checks++;
+        fx_close(&fx); return;
+    }
+
+    CHECK_EQ(jsdk_joint_get_device_family(fx.j), JSDK_DEVFAMILY_CYBERBEAST_MIT);
+    CHECK_NEAR(fx.j->gear_ratio, (double)fx.sim->nodes[0].gear_ratio, 1e-3);
+    CHECK(fx.j->range.pos_max > 0.0f);
+    CHECK(fx.j->range.vel_max > 0.0f);
+    CHECK(fx.j->range.kp_max > 0.0f);
+    CHECK(fx.j->range.kd_max > 0.0f);
+    CHECK(fx.j->calibrated == 1u);
+
+    /* tau_max 必须恰好等于 current_lim × kt × gear（三项都是设备真值）。 */
+    CHECK_NEAR(fx.j->range.tau_max,
+               (double)fx.j->tau_lim_default_Nm * (double)fx.j->gear_ratio,
+               1e-3);
+
+    /* 看门狗：描述符声明 int32，写入必须真的落到 4 字节上。 */
+    CHECK_EQ(jsdk_joint_set_watchdog_ms(fx.j, 250u), JSDK_OK);
+    CHECK_EQ(fx.sim->nodes[0].can_timeout_i32, 250);
+    CHECK_EQ(fx.j->break_timeout_ms, 250u);
+
+    /* 本词汇没有 requested_state / action.calibrate → 必须**明确说**不支持，
+       而不是去猜一个 action 名字或默默返回成功。 */
+    CHECK_EQ(jsdk_joint_home(fx.j), JSDK_ERR_UNSUPPORTED);
+    CHECK_EQ(jsdk_joint_calibrate(fx.j), JSDK_ERR_UNSUPPORTED);
+
+    /* 控制通路：MIT 词汇的使能序列与 MIT 帧必须原样工作（派生量程不能越界）。 */
+    CHECK_EQ(jsdk_context_activate(fx.ctx), JSDK_OK);
+    CHECK_EQ(jsdk_joint_is_enabled(fx.j), 1);
+    jsdk_joint_set_mit(fx.j, 0.1, 0.0, 1.0, 0.1, 0.0);
+    for (unsigned k = 0u; k < 10u; ++k) fx_cycle(&fx);
+    CHECK_EQ(fx.sim->nodes[0].last_control_msgtype, CB_MSG_MIT_CONTROL);
+    CHECK_EQ(fx.sim->nodes[0].armed, 1u);
+
+    /* 使能中置零必须拒绝：该固件 SET_ZERO 只在 MENU 生效，闭环里调用会
+       **静默什么都不做**，所以要在发帧之前挡下来。 */
+    CHECK_EQ(jsdk_joint_set_zero_here(fx.j), JSDK_ERR_BAD_STATE);
+
+    jsdk_context_deactivate(fx.ctx);
+    CHECK_EQ(jsdk_joint_is_enabled(fx.j), 0);
+
+    /*
+     * 置零判据：**存储式零点**（JSDK_PF_ZERO_NEEDS_BOOT）。
+     *
+     * 真机实测（MIT 固件）：SET_ZERO 把 `M_ZERO = 当前计数` 存进 Flash，
+     * 但运行期位置由 `turns` 的连续性补偿保持不变 ⇒ **位置不会变 0**，
+     * 要到下次上电才归零。所以判据必须是“零点端点变了”，而不是“位置变 0”
+     * —— 后者会让每一次成功的置零都报 TIMEOUT（真机上就是这么发现的）。
+     */
+    {
+        int32_t z0 = fx.sim->nodes[0].zero_offset;
+        int32_t c0 = fx.sim->nodes[0].enc_count;
+        float   p0 = fx.sim->nodes[0].pos_estimate;
+
+        sim_set_zero_deferred(fx.sim, 0u, 1);      /* 该固件：位置不因置零改变 */
+
+        CHECK_EQ(jsdk_joint_set_zero_here(fx.j), JSDK_OK);
+        /* ① 设备真的记下了：零点 = 置零那一刻的计数，且与旧值不同 */
+        CHECK(fx.sim->nodes[0].zero_offset != z0);
+        CHECK_EQ(fx.sim->nodes[0].zero_offset, fx.sim->nodes[0].enc_count);
+        /* ② 位置**没有**变（这就是“下次上电生效”的含义，不能用位置当判据） */
+        CHECK_NEAR(fx.sim->nodes[0].pos_estimate, p0, 1e-6);
+        /* ③ 调用方要能被明确告知“还没生效” */
+        CHECK((fx.j->status_flags & JSDK_JF_ZERO_PENDING_REBOOT) != 0u);
+        printf("      zero stored: m_zero %ld -> %ld (count was %ld), "
+               "position unchanged %.4f\n",
+               (long)z0, (long)fx.sim->nodes[0].zero_offset, (long)c0,
+               (double)fx.sim->nodes[0].pos_estimate);
+
+        /* ④ 证伪力：让转子先走开（零点不再“已经对齐”），再把 SET_ZERO 帧丢掉
+              → 必须报 TIMEOUT，不能“看起来成功”。
+            ⚠ 必须先改变计数：若零点已经与当前计数一致，那段“已对齐”的短路
+              会（正确地）返回 OK —— 拿它当“丢帧”的判据是错的，这一点在
+              第一次写这条用例时就踩到了。 */
+        fx.sim->nodes[0].enc_count += 5000;
+        fx.drop_msgtype   = (uint8_t)CB_MSG_SET_ZERO;
+        fx.drop_msgtype_n = 1000u;
+        CHECK_EQ(jsdk_joint_set_zero_here(fx.j), JSDK_ERR_TIMEOUT);
+        fx.drop_msgtype   = 0u;
+        fx.drop_msgtype_n = 0u;
+
+        /* 恢复 ODrive 语义，免得影响同进程后续用例 */
+        sim_set_zero_deferred(fx.sim, 0u, 0);
+
+        /*
+         * 另一条**真实**分支：设备置零后位置确实立刻读到 0（真机上两种都出现过，
+         * 取决于内部多圈累计）。这时**不应**置“待重启”标志 —— 否则就是过度断言，
+         * 会让客户去做一次不必要的重启。
+         */
+        jsdk_joint_clear_status_flags(fx.j, JSDK_JF_ZERO_PENDING_REBOOT);
+        fx.sim->nodes[0].enc_count += 500;         /* 先走开：零点需要更新 */
+        CHECK_EQ(jsdk_joint_set_zero_here(fx.j), JSDK_OK);
+        CHECK_NEAR(fx.sim->nodes[0].pos_estimate, 0.0, 1e-6);
+        CHECK((fx.j->status_flags & JSDK_JF_ZERO_PENDING_REBOOT) == 0u);
+    }
+
+    fx_close(&fx);
+
+    /* 强制 ODRIVE 家族 → 必须 NOT_FOUND（不得静默回退到 MIT）。 */
+    {
+        fix_t f2;
+
+        if (fx_open(&f2, "0:id=1,hb=0,timeout=30000,fd", 1u) == 0) {
+            (void)sim_set_desc(f2.sim, g_json_mit, (uint32_t)g_json_mit_len, 0x1234u);
+            CHECK_EQ(jsdk_joint_set_device_family(f2.j, JSDK_DEVFAMILY_ODRIVE), JSDK_OK);
+            CHECK_EQ(jsdk_context_desc_fetch(f2.ctx), JSDK_OK);
+            CHECK_EQ(jsdk_context_configure(f2.ctx), JSDK_ERR_NOT_FOUND);
+            fx_close(&f2);
+        } else {
+            printf("      FATAL: second fixture failed\n"); g_fail++; g_checks++;
+        }
+    }
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -2792,7 +2954,12 @@ int main(void)
         printf("FATAL: cannot read fixture\n");
         return 1;
     }
-    printf("fixture: %u bytes\n\n", (unsigned)g_json_len);
+    if (load_mit_fixture() != 0) {
+        printf("FATAL: cannot read MIT fixture\n");
+        return 1;
+    }
+    printf("fixture: %u bytes (+MIT %u bytes)\n\n",
+           (unsigned)g_json_len, (unsigned)g_json_mit_len);
 
     test_fault_text();   printf("\n");
     test_params();       printf("\n");
@@ -2814,8 +2981,10 @@ int main(void)
     test_state_request(); printf("\n");
     test_state_poll();    printf("\n");
     test_robustness();   printf("\n");
+    test_mit_profile();  printf("\n");
 
     free(g_json);
+    free(g_json_mit);
     printf("=== %u checks, %u failures ===\n", g_checks, g_fail);
     return g_fail != 0u ? 1 : 0;
 }

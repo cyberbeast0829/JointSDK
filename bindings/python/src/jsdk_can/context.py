@@ -210,6 +210,11 @@ class Context:
         self._lib.jsdk_context_config_default(ctypes.byref(self.cfg))
         self.cfg.hal = self.hal.hal
         self.cfg.master_id = int(master_id)
+        # 后端明确**不支持** FD（如插件式 GsusbHal：python-can 的 gs_usb 是
+        # CAN 2.0 实现）时，默认按 Classic —— 否则 SDK 会按 FD 打包，而传输层
+        # 根本发不出去。只有调用方**显式**给了 is_fd 才以调用方为准。
+        if is_fd is None and not getattr(self.hal, "supports_fd", True):
+            is_fd = False
         self.cfg.is_fd = 1 if (is_fd is None or is_fd) else 0
         # None = “没指定，猜 FD”，允许 SDK 自动对齐；给定值 = 明确要求，不许被改
         # （见 joint_sdk.h 的 is_fd_explicit：改掉显式配置会连带弄错 8 字节参数的分块读）

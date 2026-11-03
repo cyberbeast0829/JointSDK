@@ -245,6 +245,7 @@ static void test_readonly(void)
 
     RUN_CLI(&r, VIF, "dump-config");
     ro_ok("dump-config", &r, "gear_ratio");
+    ro_ok("dump-config-family", &r, "family=odrive");
 
     RUN_CLI(&r, VIF, "err");
     ro_ok("err", &r, "axis");
@@ -302,6 +303,7 @@ static void test_json(void)
     expect_has(&r, "out", "\"mit_max_torque\"");
     expect_has(&r, "out", "\"torque_constant\"");
     expect_has(&r, "out", "\"break_timeout_ms\"");
+    expect_has(&r, "out", "\"family\":\"odrive\"");
 
     RUN_CLI(&r, VIF, "--json", "read", "axis0.motor.config.gear_ratio");
     CHECK(r.rc == 0);

@@ -974,7 +974,7 @@ with Context(VirtualHal(), period_ns=2_000_000) as ctx:
 
 | 项 | 设计 |
 |---|---|
-| HAL | Python 侧**不**用 ctypes 回调拼 `jsdk_can_hal_t`（脆弱且慢）。改为 C 侧提供内置后端工厂（见 §7.3），Python 只选后端名 |
+| HAL | Python 侧**不**用 ctypes 回调拼 `jsdk_can_hal_t`（脆弱且慢）——这条只管**内置**后端：它们有 C 实现，由 C 侧工厂填好函数表，Python 只选后端名。**没有 C 实现**的传输（gs_usb / 协议网关 / 测试替身）走**插件式回调 HAL**（`CallbackHal` + ctypes，见 `PYTHON.zh-CN.md` §7.2）；代价摆在那里：每次 send/recv/now_ms 都是一次 C→Python 调用，只适合桌面非实时场景 |
 | 实时性 | **明确非实时**。`cycle_*` + `pace()` 是"桌面级"节拍（`perf_counter_ns` + `sleep`，实测 1 kHz 下最大落后 1~3 ms）。硬实时控制请用 C/C++；Python 用于配置、采集、可视化 |
 | 错误 | C 返回码 → `JsdkError` 子类异常，并带上 `jsdk_context_last_error()` 原文。**异常类与状态码一一对应**（`error_for_status()` 是唯一入口），因此 `except JsdkTransportError` 这类写法可靠 |
 | 数值 | 统一 `float`/`float64`，不使用 numpy 作为硬依赖（`param_get_batch` 等直接返回 `dict`） |

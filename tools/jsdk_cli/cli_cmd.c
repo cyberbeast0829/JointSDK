@@ -625,10 +625,21 @@ static int cmd_batch_read(cli_app_t *a)
  * 只读：dump-config
  * ======================================================================== */
 
+/** 设备词汇家族名（与 `jsdk_profile.c` 的短名一致；未知按 auto）。 */
+static const char *cli_family_name(int family)
+{
+    switch (family) {
+    case JSDK_DEVFAMILY_ODRIVE:         return "odrive";
+    case JSDK_DEVFAMILY_CYBERBEAST_MIT: return "mit";
+    default:                            return "auto";
+    }
+}
+
 static int cmd_dump_config(cli_app_t *a)
 {
     jsdk_joint_config_snapshot_t s;
     jsdk_status_t st = jsdk_joint_read_config_snapshot(a->joint, &s);
+    const char *family = cli_family_name(jsdk_joint_get_device_family(a->joint));
 
     if (st != JSDK_OK) { cli_error(a, "dump-config", st); return CLI_EXIT_FAIL; }
 
@@ -646,9 +657,11 @@ static int cmd_dump_config(cli_app_t *a)
         cli_json_i64(&j, "node_id", (long long)s.node_id);
         cli_json_i64(&j, "heartbeat_rate_ms", (long long)s.heartbeat_rate_ms);
         cli_json_i64(&j, "break_timeout_ms", (long long)s.break_timeout_ms);
+        cli_json_str(&j, "family", family);
         cli_json_finish(&j);
     } else {
-        cli_fprintf(a->out, "节点 %u 配置快照 (valid=%d):\n", (unsigned)a->o.node, s.valid);
+        cli_fprintf(a->out, "节点 %u 配置快照 (valid=%d, family=%s):\n",
+                    (unsigned)a->o.node, s.valid, family);
         out_kv(a, "gear_ratio", "%.6g", (double)s.gear_ratio);
         out_kv(a, "mit_max_pos", "%.6g rad", (double)s.mit_max_pos);
         out_kv(a, "mit_max_vel", "%.6g rad/s", (double)s.mit_max_vel);
@@ -1546,19 +1559,40 @@ static int cmd_watchdog(cli_app_t *a)
 static int cmd_set_zero(cli_app_t *a)
 {
     jsdk_status_t st;
+    jsdk_joint_feedback_t fb;
+    int pending = 0;
     int rc = require_yes(a, "set-zero");
     if (rc != 0) return rc;
 
     st = jsdk_joint_set_zero_here(a->joint);
     if (st != JSDK_OK) { cli_error(a, "set-zero", st); return CLI_EXIT_FAIL; }
 
+    /*
+     * ⚠ 具体语义**由 SDK 说**（`jsdk_context_last_error()`）：不同家族不一样
+     *   —— ODrive 当场归 0 且不落 Flash；MIT 词汇自己落 Flash，但多圈位置是
+     *   连续累计，位置是否立刻为 0 要看累计圈数。CLI 以前写死一句
+     *   “未落 Flash，需 save”（对 MIT 是错的），现在不再复述，直接引用 SDK 判据。
+     */
+    if (jsdk_joint_get_feedback(a->joint, &fb) == JSDK_OK) {
+        pending = (fb.status_flags & JSDK_JF_ZERO_PENDING_REBOOT) != 0;
+    }
+
     if (a->o.json) {
         cli_json_t j;
         cli_json_init(&j, a->out, 0);
         cli_json_bool(&j, "zeroed", 1);
+        cli_json_bool(&j, "effective_now", pending ? 0 : 1);
+        if (pending) cli_json_str(&j, "effective_at", "restart");
+        cli_json_str(&j, "detail", jsdk_context_last_error(a->ctx));
         cli_json_finish(&j);
     } else {
-        cli_fprintf(a->out, "当前位置已设为零点（未落 Flash，需 save 持久化）\n");
+        const char *msg = jsdk_context_last_error(a->ctx);
+
+        cli_fprintf(a->out, "%s\n", (msg && msg[0]) ? msg : "SET_ZERO 已下发");
+        if (pending) {
+            cli_fprintf(a->out,
+                "  → 要让位置从 0 开始：`reset`（软复位）或断电重启（SDK 不会自动重启）\n");
+        }
     }
     return CLI_EXIT_OK;
 }

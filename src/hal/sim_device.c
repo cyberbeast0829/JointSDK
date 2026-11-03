@@ -100,6 +100,13 @@ static const sim_ep_def_t k_eps[] = {
     EP(3002, "sim_fn_scale.factor",                         SIM_T_F32, SIM_ACC_READ | SIM_ACC_WRITE, fn_scale_factor),
     EP(3003, "sim_fn_scale",                                SIM_T_FUNCTION, SIM_ACC_READ,            fn_scale_calls),
     EP(3004, "sim_fn_scale.out",                            SIM_T_F32, SIM_ACC_READ,                 fn_scale_out),
+    /* 仅供测试：int32 协议超时（对应 MIT 固件的 config.can_timeout 类型） */
+    EP(3011, "sim.can_timeout_i32",                         SIM_T_I32, SIM_ACC_READ | SIM_ACC_WRITE, can_timeout_i32),
+    /* 仅供测试：存储式零点（MIT 固件的 `config.m_zero` / `telemetry.count`）。
+       ⚠ 夹具 `endpoints_mit.json` 用同样的 id 把它们声明成那两条路径 ——
+         对外语义由**描述符里的名字**决定，仿真器只按 id 定位。 */
+    EP(3012, "sim.m_zero",                                  SIM_T_I32, SIM_ACC_READ | SIM_ACC_WRITE, zero_offset),
+    EP(3013, "sim.enc_count",                               SIM_T_I32, SIM_ACC_READ | SIM_ACC_WRITE, enc_count),
 };
 #undef EP
 
@@ -109,6 +116,12 @@ const sim_ep_def_t *sim_default_endpoints(size_t *count_out)
 {
     if (count_out) *count_out = K_EP_COUNT;
     return k_eps;
+}
+
+void sim_set_zero_deferred(sim_bus_t *b, unsigned idx, int deferred)
+{
+    if (!b || idx >= b->n_nodes) return;
+    b->nodes[idx].zero_deferred = (uint8_t)(deferred ? 1u : 0u);
 }
 
 uint8_t sim_ep_width(uint8_t type)
@@ -1221,8 +1234,20 @@ static void handle_frame_for_node(sim_bus_t *b, sim_node_t *n,
         if (f->len >= 1u) n->node_id = f->data[0];
         break;
     case CB_MSG_SET_ZERO:
-        n->pos_estimate = 0.0f;
-        n->input_pos = 0.0f;
+        /*
+         * 两条语义，由 `zero_deferred` 选（见 sim_device.h）：
+         *   ODrive（0，默认）：位置立刻归 0；
+         *   MIT（1）：只把**当前计数**存进零点，**位置不变** —— 真机的
+         *            `turns` 连续性补偿就是这个效果（位置要下次上电才归零）。
+         * 计数先自增，保证“存到的值”与“上次的值”可区分，用例才能断言
+         * “设备真的采样了当前计数”。
+         */
+        n->enc_count++;
+        n->zero_offset = n->enc_count;
+        if (!n->zero_deferred) {
+            n->pos_estimate = 0.0f;
+            n->input_pos = 0.0f;
+        }
         break;
     case CB_MSG_START_MOTOR:
         n->armed = 1u;
@@ -1444,6 +1469,7 @@ static void node_defaults(sim_node_t *n)
     n->hw_version_major   = 1u;
     n->fw_version_major   = 0u;
     n->break_timeout      = (uint16_t)SIM_BREAK_TIMEOUT_DEFAULT_MS;
+    n->can_timeout_i32    = (int32_t)SIM_BREAK_TIMEOUT_DEFAULT_MS;
     n->error_axis         = 0u;
     n->requested_state    = SIM_AS_IDLE;
     n->current_state      = SIM_AS_IDLE;
@@ -1478,6 +1504,12 @@ static void node_defaults(sim_node_t *n)
     n->pos_estimate       = 0.0f;
     n->vel_estimate       = 0.0f;
     n->cpr                = 8192;
+
+    /* 存储式零点：计数从非 0 开始，使“存到的值 ≠ 原值”可区分；
+       缺省用 ODrive 语义（位置立刻归 0），MIT 用例自己置 `zero_deferred`。 */
+    n->enc_count          = 12345;
+    n->zero_offset        = 0;
+    n->zero_deferred      = 0u;
 
     n->is_fd              = 1u;              /* 缺省 CAN FD */
     n->armed              = 0u;

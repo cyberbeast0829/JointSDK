@@ -252,6 +252,26 @@ typedef struct {
     float    fn_scale_in;          /* sim_fn_scale.in   入参 */
     float    fn_scale_factor;      /* sim_fn_scale.factor 入参 */
     float    fn_scale_out;         /* sim_fn_scale.out  出参（= in × factor） */
+
+    /* 仅供测试：**int32** 宽度的协议超时端点。
+       真机的 MIT 固件 `config.can_timeout` 是 int32，而 ODrive 的
+       `can.config.break_timeout` 是 u16 —— 用它验证 SDK 按描述符宽度读写，
+       而不是写死 2 字节（写死的话 int32 端点会被固件静默拒绝）。 */
+    int32_t  can_timeout_i32;      /* sim.can_timeout_i32 (id 3011) i32 rw */
+
+    /* ------------------------------------------------------------------
+     * 仅供测试：**存储式零点**（真机 MIT 固件 `config.m_zero` / `telemetry.count`）
+     *
+     * `zero_deferred = 0` = ODrive 语义：SET_ZERO 后 `pos_estimate` 立刻归 0。
+     * `zero_deferred = 1` = MIT 语义：SET_ZERO 只把**当前计数**存进零点
+     * （`zero_offset = ++enc_count`），而 `pos_estimate` **不变** —— 真机的
+     * `turns` 连续性补偿就是这个效果，位置要到下次上电才归零。
+     * ⇒ SDK 的判据必须比对零点端点，不能用“位置变 0”，这条模型让那条
+     *   判据在离线测试里可证伪。
+     * ------------------------------------------------------------------ */
+    int32_t  zero_offset;          /* sim.zero_offset (id 3012) i32 rw */
+    int32_t  enc_count;            /* sim.enc_count   (id 3013) i32 rw */
+    uint8_t  zero_deferred;        /* 1 = 位置不因 SET_ZERO 变化 */
 } sim_node_t;
 
 /** 虚拟总线（多节点） */
@@ -412,6 +432,17 @@ void sim_clear_stats(sim_bus_t *b);
 
 /** 设置描述符流速率（帧/ms）；0 = 恢复默认。用于“慢但持续”的流。 */
 void sim_set_desc_rate(sim_bus_t *b, uint32_t frames_per_ms);
+
+/**
+ * 设置节点的置零语义（`JSDK_PF_ZERO_NEEDS_BOOT` 的模型）。
+ *
+ * @param idx      节点下标（0 起，不是 node_id）
+ * @param deferred 1 = MIT 语义（SET_ZERO 只存零点，位置要下次上电才归零）
+ *                 0 = ODrive 语义（位置立刻归 0，默认）
+ *
+ * 默认 0，所以既有 ODrive 用例行为不变；只有需要的 MIT 用例显式置 1。
+ */
+void sim_set_zero_deferred(sim_bus_t *b, unsigned idx, int deferred);
 
 /**
  * 让某节点**丢掉的应答**：丢掉它发出的某个 MsgType 的前 `n` 帧。

@@ -228,12 +228,13 @@ CP936 表示不了的字符（如 `⚠`）会直接 `UnicodeEncodeError` 崩掉�
 ## 7. 传输后端（HAL）
 
 ```python
-from jsdk_can import VirtualHal, SocketCanHal, PcanHal, SlcanHal
+from jsdk_can import VirtualHal, SocketCanHal, PcanHal, SlcanHal, GsusbHal
 
 VirtualHal("0:id=1,gear=16.5,fd")          # 内置驱动器模型，无需硬件
 SocketCanHal("can0", 1_000_000, 5_000_000) # 位定时由内核管，先用 ip link 把链路 up
 PcanHal("PCAN_USBBUS1", 1_000_000, 5_000_000)
 SlcanHal("COM5", 115_200, 5_000_000)        # 串口速率 **不是** CAN 段速率
+GsusbHal("0", 1_000_000)                    # gs_usb / candleLight（Windows 也能用，见 7.2）
 ```
 
 ### 7.1 slcan 的 CAN FD
@@ -266,6 +267,46 @@ SlcanHal("COM5", baud=115200, data_bitrate=5_000_000)
 
 > 真机验证请在**先**跑 `jsdk-cli --if slcan ... scan`（见 `PORTING.zh-CN.md` §7.5.3）。
 > slcan 吞吐只有 100~500 fps，不适合高频控制。
+
+### 7.2 gs_usb（candleLight）—— Windows 上也能用的 USB-CAN
+
+```python
+GsusbHal("0", 1_000_000)     # 设备序号（0 起）；也可 "1:4" = bus:address
+GsusbHal.devices()           # 排障：枚举当前可见的适配器
+```
+
+gs_usb 是**USB 无内核类**设备（不是串口，也不是 PCAN），而 C 侧没有它的后端，
+所以它是 **插件式 HAL**（`CallbackHal`）：传输由 **Python** 实现（python-can 的
+`gs_usb` 接口），再用 ctypes 回调接进 `jsdk_can_hal_t`。
+
+```bash
+pip install "python-can[gs_usb]"            # 带上 gs-usb + pyusb
+python tools/gsusb_selftest.py --loopback   # 先验适配器，别一上来就开关节
+```
+
+现场三件事（每条都是买过单的）：
+
+1. **驱动必须是 WinUSB 系**（WinUSB / libusbK / libusb-win32，用 Zadig 或设备管理器
+   改）。绑在厂商驱动上（实测某机是 VirtualBox 的 `VBoxUSB`）**libusb 打不开**，
+   而报出来的可能只是“找不到设备”。
+2. **与 usbipd 互斥**：设备被 `usbipd wsl attach` 交给 WSL 后，Windows 侧就打不开
+   （反之亦然）—— 同一条 USB 通路只能开一条。
+3. **DLL 发现**：Windows 上 pyusb 的 `libusb1.get_backend()` **找不到**
+   `libusb-package` 装的那份 `libusb-1.0.dll`，直接返回 `None` ⇒ `scan()` 返回
+   **0 个设备**（“设备明明插着却说找不到”）。`GsusbHal` 会先按绝对路径把 DLL 载入
+   来绕过它；装 `libusb-package` 最省事。
+
+⚠ **只跑 Classic**：python-can 的 gs_usb 接口是 CAN 2.0（8 字节）实现，没有 FD
+路径 ⇒ `GsusbHal.supports_fd = False`，`Context` 因此默认按经典帧（**别再传**
+`is_fd=True`）。要 FD 请用 Linux 的 `SocketCanHal`。
+
+⚠ 这是**非实时**通路（ctypes 回调 + USB + Python），控制周期别超过 ~200 Hz；
+硬实时请用 C 后端。
+
+诊断：`hal.stats()` → `tx / tx_err / rx / echo / err_frame / dropped`。
+**`echo > 0` 证明设备↔主机这条 USB 通路是通的**（设备会把它收到的发送帧回显
+回来）；而 `rx == 0` 说明**总线上没人发言** —— 先怀疑对端，别先怀疑自己。
+顺序：`tools/gsusb_selftest.py` 过了，再谈开 `Context`。
 
 ## 8. 参数访问
 

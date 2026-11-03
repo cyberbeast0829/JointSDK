@@ -266,6 +266,29 @@ typedef enum {
     JSDK_MODESTATE_TORQUE      = 7
 } jsdk_modestate_t;
 
+/**
+ * 设备词汇/语义家族（`jsdk_joint_get_device_family()`）。
+ *
+ * JointSDK 的 L3 只依赖"语义"（齿比、力矩常数、MIT 量程、状态、标定）；不同固件
+ * 把这些语义放在不同的端点名下。本枚举标识**实际解析到的家族**：
+ *
+ * | 值 | 端点词汇 | 状态来源 | 标定方式 |
+ * |---|---|---|---|
+ * | `ODRIVE` | `axis0.motor.config.*` 等 | `axis0.current_state` | `requested_state = 3/11` |
+ * | `CYBERBEAST_MIT` | 扁平 `config.*` / `action.*` | MIT 响应/心跳 nibble | `action.calibrate` |
+ *
+ * `AUTO` 只用于**输入**（`jsdk_joint_set_device_family()` 的默认值 = 按描述符自动
+ * 识别），`jsdk_joint_get_device_family()` 永远不会返回它。
+ *
+ * @note 新增家族（例如 moteus）时**只追加枚举值**，并在
+ *       `src/core/jsdk_profile.c` 的候选路径表里追加一行；L3 其余代码只读能力位。
+ */
+typedef enum {
+    JSDK_DEVFAMILY_AUTO          = 0,  /**< 自动识别（输入专用） */
+    JSDK_DEVFAMILY_ODRIVE        = 1,  /**< ODrive / CYBERBEAST 原生词汇 */
+    JSDK_DEVFAMILY_CYBERBEAST_MIT = 2  /**< mini-cheetah 派生固件（扁平端点名） */
+} jsdk_devfamily_t;
+
 /* ==========================================================================
  * 4. 关节状态标志位（粘滞，需显式清除）
  * ======================================================================== */
@@ -293,6 +316,17 @@ typedef enum {
                                               若发 0 则该轴**不出力且不报错**。
                                               调 `jsdk_joint_set_torque_limit_Nm()` 清除。 */
 
+#define JSDK_JF_ZERO_PENDING_REBOOT 0x0100u
+                                         /**< `jsdk_joint_set_zero_here()` **已完成**
+                                              （零点端点读回已变，设备侧确实记下了），
+                                              但**读到的位置还不是 0**。
+
+                                              该固件的多圈位置是**连续累计**（改零点只移动
+                                              单圈回绕点），所以置零后位置是否立刻为 0
+                                              取决于累计了多少圈 —— 实测两种都出现过。
+                                              ⇒ 要位置从 0 开始需重启设备
+                                              （SDK **不会**自动重启）。 */
+
 /* ==========================================================================
  * 5. 不透明句柄与上下文存储
  * ======================================================================== */
@@ -308,19 +342,23 @@ typedef struct jsdk_joint   jsdk_joint_t;
  * 与 JSDK_MAX_JOINTS_STATIC 匹配的上下文最大字节数（编译期固定）。
  *
  * ⚠ 这个值是**实测得出**的，不是拍脑袋：x86-64 / MinGW 下
- *   `sizeof(jsdk_joint_t) = 560`（含反馈 112 + 目标 88 + 8 个参数槽位 112 + 端点 ID 22 …）
+ *   `sizeof(jsdk_joint_t) = 592`（含反馈 112 + 目标 88 + 8 个参数槽位 112 +
+ *   端点 ID / 设备 profile 能力位 …）
  *   `sizeof(cb_desc_fetch_t) = 728`（增量 JSON 解析器 + 传输状态机）
- *   ⇒ `sizeof(jsdk_context_t) = 5744`（8 个内嵌关节）。
+ *   ⇒ `sizeof(jsdk_context_t) = 6104`（8 个内嵌关节，v0.41 实测）。
  *   `src/core/jsdk_context.c` 里有编译期断言守住"实际大小 ≤ 本常量"，
  *   所以结构体一旦变大而这里没跟着改，**编译就会失败**（而不是静默写溢出
  *   调用者的静态存储 —— 那是最危险的一类回归）。
  *   测试 `tests/test_joint.c` 的 `[2]` 会把这个实测值打印出来，便于随时复核。
  *
+ * 历史：6144 → **7168**（v0.41 加入设备 profile 能力位，并为后续厂商
+ *       —— 例如 moteus —— 预留空间）。只增不减。
+ *
  * RAM 敏感时：把 `JSDK_MAX_JOINTS_STATIC` 调小（例如 4 → 约 3.6 KB），
  * 两个宏必须一起改。
  */
 #ifndef JSDK_CONTEXT_MAX_SIZE
-#  define JSDK_CONTEXT_MAX_SIZE 6144u
+#  define JSDK_CONTEXT_MAX_SIZE 7168u
 #endif
 
 /**
@@ -536,19 +574,20 @@ JSDK_API void jsdk_context_config_default(jsdk_context_config_t *cfg);
 typedef struct {
     uint32_t magic;                 /**< 内部使用，置 0；由 SDK 填充。 */
 
-    uint8_t  node_id;               /**< 1..254，对应设备 axis0.config.can.node_id。 */
+    uint8_t  node_id;               /**< 1..254（ODrive: axis0.config.can.node_id；MIT: config.can_id）。 */
     uint8_t  axis;                  /**< 预留：多轴板轴号；当前固定 0。 */
 
     /* 以下为 0 时表示“从设备读取”。读取失败不会静默取默认值，
-       而是置 unit_scale.valid = 0 并拒绍物理量 API。
-       端点 ID 由运行时解析的 JSON 描述符提供（见 §18），无内置表。 */
-    float gear_ratio;               /**< axis0.motor.config.gear_ratio */
-    float mit_max_pos;              /**< 单位：rad（输出端） */
-    float mit_max_vel;              /**< 单位：rad/s（输出端） */
-    float mit_max_torque;           /**< 单位：N·m（输出端） */
-    float mit_max_kp;               /**< axis0.controller.config.mit_max_kp */
-    float mit_max_kd;               /**< axis0.controller.config.mit_max_kd */
-    float torque_constant;          /**< N·m/A；解码 MIT 响应电流所必需 */
+       而是置 unit_scale.valid = 0 并拒绝物理量 API。
+       端点 ID 由运行时解析的 JSON 描述符提供（见 §18），无内置表；
+       具体候选路径见 `jsdk_joint_get_device_family()` 与 docs/PROFILES.zh-CN.md。 */
+    float gear_ratio;               /**< 齿比（ODrive: …gear_ratio；MIT: config.gr） */
+    float mit_max_pos;              /**< 单位：rad（输出端；MIT: config.p_max） */
+    float mit_max_vel;              /**< 单位：rad/s（输出端；MIT: config.v_max） */
+    float mit_max_torque;           /**< 单位：N·m（输出端；MIT 无端点，按 i_max×kt×gr 派生） */
+    float mit_max_kp;               /**< ODrive: …mit_max_kp；MIT: config.kp_max */
+    float mit_max_kd;               /**< ODrive: …mit_max_kd；MIT: config.kd_max */
+    float torque_constant;          /**< N·m/A；解码 MIT 响应电流所必需（MIT: config.kt） */
 
     jsdk_mode_t initial_mode;       /**< jsdk_context_activate() 使用的模式 */
 } jsdk_joint_config_t;
@@ -598,18 +637,29 @@ JSDK_API jsdk_status_t jsdk_context_add_joint(jsdk_context_t *ctx,
 /**
  * 配置阶段（非实时上下文，允许阻塞式等待响应）：
  *   1. 握手：发一帧让设备学到本机 master_id（否则心跳发往 0x01）；
- *   2. 发现标定参数：读 gear_ratio / mit_max_* / torque_constant，并做数值合理性校验；
- *   3. 端点解析：从设备下载 JSON 描述符（JSON_DESC_READ 0x24 → 0x25 流）并增量解析，
+ *   2. **设备词汇解析**：按描述符里实际存在的端点名，把「语义」映射到端点 ID
+ *      （见 `jsdk_joint_get_device_family()`）。目前支持两族：
+ *        - ODrive 词汇：`axis0.motor.config.*` / `axis0.controller.config.mit_max_*`；
+ *        - MIT 扁平词汇：`config.gr / config.kt / config.p_max / …`。
+ *      缺 `mit_max_torque` 时用 `current_lim × torque_constant × gear_ratio` **派生**
+ *      （三项必须是真读到的值，不猜）。
+ *   3. 发现标定参数并读回实际值（`jsdk_joint_config_t` 里显式给的数值优先）；
+ *   4. 端点解析：从设备下载 JSON 描述符（JSON_DESC_READ 0x24 → 0x25 流）并增量解析，
  *      得到全部端点 ID（见 §18）。**SDK 不内置静态端点表**，因此换固件不会读错参数。
  *      ⚠ 代价：实测描述符 41029 字节，FD 下 1+662 帧、Classic 1M 下 1+6839 帧；
  *      全量保留约 24.9 KB RAM。用 desc.retain / filter_paths 可降到 <1 KB。
  *      ⚠ 禁止在关节使能时执行（设备以 50 帧/ms 灌入，会挤掉控制帧触发看门狗）；
- *   4. 若 enable_watchdog_hint 且 period_ns 已知：在需要时设定 break_timeout
- *      （当前为 0 或比周期还短），并**读回确认**（读不回来只记 NOTE + 置
- *      JSDK_JF_WATCHDOG_UNVERIFIED，不阻断配置）。
- *      ⚠ 设备侧 `break_timeout == 0` = **超时检测已禁用** ⇒ 不做“周期必须小于它”
- *        的校验（那个校验只在设备真的开着超时时有意义）。
- * 任一标定参数缺失/异常 → JSDK_ERR_PROTOCOL 且 unit_scale.valid = 0。
+ *   5. 若 enable_watchdog_hint 且 period_ns 已知：在需要时设定协议超时
+ *      （`break_timeout` / `can_timeout`；当前为 0 或比周期还短），并**读回确认**
+ *      （读不回来只记 NOTE + 置 JSDK_JF_WATCHDOG_UNVERIFIED，不阻断配置）。
+ *      ⚠ 端点宽度按描述符（ODrive u16 / MIT int32）；写死宽度会被固件静默拒绝。
+ *      ⚠ 设备侧 `0` = **超时检测已禁用** ⇒ 不做“周期必须小于它”的校验
+ *        （那个校验只在设备真的开着超时时有意义）。
+ * 标定参数缺失/异常或两族词汇都不匹配 → `JSDK_ERR_NOT_FOUND` /
+ * `JSDK_ERR_PROTOCOL`；后者还会让 `unit_scale.valid = 0`。
+ *
+ * @note 本函数**不要求**任何固定的 ODrive 路径；具体候选名见 `src/core/jsdk_profile.c`，
+ *       解析结果可用 @ref jsdk_joint_get_device_family() 查询。
  */
 JSDK_API jsdk_status_t jsdk_context_configure(jsdk_context_t *ctx);
 
@@ -1006,6 +1056,30 @@ JSDK_API jsdk_modestate_t jsdk_joint_get_mode_state(const jsdk_joint_t *j);
  * @return 状态值；尚未读到过返回 -1。用 `jsdk_can_axis_state_name()` 取名字。
  */
 JSDK_API int jsdk_joint_get_can_state(const jsdk_joint_t *j);
+
+/**
+ * 本关节**实际解析到**的设备词汇家族（`jsdk_devfamily_t`）。
+ *
+ * @note 在 `configure()` 之前返回 `JSDK_DEVFAMILY_AUTO`（尚未解析）。
+ *       解析依据是运行时下载的 JSON 描述符里**实际存在的端点名**，不是固件版本号 ——
+ *       所以同一份 SDK 可以同时接 ODrive 词汇的关节和扁平端点名的关节。
+ */
+JSDK_API int jsdk_joint_get_device_family(const jsdk_joint_t *j);
+
+/**
+ * 强制指定设备词汇家族（默认 `JSDK_DEVFAMILY_AUTO` = 按描述符自动识别）。
+ *
+ * 用途：
+ *  - 总线上同时存在多套词汇、自动识别的优先顺序不适用时；
+ *  - 测试 / 未来新增厂商（例如 moteus）时显式选路。
+ *
+ * ⚠ 必须在 `jsdk_context_configure()` **之前**调用。传入未知值按 `AUTO` 处理
+ *   （不报错，便于旧二进制把未初始化的填充字节传进来时仍能工作）。
+ *
+ * @return `JSDK_OK`；已 `configure()` 或句柄无效时返回 `JSDK_ERR_BAD_STATE` /
+ *         `JSDK_ERR_INVALID_ARG`。
+ */
+JSDK_API jsdk_status_t jsdk_joint_set_device_family(jsdk_joint_t *j, int family);
 
 /** 清除粘滞状态标志位。 */
 JSDK_API void jsdk_joint_clear_status_flags(jsdk_joint_t *j, uint16_t mask);

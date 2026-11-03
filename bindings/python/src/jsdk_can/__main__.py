@@ -31,7 +31,7 @@ from . import __version__
 from .context import Context
 from .enums import Mode, StatusFlag
 from .errors import JsdkError
-from .hal import PcanHal, SlcanHal, SocketCanHal, VirtualHal
+from .hal import GsusbHal, PcanHal, SlcanHal, SocketCanHal, VirtualHal
 
 __all__ = ["main"]
 
@@ -95,6 +95,10 @@ def _build_hal(args: argparse.Namespace, data_bitrate: int | None = None):
         return PcanHal(args.channel or "PCAN_USBBUS1", args.bitrate, db)
     if args.iface == "slcan":
         return SlcanHal(args.channel or "COM3", args.baud, db)
+    if args.iface == "gsusb":
+        # gs_usb（candleLight）：走 python-can，需要 `pip install "python-can[gs_usb]"`。
+        # ⚠ 它是 **CAN 2.0** 通路（无 FD），所以 `db` 在这里无意义 —— 见 GsusbHal。
+        return GsusbHal(args.channel or "0", args.bitrate or 1_000_000)
     raise SystemExit(f"未知后端：{args.iface}")
 
 
@@ -154,10 +158,10 @@ def _common_parser() -> argparse.ArgumentParser:
     """全局选项（主 parser 与每个子命令都继承一份，两种顺序都能写）。"""
     c = argparse.ArgumentParser(add_help=False, argument_default=argparse.SUPPRESS)
     c.add_argument("--if", dest="iface", choices=["virtual", "socketcan", "pcan",
-                                                  "slcan"],
+                                                  "slcan", "gsusb"],
                    help="传输后端（默认 virtual：无硬件也能跑）")
     c.add_argument("--channel",
-                   help="can0 / PCAN_USBBUS1 / COM3 / 虚拟节点规格")
+                   help="can0 / PCAN_USBBUS1 / COM3 / gs_usb 设备序号 / 虚拟节点规格")
     c.add_argument("--baud", type=int,
                    help="**串口**波特率（仅 slcan；与 --bitrate 不是一个量）")
     c.add_argument("--bitrate", type=int)

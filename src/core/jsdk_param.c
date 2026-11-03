@@ -470,6 +470,99 @@ jsdk_status_t jsdk_joint_param_get_batch(jsdk_joint_t *j, jsdk_param_req_t *reqs
 }
 
 /* ==========================================================================
+ * 按描述符类型宽度的整数读写
+ * ------------------------------------------------------------------------
+ * 用途：看门狗超时 / 节点号 / 心跳周期这类“整数但宽度随固件而变”的端点。
+ * 典型差异：ODrive 的 `can.config.break_timeout` 是 **u16**，MIT 词汇的
+ * `config.can_timeout` 是 **int32** —— 写死 2 字节会让后者被固件以
+ * `EP_ERR_BAD_LEN` 静默丢弃（写 ACK 不含成败位，主站完全看不出来）。
+ * ======================================================================== */
+
+int jsdk_ctx_read_u32_typed(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_id,
+                            jsdk_ep_type_t type, uint32_t *out, uint32_t timeout_ms)
+{
+    uint8_t  buf[8];
+    uint8_t  len = 0u;
+    uint8_t  need;
+    jsdk_value_t v;
+
+    if (!jsdk_ctx_check(ctx) || !out) return JSDK_ERR_INVALID_ARG;
+    need = (uint8_t)jsdk_ep_type_size(type);
+    if (need == 0u || need > 4u) return JSDK_ERR_UNSUPPORTED;
+
+    {
+        int rc = jsdk_ctx_read_param_exact(ctx, node_id, ep_id, buf, need, &len,
+                                           timeout_ms);
+        if (rc != JSDK_OK) return rc;      /* 保留 NOT_FOUND / PROTOCOL 等细节 */
+    }
+    if (len < need) return JSDK_ERR_PROTOCOL;
+
+    le_to_value(type, buf, &v);
+    switch (type) {
+    case JSDK_EP_U8:   *out = v.v.u8;  return JSDK_OK;
+    case JSDK_EP_I8:   *out = (uint32_t)(int32_t)v.v.i8;  return JSDK_OK;
+    case JSDK_EP_U16:  *out = v.v.u16; return JSDK_OK;
+    case JSDK_EP_I16:  *out = (uint32_t)(int32_t)v.v.i16; return JSDK_OK;
+    case JSDK_EP_U32:  *out = v.v.u32; return JSDK_OK;
+    case JSDK_EP_I32:  *out = (uint32_t)v.v.i32; return JSDK_OK;
+    case JSDK_EP_BOOL: *out = (uint32_t)v.v.boolean; return JSDK_OK;
+    default:           return JSDK_ERR_UNSUPPORTED;
+    }
+}
+
+int jsdk_ctx_write_u32_typed(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_id,
+                             jsdk_ep_type_t type, uint32_t value,
+                             uint32_t timeout_ms)
+{
+    jsdk_value_t in;
+    uint8_t  buf[8];
+    uint8_t  len = 0u;
+
+    if (!jsdk_ctx_check(ctx)) return JSDK_ERR_INVALID_ARG;
+
+    /* ⚠ 超值域**报错**，不静默截断：截断会让“设了 250 ms”变成另一个值，
+       而设备的写 ACK 不含成败位，主站只能靠读回发现。 */
+    switch (type) {
+    case JSDK_EP_U8:
+    case JSDK_EP_BOOL:
+        if (value > 0xFFu) { jsdk_ctx_seterr(ctx, "value %u exceeds u8", (unsigned)value); return JSDK_ERR_INVALID_ARG; }
+        break;
+    case JSDK_EP_I8:
+        if (value > 0x7Fu) { jsdk_ctx_seterr(ctx, "value %u exceeds i8", (unsigned)value); return JSDK_ERR_INVALID_ARG; }
+        break;
+    case JSDK_EP_U16:
+        if (value > 0xFFFFu) { jsdk_ctx_seterr(ctx, "value %u exceeds u16", (unsigned)value); return JSDK_ERR_INVALID_ARG; }
+        break;
+    case JSDK_EP_I16:
+        if (value > 0x7FFFu) { jsdk_ctx_seterr(ctx, "value %u exceeds i16", (unsigned)value); return JSDK_ERR_INVALID_ARG; }
+        break;
+    case JSDK_EP_I32:
+        if (value > 0x7FFFFFFFu) { jsdk_ctx_seterr(ctx, "value %u exceeds i32", (unsigned)value); return JSDK_ERR_INVALID_ARG; }
+        break;
+    case JSDK_EP_U32:
+        break;
+    default:
+        return JSDK_ERR_UNSUPPORTED;
+    }
+
+    memset(&in, 0, sizeof in);
+    in.type = type;
+    switch (type) {
+    case JSDK_EP_U8:   in.v.u8  = (uint8_t)value;  break;
+    case JSDK_EP_I8:   in.v.i8  = (int8_t)value;   break;
+    case JSDK_EP_U16:  in.v.u16 = (uint16_t)value; break;
+    case JSDK_EP_I16:  in.v.i16 = (int16_t)value;  break;
+    case JSDK_EP_U32:  in.v.u32 = value;           break;
+    case JSDK_EP_I32:  in.v.i32 = (int32_t)value;  break;
+    case JSDK_EP_BOOL: in.v.boolean = (value != 0u) ? 1 : 0; break;
+    default:           return JSDK_ERR_UNSUPPORTED;
+    }
+
+    if (value_to_le(type, &in, buf, &len) != 0) return JSDK_ERR_UNSUPPORTED;
+    return jsdk_ctx_write_param(ctx, node_id, ep_id, buf, len, timeout_ms);
+}
+
+/* ==========================================================================
  * SDO 风格槽位
  * ======================================================================== */
 

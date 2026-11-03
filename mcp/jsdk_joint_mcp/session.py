@@ -242,14 +242,15 @@ class JointSession:
             )
 
         from jsdk_can import Context, Mode          # noqa: PLC0415
-        from jsdk_can.hal import PcanHal, SlcanHal, SocketCanHal, VirtualHal  # noqa: PLC0415
+        from jsdk_can.hal import (GsusbHal, PcanHal, SlcanHal,  # noqa: PLC0415
+                                  SocketCanHal, VirtualHal)
 
         with self._lock:
             if self.state.opened:
                 return self.state
 
             hal = self._build_hal(
-                SlcanHal, SocketCanHal, PcanHal, VirtualHal
+                SlcanHal, SocketCanHal, PcanHal, VirtualHal, GsusbHal
             )
 
             # ⚠⚠ 帧格式的**两层**归属（之前写错过，这里记清楚）：
@@ -285,7 +286,7 @@ class JointSession:
                 )
             return self.state
 
-    def _build_hal(self, SlcanHal, SocketCanHal, PcanHal, VirtualHal):
+    def _build_hal(self, SlcanHal, SocketCanHal, PcanHal, VirtualHal, GsusbHal=None):
         """构造 HAL —— **帧格式在这里定**（不是 add_joint 层）。
 
         ⚠ `data_bitrate` 的真实语义（按 HAL 不同）：
@@ -333,9 +334,19 @@ class JointSession:
                            bitrate=self.cfg.bitrate,
                            data_bitrate=self.cfg.data_bitrate or 5_000_000)
 
+        if iface == "gsusb":
+            # gs_usb（candleLight）USB-CAN：走 python-can 的 gs_usb 接口。
+            # ⚠ 该接口是 CAN 2.0（无 FD），且**需要设备已绑到 WinUSB/libusbK/
+            #   libusb-win32**（厂商驱动打不开）；与 usbipd（交给 WSL）互斥。
+            if GsusbHal is None:  # 旧库没有这个后端
+                raise UsageError(
+                    "当前 jsdk_can 没有 GsusbHal（需要带插件式 HAL 的版本）")
+            return GsusbHal(self.cfg.channel or "0",
+                            bitrate=self.cfg.bitrate or 1_000_000)
+
         raise UsageError(
             f"未知传输后端: {iface}",
-            hint="可选 socketcan / pcan / slcan / virtual",
+            hint="可选 gsusb / socketcan / pcan / slcan / virtual",
         )
 
     def configure(self, *, load_descriptor: bool | None = None) -> SessionState:

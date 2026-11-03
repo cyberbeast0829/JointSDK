@@ -465,6 +465,21 @@ class Joint:
         """
         return int(self._lib.jsdk_joint_get_can_state(self._ptr))
 
+    def device_family(self) -> int:
+        """实际解析到的设备词汇家族：0=AUTO/未解析，1=ODRIVE，2=CYBERBEAST_MIT。
+
+        在 ``context.configure()`` 之前为 0。解析依据是描述符里实际存在的端点名。
+        """
+        return int(self._lib.jsdk_joint_get_device_family(self._ptr))
+
+    def set_device_family(self, family: int) -> None:
+        """强制设备词汇家族（默认 0 = 自动识别）；必须在 ``configure()`` 之前调用。"""
+        raise_for_status(
+            self._lib.jsdk_joint_set_device_family(self._ptr, int(family)),
+            "set_device_family",
+            self._ctx.last_error(),
+        )
+
     def clear_status_flags(self, mask: int = 0xFFFF) -> None:
         """清除粘滞状态标志（``JSDK_JF_*``）。"""
         self._lib.jsdk_joint_clear_status_flags(self._ptr, int(mask))

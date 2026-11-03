@@ -111,10 +111,12 @@ __all__ = [
     "unit_scale_calc",
     # 传输后端
     "Hal",
+    "CallbackHal",
     "VirtualHal",
     "SocketCanHal",
     "PcanHal",
     "SlcanHal",
+    "GsusbHal",
     "DEFAULT_VIRTUAL_SPEC",
     # 枚举
     "Status",

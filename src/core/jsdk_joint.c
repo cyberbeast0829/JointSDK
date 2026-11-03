@@ -208,6 +208,27 @@ void jsdk_joint__on_mit_response(jsdk_joint_t *j, const uint8_t *data, uint8_t l
     j->fb.mode_state = r.mode;
     j->fb.axis_error = j->fault.axis_error;
 
+    /*
+     * 没有 `axis0.current_state` 端点的固件（MIT 词汇）只能从 nibble 推 AxisState。
+     * 这不只是为了显示：客户按 `can_state()` 判断“是否已使能”时，必须与
+     * `is_enabled()` / `mode_state()` 一致。
+     *
+     * 映射与固件 `cb_axis_state_byte()` 同口径：
+     *   MIT/POS/VEL/TORQUE/CLOSED_LOOP(3..7) → 8 CLOSED_LOOP_CONTROL
+     *   CALIBRATING(1)                       → 4 ENCODER_OFFSET_CALIBRATION
+     *   其它（IDLE/RESET）                    → 1 IDLE
+     * ODrive 词汇**不覆盖**：那里 `axis0.current_state` 更精确（含 6/7/16 子状态）。
+     */
+    if ((j->profile_flags & (uint8_t)JSDK_PF_STATE_FROM_NIBBLE) != 0u) {
+        uint8_t a = 1u;
+        if (r.mode >= JSDK_MODESTATE_CLOSED_LOOP && r.mode <= JSDK_MODESTATE_TORQUE) a = 8u;
+        else if (r.mode == JSDK_MODESTATE_CALIBRATING) a = 4u;
+        if (j->current_state_raw != a) {
+            j->current_state_raw = a;
+            j->state_known = 1u;
+        }
+    }
+
     touch_feedback(j, j->ctx ? j->ctx->now_ms : 0u);
     jsdk_joint__refresh_state(j);
 }
@@ -601,10 +622,16 @@ void jsdk_joint_hold_position_pd(jsdk_joint_t *j, double kp, double kd)
  * 编码并发送
  * ======================================================================== */
 
-/** 该模式发出的帧会不会刷新固件的协议级超时计时器（见 jsdk_core_internal.h）。 */
-static int mode_feeds_watchdog(uint8_t msgtype)
+/**
+ * 该模式发出的帧会不会刷新固件的协议级超时计时器。
+ *
+ * ⚠ 用**关节感知**版本：MIT 固件的 `0x04 CURRENT` 也会把 controller.timeout 清零
+ *   （ODrive 不会，见 F19）。不区分 profile 的话，客户从 MIT 切到纯 CURRENT 后
+ *   SDK 会周期性补发 MIT 零力矩帧，把电流指令打回 0。
+ */
+static int mode_feeds_watchdog(const jsdk_joint_t *j, uint8_t msgtype)
 {
-    return jsdk_msgtype_feeds_watchdog(msgtype);
+    return jsdk_joint__feeds_watchdog(j, msgtype);
 }
 
 /**
@@ -800,7 +827,7 @@ static int send_one_frame(jsdk_joint_t *j)
     j->sent_cycle = 1u;          /* 本周期已给这个关节发过帧 */
     ctx->tx_seq = cb_seq_next(ctx->tx_seq);
 
-    if (mode_feeds_watchdog(msgtype)) {
+    if (mode_feeds_watchdog(j, msgtype)) {
         j->last_ctrl_tx_ms = ctx->now_ms;
         j->first_frame_done = 1u;
     }

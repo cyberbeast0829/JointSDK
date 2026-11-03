@@ -22,7 +22,7 @@ DEFAULT_TIMEOUT_S = 120
 def add_common_args(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """给脚本加 `--if/--channel/--node`（与 `hw_smoke` 同名同义）。"""
     ap.add_argument("--if", dest="iface", default="slcan",
-                    choices=["slcan", "socketcan", "pcan", "virtual"],
+                    choices=["slcan", "socketcan", "pcan", "gsusb", "virtual"],
                     help="传输后端（默认 slcan）")
     ap.add_argument("--channel", default="",
                     help="通道名（slcan: COM4 或 /dev/ttyACM0；socketcan: can0）")

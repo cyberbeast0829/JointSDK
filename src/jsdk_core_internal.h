@@ -53,6 +53,16 @@
 #define JSDK_CFG_TIMEOUT_MS  200u
 
 /**
+ * `jsdk_joint_set_zero_here()` 的**存储式**零点校验预算（ms）。
+ *
+ * ⚠ 不能复用 `JSDK_CFG_TIMEOUT_MS`(200)：固件是在**主循环**里
+ *   `M_ZERO = count; save_preferences();`，Flash 写实际耗时从几十 ms 到数秒不等
+ *   （真机：标定刚结束紧接着置零时 200 ms 就不够用，会把成功的置零报成超时）。
+ *   判据仍用时钟，不用迭代次数。
+ */
+#define JSDK_ZERO_VERIFY_MS  3000u
+
+/**
  * `jsdk_context_activate()` 的**整个过程**超时（ms）。
  *
  * ⚠ 不能复用 JSDK_CFG_TIMEOUT_MS(200)：那是"等单次响应"的尺度，而这里是
@@ -99,6 +109,78 @@ static inline int jsdk_msgtype_feeds_watchdog(uint8_t msgtype)
             || (msgtype >= (uint8_t)CB_MSG_MIT_CONTROL_BCAST
                 && msgtype <= (uint8_t)CB_MSG_TORQUE_CONTROL_BCAST)) ? 1 : 0;
 }
+
+/* ==========================================================================
+ * 设备 profile（语义 → 端点词汇的映射）
+ * ------------------------------------------------------------------------
+ * L3 只依赖"语义"（齿比 / 力矩常数 / MIT 量程 / 状态 / 标定），不依赖某一家的
+ * 端点名。`jsdk_profile.c` 里有一张**候选路径表**；解析结果落到关节的
+ * `dev_family` + `profile_flags` + 既有 `ep_*` 字段（ID 一律运行时从描述符解析）。
+ *
+ * 扩展新厂商（例如 moteus）：
+ *   1. 公共头 `jsdk_devfamily_t` 追加一个值；
+ *   2. `src/core/jsdk_profile.c` 的 `g_profiles[]` 追加一行候选路径；
+ *   3. 若它的状态/标定机制不同，再在 `jsdk_ops.c` 按能力位加一条分支。
+ * 其余代码**只读能力位**，不认厂商名。
+ * ======================================================================== */
+
+/** 语义键（**不是端点 ID**）。 */
+typedef enum {
+    JSDK_EPKEY_GEAR = 0,        /**< 齿比（输出端/电机端） */
+    JSDK_EPKEY_TCONST,          /**< 力矩常数 N·m/A（电机端） */
+    JSDK_EPKEY_CURLIM,          /**< 额定/告警电流 A（电机端） */
+    JSDK_EPKEY_POS_MAX,         /**< MIT 位置量程 rad（输出端） */
+    JSDK_EPKEY_VEL_MAX,         /**< MIT 速度量程 rad/s（输出端） */
+    JSDK_EPKEY_TAU_MAX,         /**< MIT 力矩量程 N·m（输出端；可派生） */
+    JSDK_EPKEY_KP_MAX,          /**< MIT kp 量程 */
+    JSDK_EPKEY_KD_MAX,          /**< MIT kd 量程 */
+    JSDK_EPKEY_NODE_ID,         /**< CAN 节点号 */
+    JSDK_EPKEY_HB_RATE,         /**< 心跳周期 ms */
+    JSDK_EPKEY_WATCHDOG,        /**< 协议级超时 ms（0 = 禁用） */
+    JSDK_EPKEY_CURRENT_STATE,   /**< 设备状态（仅 ODrive 词汇有） */
+    JSDK_EPKEY_REQUESTED_STATE, /**< 状态机请求（仅 ODrive 词汇有） */
+    JSDK_EPKEY_ACTION_CALIBRATE,/**< 标定 function 端点（MIT 词汇） */
+    JSDK_EPKEY_ZERO_OFFSET,     /**< 机械零点存储值（MIT: config.m_zero） */
+    JSDK_EPKEY_ENC_COUNT,       /**< 编码器原始计数（MIT: telemetry.count） */
+    JSDK_EPKEY_COUNT
+} jsdk_epkey_t;
+
+/** 能力位（**只增不改**；未置位 = 该能力不存在）。 */
+#define JSDK_PF_TAU_MAX_EXPLICIT  0x01u  /**< 端点表里有显式 mit_max_torque */
+#define JSDK_PF_TAU_MAX_DERIVED   0x02u  /**< tau_max = cur_lim × kt × gear */
+#define JSDK_PF_WD_FEEDS_CURRENT  0x04u  /**< 0x04 CURRENT 也刷新固件超时 */
+#define JSDK_PF_HAS_HOME          0x08u  /**< requested_state 支持 HOMING(11) */
+#define JSDK_PF_ACTION_CALIBRATE  0x10u  /**< 标定走 function 端点 */
+#define JSDK_PF_STATE_FROM_NIBBLE 0x20u  /**< 状态由 MIT 响应/心跳 nibble 提供 */
+#define JSDK_PF_ZERO_REQUIRES_IDLE 0x40u /**< SET_ZERO 只在静息态（MENU）生效 */
+
+/*
+ * ⚠ 0x80 是**最后一位**：再加能力位就要把 `profile_flags` 扩成 `uint16_t`
+ *   （它现在是 `uint8_t`，见下面的 `jsdk_joint_t`）。
+ */
+#define JSDK_PF_ZERO_NEEDS_BOOT   0x80u /**< SET_ZERO 只写**零点存储**（并落 Flash）；
+                                          *   报告位置**不保证**立刻为 0。
+                                          *
+                                          *   ⇒ 判据必须是“零点端点变了 ≈ 当前计数”，
+                                          *   **不能**是“位置变 0”。真机实测：该固件
+                                          *   多圈位置是连续累计，置零后位置有时
+                                          *   立刻读 0、有时不动（取决于累计圈数），
+                                          *   拿位置当判据会把成功的置零报成 TIMEOUT。 */
+/** 该 MsgType 对本关节是否刷新固件超时（profile 感知版）。 */
+int jsdk_joint__feeds_watchdog(const jsdk_joint_t *j, uint8_t msgtype);
+
+/** 解析设备词汇（只查描述符，不产生总线 I/O）。 */
+jsdk_status_t jsdk_profile_resolve(jsdk_context_t *ctx, jsdk_joint_t *j);
+
+/** 按语义键查已解析家族的候选路径（运行期按名查描述符）。 */
+int jsdk_profile_lookup(const jsdk_joint_t *j, jsdk_epkey_t key,
+                        uint16_t *ep_id, jsdk_ep_type_t *type);
+
+/** 家族名（日志/诊断用）。 */
+const char *jsdk_profile_name(uint8_t family);
+
+/** `action.calibrate` 的路径（该家族没有则 NULL）。 */
+const char *jsdk_profile_action_calibrate(const jsdk_joint_t *j);
 
 /* ==========================================================================
  * 目标缓存
@@ -182,7 +264,14 @@ struct jsdk_joint {
     uint16_t ep_gear_ratio, ep_torque_constant;
     uint16_t ep_mit_pos, ep_mit_vel, ep_mit_tau, ep_mit_kp, ep_mit_kd;
     uint16_t ep_requested_state, ep_current_state, ep_node_id, ep_break_timeout;
-    uint16_t ep_current_lim;      /**< axis0.motor.config.current_lim（可选） */
+    uint16_t ep_zero_offset, ep_enc_count;   /**< MIT 置零判据专用（0 = 设备没有） */
+    uint16_t ep_current_lim;      /**< 额定/告警电流（可选；MIT 用它派生 tau_max） */
+
+    /* ---- 设备 profile（见 jsdk_profile.c） ---- */
+    uint8_t  dev_family;          /**< jsdk_devfamily_t；0 = 尚未解析 */
+    uint8_t  profile_flags;       /**< JSDK_PF_* 能力位 */
+    uint8_t  wd_type;             /**< 看门狗端点的 jsdk_ep_type_t（宽度可能非 u16） */
+    uint8_t  family_hint;         /**< 调用方指定的家族；0 = AUTO */
 
     /* ---- 设备侧配置读回 ---- */
     uint32_t break_timeout_ms;    /**< can.config.break_timeout；**0 = 设备侧超 时检测已禁用** */
@@ -699,6 +788,22 @@ int jsdk_ctx_read_param_exact(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_
  */
 int jsdk_ctx_write_param(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_id,
                          const void *val, uint8_t len, uint32_t timeout_ms);
+
+/**
+ * 按**端点声明类型**读一个无符号整数（u8/i8/u16/i16/u32/i32/bool）。
+ *
+ * 为什么需要它：`break_timeout` 在 ODrive 上是 **u16**，而 MIT 词汇里的
+ * `config.can_timeout` 是 **int32**。按固定宽度读会“读到 2 字节就当成值”，
+ * 宽容地通过但语义错误；按类型读才不会把宽度猜错。
+ *
+ * @return JSDK_OK；类型不是 1/2/4 字节整数 → `JSDK_ERR_UNSUPPORTED`
+ */
+int jsdk_ctx_read_u32_typed(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_id,
+                            jsdk_ep_type_t type, uint32_t *out, uint32_t timeout_ms);
+
+/** @copydoc jsdk_ctx_read_u32_typed（写侧；超出端点值域由固件钳位/拒绝） */
+int jsdk_ctx_write_u32_typed(jsdk_context_t *ctx, uint8_t node_id, uint16_t ep_id,
+                             jsdk_ep_type_t type, uint32_t value, uint32_t timeout_ms);
 
 #ifdef __cplusplus
 }
