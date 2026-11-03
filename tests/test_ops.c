@@ -2817,6 +2817,80 @@ static void test_state_poll(void)
  *   ③ 看门狗端点宽度按描述符（这里故意声明为 **int32**）——写死 2 字节会被
  *      固件以 `EP_ERR_BAD_LEN` 静默丢弃。
  */
+/**
+ * `fault-reset` 的真机症状复现（ODrive，2026-11）：
+ *   - `CLEAR_ERRORS(0x65)` **清不掉** `axis0.error` 的 `ERROR_CAN_BUS_FAILED`；
+ *   - `feedback().axis_error` 是 `0x45` 查询的**快照**，之后不会自己刷新
+ *     ⇒ 同一进程里只靠"请求 + 空转"，永远看到旧值，把"其实已清"报成没清。
+ *
+ * 本用例把两条都注入（丢掉 CLEAR_ERRORS + 先查一次 0x45 让缓存变旧），要求
+ * `jsdk_joint_fault_reset_wait()` 靠**回退写 0 + 重新取明细**把它清掉。
+ */
+static void test_fault_reset_fallback(void)
+{
+    fix_t fx;
+
+    printf("[fault-reset] latched bit survives CLEAR_ERRORS -> write-back + re-query\n");
+
+    if (fx_open(&fx, "0:id=1,hb=0,timeout=30000,fd", 1u) != 0) {
+        printf("      FATAL: fixture failed\n"); g_fail++; g_checks++; return;
+    }
+    if (fx_configure(&fx) != 0) {
+        printf("      FATAL: configure failed\n"); g_fail++; g_checks++;
+        fx_close(&fx); return;
+    }
+
+    /* ① 锁存故障，并用一次 0x45 查询把"快照"填上（真机就是这样变陈旧的） */
+    fx.sim->nodes[0].error_axis |= SIM_ERR_CAN_BUS_FAILED;
+    { jsdk_fault_info_t fi; (void)jsdk_joint_query_error_detail(fx.j, &fi); }
+    /*
+     * ⚠ 这里要**手动**把快照带进 feedback：真机上这条路径是“某次 MIT 响应里
+     *   `j->fb.axis_error = j->fault.axis_error`”，而**未使能**时 SDK 不发控制帧、
+     *   也就没有响应 —— 正因如此，快照一旦是旧的，就再没人刷新它（本用例要复现的
+     *   就是这个状态）。用例直接模拟“已经带进去了”。
+     */
+    fx.j->fb.axis_error = fx.j->fault.axis_error;
+    CHECK_EQ(jsdk_joint_is_fault(fx.j), 1);
+
+    /* ② 把 CLEAR_ERRORS 丢掉 —— 等价于真机上"0x65 没效果" */
+    fx.drop_msgtype   = (uint8_t)CB_MSG_CLEAR_ERRORS;
+    fx.drop_msgtype_n = 1000u;
+
+    CHECK_EQ(jsdk_joint_fault_reset_wait(fx.j, 300u), JSDK_OK);
+    CHECK_EQ(fx.sim->nodes[0].error_axis, 0u);            /* 设备侧真的清了 */
+    CHECK_EQ(jsdk_joint_is_fault(fx.j), 0);               /* 缓存也刷新了 */
+    printf("      recovery: CLEAR_ERRORS dropped, write-back + re-query cleared it\n");
+
+    /* ③ 反例：连回退的 `0x45`/写 0 都堵死时，必须**如实报仍有故障**，不能假成功 */
+    fx.sim->nodes[0].error_axis |= SIM_ERR_CAN_BUS_FAILED;
+    { jsdk_fault_info_t fi; (void)jsdk_joint_query_error_detail(fx.j, &fi); }
+    fx.j->fb.axis_error = fx.j->fault.axis_error;
+    fx.drop_msgtype   = (uint8_t)CB_MSG_PARAM_WRITE;      /* 回退写 0 也被丢 */
+    fx.drop_msgtype_n = 1000u;
+    CHECK_EQ(jsdk_joint_fault_reset_wait(fx.j, 300u), JSDK_ERR_PROTOCOL);
+    CHECK(strstr(jsdk_context_last_error(fx.ctx), "still reports a fault") != NULL);
+    fx.drop_msgtype   = 0u;
+    fx.drop_msgtype_n = 0u;
+
+    /*
+     * ④ 上一条的反面：**位图全清、但 `fb.err_code` / `fb.hb_error` 是旧快照**时，
+     *    判据必须只看位图 —— 真机就是这个状态（清完之后 `mit_err` 还挂着
+     *    `CAN_TIMEOUT`），按 `is_fault()` 判会**永远报“清不掉”**。
+     */
+    fx.sim->nodes[0].error_axis = 0u;
+    fx.j->fb.err_code = 9u;          /* CAN_TIMEOUT，上一帧的快照 */
+    fx.j->fb.hb_error = 0x01u;
+    CHECK_EQ(jsdk_joint_is_fault(fx.j), 1);          /* 旧判据会误判“还有故障” */
+    CHECK_EQ(jsdk_joint_fault_reset_wait(fx.j, 300u), JSDK_OK);
+    CHECK(strstr(jsdk_context_last_error(fx.ctx), "stale snapshot") != NULL);
+    fx.j->fb.err_code = 0u;
+    fx.j->fb.hb_error = 0u;
+    printf("      stale err_code/hb snapshots no longer block the verdict\n");
+
+    fx_close(&fx);
+}
+
+
 static void test_mit_profile(void)
 {
     fix_t fx;
@@ -2982,6 +3056,9 @@ int main(void)
     test_state_poll();    printf("\n");
     test_robustness();   printf("\n");
     test_mit_profile();  printf("\n");
+    printf("\n");
+    test_fault_reset_fallback();
+    printf("\n");
 
     free(g_json);
     free(g_json_mit);

@@ -81,8 +81,8 @@ void cli_usage(FILE *f, const char *argv0)
         "  calibrate                     写 requested_state = 3 并等待\n"
         "  home                          写 requested_state = 11 并等待\n"
         "  estop                         广播 ESTOP(0xC0)（**全局广播**，打到总线上所有节点）\n"
-        "  fault-reset                   清故障：STOP_MOTOR → CLEAR_ERRORS → 等错误位归零\n"
-        "                                （estop/FAULT_ALERT 锁死关节后唯一的软件恢复路径）\n"
+        "  fault-reset                   清故障：STOP_MOTOR → CLEAR_ERRORS → 仍不行就把\n"
+        "                                锁存错误位写 0（axis0.error）并重取 0x45 确认\n"
         "  mit [--pos R --vel R --kp K --kd D --tau T] --hold S\n"
         "                                唯一会驱动电机的命令\n",
         argv0 ? argv0 : "jsdk-cli");

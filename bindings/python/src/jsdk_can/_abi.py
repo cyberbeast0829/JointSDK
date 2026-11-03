@@ -683,6 +683,7 @@ _FUNCS: dict[str, tuple[list, object]] = {
     "jsdk_joint_request_enable": ([c_void_p, c_int], None),
     "jsdk_joint_request_disable": ([c_void_p], None),
     "jsdk_joint_request_fault_reset": ([c_void_p], None),
+    "jsdk_joint_fault_reset_wait": ([c_void_p, c_uint32], c_int),
     "jsdk_joint_set_mode": ([c_void_p, c_int], None),
     "jsdk_joint_set_target_position_rad": ([c_void_p, c_double], None),
     "jsdk_joint_set_target_velocity_rad_s": ([c_void_p, c_double], None),

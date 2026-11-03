@@ -53,6 +53,12 @@
 #define JSDK_CFG_TIMEOUT_MS  200u
 
 /**
+ * `jsdk_joint_fault_reset_wait()` 等状态机清完的默认预算（ms）。
+ * 量级是“几个控制周期 + 一次往返”，不是标定那种几十秒。
+ */
+#define JSDK_FAULT_RESET_MS  2000u
+
+/**
  * `jsdk_joint_set_zero_here()` 的**存储式**零点校验预算（ms）。
  *
  * ⚠ 不能复用 `JSDK_CFG_TIMEOUT_MS`(200)：固件是在**主循环**里
@@ -142,6 +148,10 @@ typedef enum {
     JSDK_EPKEY_ACTION_CALIBRATE,/**< 标定 function 端点（MIT 词汇） */
     JSDK_EPKEY_ZERO_OFFSET,     /**< 机械零点存储值（MIT: config.m_zero） */
     JSDK_EPKEY_ENC_COUNT,       /**< 编码器原始计数（MIT: telemetry.count） */
+    JSDK_EPKEY_ERROR_LATCH,     /**< **可写**的锁存错误位（ODrive: axis0.error）
+                                 *   存在它 = “清故障时可以回退写 0”。
+                                 *   `CLEAR_ERRORS(0x65)` 对某些位（实测
+                                 *   `ERROR_CAN_BUS_FAILED`）无效。 */
     JSDK_EPKEY_COUNT
 } jsdk_epkey_t;
 
@@ -264,6 +274,7 @@ struct jsdk_joint {
     uint16_t ep_gear_ratio, ep_torque_constant;
     uint16_t ep_mit_pos, ep_mit_vel, ep_mit_tau, ep_mit_kp, ep_mit_kd;
     uint16_t ep_requested_state, ep_current_state, ep_node_id, ep_break_timeout;
+    uint16_t ep_error_latch;      /**< 可写锁存错误位（0 = 设备不提供） */
     uint16_t ep_zero_offset, ep_enc_count;   /**< MIT 置零判据专用（0 = 设备没有） */
     uint16_t ep_current_lim;      /**< 额定/告警电流（可选；MIT 用它派生 tau_max） */
 
@@ -271,6 +282,7 @@ struct jsdk_joint {
     uint8_t  dev_family;          /**< jsdk_devfamily_t；0 = 尚未解析 */
     uint8_t  profile_flags;       /**< JSDK_PF_* 能力位 */
     uint8_t  wd_type;             /**< 看门狗端点的 jsdk_ep_type_t（宽度可能非 u16） */
+    uint8_t  errlatch_type;       /**< `ep_error_latch` 的 jsdk_ep_type_t */
     uint8_t  family_hint;         /**< 调用方指定的家族；0 = AUTO */
 
     /* ---- 设备侧配置读回 ---- */

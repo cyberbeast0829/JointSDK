@@ -67,6 +67,10 @@ static const jsdk_profile_path_t k_odrive_paths[] = {
     { JSDK_EPKEY_WATCHDOG,      { "can.config.break_timeout", NULL, NULL } },
     { JSDK_EPKEY_CURRENT_STATE, { "axis0.current_state", NULL, NULL } },
     { JSDK_EPKEY_REQUESTED_STATE, { "axis0.requested_state", NULL, NULL } },
+    /* 可写锁存错误位：`CLEAR_ERRORS(0x65)` 对 `ERROR_CAN_BUS_FAILED` 无效（真机实测），
+       有它在 `fault-reset` 才能回退成“写 0”。MIT 词汇没有对应端点（它的
+       `CLEAR_ERRORS` 走 `request_fsm_state(MENU)`，本身有效）。 */
+    { JSDK_EPKEY_ERROR_LATCH,   { "axis0.error", NULL, NULL } },
 };
 
 /*
@@ -287,6 +291,10 @@ jsdk_status_t jsdk_profile_resolve(jsdk_context_t *ctx, jsdk_joint_t *j)
         j->ep_requested_state = set.ep[JSDK_EPKEY_REQUESTED_STATE];
         j->ep_zero_offset     = set.ep[JSDK_EPKEY_ZERO_OFFSET];
         j->ep_enc_count       = set.ep[JSDK_EPKEY_ENC_COUNT];
+        j->ep_error_latch     = set.ep[JSDK_EPKEY_ERROR_LATCH];
+        j->errlatch_type      = set.ep[JSDK_EPKEY_ERROR_LATCH]
+                                    ? set.type[JSDK_EPKEY_ERROR_LATCH]
+                                    : (uint8_t)JSDK_EP_U32;
 
         /* 看门狗端点可能是 u16（ODrive）或 int32（MIT）——按描述符宽度读写 */
         j->wd_type = set.ep[JSDK_EPKEY_WATCHDOG]

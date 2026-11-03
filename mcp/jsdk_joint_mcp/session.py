@@ -767,7 +767,15 @@ class JointSession:
         with self._lock:
             self._ensure_configured(descriptor=True)
             try:
-                self._joint().fault_reset()
+                # ⚠ 用阻塞版：`CLEAR_ERRORS(0x65)` 清不掉某些锁存位（真机
+                #   `ERROR_CAN_BUS_FAILED`），而 `feedback().axis_error` 是 0x45
+                #   快照、不刷新 —— 只“请求”会让工具一直报“仍有故障”。
+                j = self._joint()
+                fn = getattr(j, "fault_reset_wait", None)
+                if fn is not None:
+                    fn(0)
+                else:                                   # 旧库没这个 API
+                    j.fault_reset()
             except Exception as exc:                       # noqa: BLE001
                 raise self._classify(exc, "fault_reset") from exc
             return self.get_state()

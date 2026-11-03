@@ -1124,6 +1124,30 @@ JSDK_API void jsdk_joint_request_disable    (jsdk_joint_t *j);
 JSDK_API void jsdk_joint_request_fault_reset(jsdk_joint_t *j);
 JSDK_API void jsdk_joint_set_mode           (jsdk_joint_t *j, jsdk_mode_t mode);
 
+/**
+ * **阻塞式**清故障：推进状态机直到故障消失，必要时回退到"直接写锁存错误位"。
+ *
+ * 为什么不能只靠 @ref jsdk_joint_request_fault_reset（真机实测，ODrive）：
+ *  1. 那个状态机只发 `STOP_MOTOR` + `CLEAR_ERRORS(0x65)`，而 **`0x65` 清不掉
+ *     某些位**（实测 `axis0.error` 的 `ERROR_CAN_BUS_FAILED`）；能清掉它的是
+ *     **写 `axis0.error = 0`**（描述符里它是可写端点）。
+ *  2. 更隐蔽：`feedback().axis_error` 是 **`0x45` 查询的快照**，之后不会自己刷新
+ *     ⇒ 同一进程里只要查过一次错误明细，`is_fault()` 就永远为真，
+ *     "清不掉"其实是"缓存没更新"。
+ * 所以本函数在推进状态机之后还会：**写 `axis0.error = 0`**（若该设备提供该端点），
+ * 然后**重新取一次 `0x45`** 刷新缓存，再判定。
+ *
+ * @param timeout_ms 等状态机清完的预算（0 = 默认 2000 ms）。来自**时钟**，
+ *                   不是迭代次数。
+ * @return `JSDK_OK` = 已确认清掉；`JSDK_ERR_PROTOCOL` = 设备仍有故障
+ *         （原因还在，重试无用，看 `last_error` 的分项）；`JSDK_ERR_TRANSPORT`
+ *         = 链路问题。
+ *
+ * @note 不动电机（只有 `STOP_MOTOR`）；不写 Flash。
+ */
+JSDK_API jsdk_status_t jsdk_joint_fault_reset_wait(jsdk_joint_t *j,
+                                                   uint32_t timeout_ms);
+
 /* --- 物理量入口（推荐） --- */
 JSDK_API void jsdk_joint_set_target_position_rad  (jsdk_joint_t *j, double rad);
 JSDK_API void jsdk_joint_set_target_velocity_rad_s(jsdk_joint_t *j, double rad_s);

@@ -2082,6 +2082,12 @@ uint16_t cb_desc_cache_crc16(const void *data, size_t len);
 #define JSDK_CFG_TIMEOUT_MS  200u
 
 /**
+ * `jsdk_joint_fault_reset_wait()` 等状态机清完的默认预算（ms）。
+ * 量级是“几个控制周期 + 一次往返”，不是标定那种几十秒。
+ */
+#define JSDK_FAULT_RESET_MS  2000u
+
+/**
  * `jsdk_joint_set_zero_here()` 的**存储式**零点校验预算（ms）。
  *
  * ⚠ 不能复用 `JSDK_CFG_TIMEOUT_MS`(200)：固件是在**主循环**里
@@ -2171,6 +2177,10 @@ typedef enum {
     JSDK_EPKEY_ACTION_CALIBRATE,/**< 标定 function 端点（MIT 词汇） */
     JSDK_EPKEY_ZERO_OFFSET,     /**< 机械零点存储值（MIT: config.m_zero） */
     JSDK_EPKEY_ENC_COUNT,       /**< 编码器原始计数（MIT: telemetry.count） */
+    JSDK_EPKEY_ERROR_LATCH,     /**< **可写**的锁存错误位（ODrive: axis0.error）
+                                 *   存在它 = “清故障时可以回退写 0”。
+                                 *   `CLEAR_ERRORS(0x65)` 对某些位（实测
+                                 *   `ERROR_CAN_BUS_FAILED`）无效。 */
     JSDK_EPKEY_COUNT
 } jsdk_epkey_t;
 
@@ -2293,6 +2303,7 @@ struct jsdk_joint {
     uint16_t ep_gear_ratio, ep_torque_constant;
     uint16_t ep_mit_pos, ep_mit_vel, ep_mit_tau, ep_mit_kp, ep_mit_kd;
     uint16_t ep_requested_state, ep_current_state, ep_node_id, ep_break_timeout;
+    uint16_t ep_error_latch;      /**< 可写锁存错误位（0 = 设备不提供） */
     uint16_t ep_zero_offset, ep_enc_count;   /**< MIT 置零判据专用（0 = 设备没有） */
     uint16_t ep_current_lim;      /**< 额定/告警电流（可选；MIT 用它派生 tau_max） */
 
@@ -2300,6 +2311,7 @@ struct jsdk_joint {
     uint8_t  dev_family;          /**< jsdk_devfamily_t；0 = 尚未解析 */
     uint8_t  profile_flags;       /**< JSDK_PF_* 能力位 */
     uint8_t  wd_type;             /**< 看门狗端点的 jsdk_ep_type_t（宽度可能非 u16） */
+    uint8_t  errlatch_type;       /**< `ep_error_latch` 的 jsdk_ep_type_t */
     uint8_t  family_hint;         /**< 调用方指定的家族；0 = AUTO */
 
     /* ---- 设备侧配置读回 ---- */
@@ -12183,6 +12195,123 @@ jsdk_status_t jsdk_joint_calibrate(jsdk_joint_t *j)
     return JSDK_ERR_UNSUPPORTED;
 }
 
+/*
+ * 判据：0x45 的**六个原始位图**是否全 0。
+ *
+ * ⚠ 不能用 `jsdk_joint_is_fault()` 当判据 —— 它还看 `fb.err_code` / `fb.hb_error`，
+ *   而那两个是**上一帧**（控制应答 / 周期帧）里的快照，清完之后照样残留：
+ *   真机实测（ODrive，fault-reset 之后）六个位图全 0，`mit_err` 却一直挂着
+ *   `CAN_TIMEOUT`，于是“设备已经干净、SDK 永远说清不掉”。
+ *   位图才是设备的权威故障状态；`err_code` 是派生的历史值（见 AGENTS.md §1.4）。
+ */
+static int ops_fault_bitmaps_clear(jsdk_joint_t *j)
+{
+    jsdk_fault_info_t info;
+
+    if (jsdk_joint_query_error_detail(j, &info) != JSDK_OK) return 0;
+
+    /* 顺手同步 `fb.axis_error`：它给 `is_fault()` 用，早一点变准没坏处 */
+    j->fb.axis_error = j->fault.axis_error;
+
+    if (info.motor_error != 0u || info.encoder_error != 0u ||
+        info.sensorless_error != 0u || info.controller_error != 0u ||
+        info.system_error != 0u || info.axis_error != 0u) {
+        return 0;
+    }
+    return 1;
+}
+
+jsdk_status_t jsdk_joint_fault_reset_wait(jsdk_joint_t *j, uint32_t timeout_ms)
+{
+    uint32_t t0;
+    uint32_t last_now = 0u;
+    unsigned frozen = 0u;
+    unsigned i;
+    int      wrote_latch = 0;
+    int      cleared;
+
+    if (!jsdk_joint_check(j)) return JSDK_ERR_INVALID_ARG;
+    if (timeout_ms == 0u) timeout_ms = JSDK_FAULT_RESET_MS;
+
+    /* --- ① 推进状态机（STOP_MOTOR → CLEAR_ERRORS → 等清完） --- */
+    jsdk_joint_request_fault_reset(j);
+    t0 = j->ctx->cfg.hal.now_ms(j->ctx->cfg.hal.user);
+    while (!ops_fault_bitmaps_clear(j)) {
+        uint32_t now = j->ctx->cfg.hal.now_ms(j->ctx->cfg.hal.user);
+
+        /*
+         * ⚠ 时钟冻结兜底（与 `request_state_and_wait()` 同一条理由）：
+         *   虚拟 HAL / 客户自写的假时钟可能根本不动，那时 `elapsed` 永远为 0，
+         *   光靠时间预算会**死循环**。这里再给一个“时钟连续不动”的上限。
+         */
+        if (now != last_now) {
+            last_now = now;
+            frozen = 0u;
+        } else if (++frozen >= 200000u) {
+            break;
+        }
+        if (jsdk_elapsed(now, t0) >= timeout_ms) break;
+
+        (void)jsdk_context_poll(j->ctx, 0u);
+    }
+
+    /*
+     * --- ② 回退：直接写锁存错误位 = 0 ---
+     *
+     * `CLEAR_ERRORS(0x65)` 清不掉某些位（真机：`axis0.error` 的
+     * `ERROR_CAN_BUS_FAILED`），而描述符里 `axis0.error` 是**可写**的。
+     * 写 0 是幂等、不落 Flash 的动作，比软复位温和得多。
+     */
+    if (j->ep_error_latch != 0u) {
+        if (jsdk_ctx_write_u32_typed(j->ctx, j->cfg.node_id, j->ep_error_latch,
+                                     (jsdk_ep_type_t)j->errlatch_type, 0u,
+                                     JSDK_CFG_TIMEOUT_MS) == JSDK_OK) {
+            wrote_latch = 1;
+            /* 让设备处理完 + 状态机把新状态带回来 */
+            for (i = 0u; i < 4u; ++i) (void)jsdk_context_poll(j->ctx, 0u);
+        }
+    }
+
+    /*
+     * --- ③ 重新取一次 0x45 明细（清完之后的权威读数）---
+     *
+     * ⚠ 这一步**不能省**：`feedback().axis_error` 只是 `0x45` 查询的**快照**，
+     *   之后不会自己刷新 —— 不重查，同一个进程里永远看到旧值，
+     *   于是“设备已清、SDK 还说有故障”。
+     * ⚠ `jsdk_joint_query_error_detail()` **不接受 NULL**（它要回填 info），
+     *   传 NULL 直接返回 INVALID_ARG 且**根本没查询** —— 别把那个局部变量“优化”掉。
+     */
+    cleared = ops_fault_bitmaps_clear(j);
+    jsdk_joint__refresh_state(j);
+
+    if (cleared) {
+        if (j->fb.err_code != 0u || j->fb.hb_error != 0u) {
+            jsdk_ctx_seterr(j->ctx,
+                "faults cleared%s; note mit_err=0x%08lX hb=0x%02X are stale snapshots "
+                "from the last frame, not a live fault",
+                wrote_latch ? " (CLEAR_ERRORS + axis error endpoint write)" : "",
+                (unsigned long)j->fb.err_code, (unsigned)j->fb.hb_error);
+        } else {
+            jsdk_ctx_seterr(j->ctx, "faults cleared%s",
+                            wrote_latch
+                                ? " (CLEAR_ERRORS + axis error endpoint write)" : "");
+        }
+        return JSDK_OK;
+    }
+
+    /* 仍然有故障：这是“原因还在”，不是“命令没生效” —— 别让用户去重试 */
+    {
+        char desc[192];
+
+        (void)jsdk_joint_describe_fault(j, desc, sizeof desc);
+        jsdk_joint_seterr(j,
+            "device still reports a fault after CLEAR_ERRORS%s: %s"
+            "（原因还在，重试无用；先查温度/编码器/看门狗配置）",
+            wrote_latch ? " + writing the latched error bit to 0" : "", desc);
+    }
+    return JSDK_ERR_PROTOCOL;
+}
+
 jsdk_status_t jsdk_joint_home(jsdk_joint_t *j)
 {
     if (!jsdk_joint_check(j)) return JSDK_ERR_INVALID_ARG;
@@ -13411,6 +13540,10 @@ static const jsdk_profile_path_t k_odrive_paths[] = {
     { JSDK_EPKEY_WATCHDOG,      { "can.config.break_timeout", NULL, NULL } },
     { JSDK_EPKEY_CURRENT_STATE, { "axis0.current_state", NULL, NULL } },
     { JSDK_EPKEY_REQUESTED_STATE, { "axis0.requested_state", NULL, NULL } },
+    /* 可写锁存错误位：`CLEAR_ERRORS(0x65)` 对 `ERROR_CAN_BUS_FAILED` 无效（真机实测），
+       有它在 `fault-reset` 才能回退成“写 0”。MIT 词汇没有对应端点（它的
+       `CLEAR_ERRORS` 走 `request_fsm_state(MENU)`，本身有效）。 */
+    { JSDK_EPKEY_ERROR_LATCH,   { "axis0.error", NULL, NULL } },
 };
 
 /*
@@ -13631,6 +13764,10 @@ jsdk_status_t jsdk_profile_resolve(jsdk_context_t *ctx, jsdk_joint_t *j)
         j->ep_requested_state = set.ep[JSDK_EPKEY_REQUESTED_STATE];
         j->ep_zero_offset     = set.ep[JSDK_EPKEY_ZERO_OFFSET];
         j->ep_enc_count       = set.ep[JSDK_EPKEY_ENC_COUNT];
+        j->ep_error_latch     = set.ep[JSDK_EPKEY_ERROR_LATCH];
+        j->errlatch_type      = set.ep[JSDK_EPKEY_ERROR_LATCH]
+                                    ? set.type[JSDK_EPKEY_ERROR_LATCH]
+                                    : (uint8_t)JSDK_EP_U32;
 
         /* 看门狗端点可能是 u16（ODrive）或 int32（MIT）——按描述符宽度读写 */
         j->wd_type = set.ep[JSDK_EPKEY_WATCHDOG]

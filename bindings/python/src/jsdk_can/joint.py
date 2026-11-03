@@ -499,8 +499,25 @@ class Joint:
         self._lib.jsdk_joint_request_disable(self._ptr)
 
     def fault_reset(self) -> None:
-        """请求清故障（非阻塞）。"""
+        """请求清故障（**非阻塞**：只置一个请求位，靠 `Context.poll()` 推进）。
+
+        ⚠ 多数场景请用 :meth:`fault_reset_wait`：某些锁存位（真机：`axis0.error`
+        的 `ERROR_CAN_BUS_FAILED`）用 `CLEAR_ERRORS(0x65)` **清不掉**，而且
+        ``feedback().axis_error`` 是 0x45 查询的快照、不会自己刷新。
+        """
         self._lib.jsdk_joint_request_fault_reset(self._ptr)
+
+    def fault_reset_wait(self, timeout_ms: int = 0) -> None:
+        """清故障并**等确认**（阻塞）。
+
+        内部：推进状态机（STOP_MOTOR → CLEAR_ERRORS）→ 若仍故障则回退写
+        `axis0.error = 0` → **重新取一次 0x45** 刷新缓存 → 再判定。
+
+        :param timeout_ms: 等状态机清完的预算，0 = SDK 默认（2000 ms）
+        :raises JsdkProtocolError: 设备**仍在**报故障（原因还在，重试无用）
+        """
+        self._chk(self._lib.jsdk_joint_fault_reset_wait(self._ptr, int(timeout_ms)),
+                  "fault_reset_wait")
 
     def set_mode(self, mode: Mode) -> None:
         """设置本关节的控制模式（下一周期生效）。"""

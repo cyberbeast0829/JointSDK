@@ -1710,35 +1710,33 @@ static int cmd_home(cli_app_t *a)
  */
 static int cmd_fault_reset(cli_app_t *a)
 {
-    unsigned spin = 0u;
+    jsdk_status_t st;
     int      rc = require_yes(a, "fault-reset");
 
     if (rc != 0) return rc;
 
-    jsdk_joint_request_fault_reset(a->joint);
+    /*
+     * ⚠ 用**阻塞式**那一版（`*_wait`），不要自己写“请求 + 空转 3000 次”：
+     *   `CLEAR_ERRORS(0x65)` 清不掉某些锁存位（真机：`axis0.error` 的
+     *   `ERROR_CAN_BUS_FAILED`），而且 `feedback().axis_error` 是 0x45 快照、
+     *   不会自己刷新 —— 自己空转只会一直看到旧值，把“其实已清”报成没清。
+     *   SDK 那版会：推进状态机 → 回退写 `axis0.error = 0` → **重新取 0x45**
+     *   → 再判定，并把原因写进 `last_error`。
+     */
+    st = jsdk_joint_fault_reset_wait(a->joint, 0u);
 
-    /* 非阻塞请求：靠跑周期推进（和其它命令同一套 advance_seq 语义） */
-    while (spin < 3000u && jsdk_joint_is_fault(a->joint)) {
-        jsdk_context_poll(a->ctx, 0u);
-        spin++;
-    }
-
-    if (jsdk_joint_is_fault(a->joint)) {
+    if (st != JSDK_OK) {
         if (a->o.json) {
             cli_json_t j;
             cli_json_init(&j, a->out, 0);
             cli_json_bool(&j, "cleared", 0);
-            cli_json_str(&j, "error", "fault still present");
+            cli_json_str(&j, "error", jsdk_context_last_error(a->ctx));
             cli_json_str(&j, "hint",
-                         "总线上可能还有节点在广播 ESTOP(0xC0)/FAULT_ALERT(0xC1)；"
-                         "也可试 `reset-device`（软复位）或断电重启");
+                         "设备仍在报故障 = 原因还在（温度/编码器/看门狗配置），重试无用；"
+                         "若怀疑还有节点在广播 ESTOP(0xC0) 才考虑 `reset-device` 或断电");
             cli_json_finish(&j);
         } else {
-            cli_fprintf(a->err, "jsdk-cli: 故障未清除 —— %s\n",
-                        jsdk_context_last_error(a->ctx));
-            cli_fprintf(a->err, "  提示：总线上可能还有节点在广播 ESTOP(0xC0)/"
-                                "FAULT_ALERT(0xC1)；\n");
-            cli_fprintf(a->err, "        也可试 `reset-device`（软复位）或断电重启。\n");
+            cli_error(a, "fault-reset", st);
         }
         return CLI_EXIT_FAIL;
     }
@@ -1747,9 +1745,10 @@ static int cmd_fault_reset(cli_app_t *a)
         cli_json_t j;
         cli_json_init(&j, a->out, 0);
         cli_json_bool(&j, "cleared", 1);
+        cli_json_str(&j, "detail", jsdk_context_last_error(a->ctx));
         cli_json_finish(&j);
     } else {
-        cli_fprintf(a->out, "故障已清除（STOP_MOTOR → CLEAR_ERRORS → 错误位归零）\n");
+        cli_fprintf(a->out, "%s\n", jsdk_context_last_error(a->ctx));
     }
     return CLI_EXIT_OK;
 }
